@@ -280,6 +280,20 @@ export interface UnifiedMemoryMetrics {
   };
 }
 
+// ─── Per-slot telemetry (one row per active slot) ────────
+export interface SlotTelemetry {
+  /** Slot index, e.g. 0..N-1 */
+  id: number;
+  /** Current context length of the request in that slot (tokens). */
+  contextLength: number;
+  /** Per-slot generation rate (tok/s). */
+  tps: number;
+  /** Time-to-first-token for the most recent completion (seconds). */
+  ttft: number;
+  /** Round-trip latency for the most recent completion (seconds). */
+  roundTrip: number;
+}
+
 // ─── LLM metrics ─────────────────────────────────────────
 export interface LlmMetrics {
   available: boolean;
@@ -449,6 +463,50 @@ export interface TailscaleMetrics {
   /** Tailscale's own health warnings — these explain a false `online`. */
   health: string[];
   error: string | null;
+
+  // ── Expanded telemetry (all optional — populated when the backend exposes it) ──
+  /** Running (decoding) slots — vLLM num_requests_running. */
+  runningSlots?: number;
+  /** Waiting (queued) slots — vLLM num_requests_waiting. */
+  waitingSlots?: number;
+  /** KV cache utilization 0–1. */
+  kvCacheUsage?: number;
+  /** Average time-to-first-token over the last sampling window (seconds). */
+  ttft?: number;
+  /** Histogram of TTFT samples (seconds), oldest→newest. */
+  ttftHistogram?: number[];
+  /** Inter-token latency (ms/token) for the last sampling window. */
+  interTokenLatency?: number;
+  /** Average end-to-end latency per request over the last window (seconds). */
+  e2eLatency?: number;
+  /** Average prompt tokens per request. */
+  promptTokensPerReq?: number;
+  /** Average generated tokens per request. */
+  genTokensPerReq?: number;
+  /** Multi-Token Prediction / speculative-decoding acceptance rate (0–1). */
+  mtpAcceptanceRate?: number;
+  /** Tokens accepted by the verifier. */
+  mtpAcceptedTokens?: number;
+  /** Tokens drafted by the proposer. */
+  mtpDraftedTokens?: number;
+  /** Prefix cache hit rate (0–1). */
+  prefixCacheHitRate?: number;
+  /** Aggregate generation tok/s (alias of generationTps for clarity). */
+  generationTpsAgg?: number;
+  /** Aggregate prefill tok/s (alias of prefillTps for clarity). */
+  prefillTpsAgg?: number;
+  /** Rolling average E2E latency over the last 10 inferences (seconds). */
+  rollingAvgE2e?: number;
+  /** Rolling average TTFT over the last 10 inferences (seconds). */
+  rollingAvgTtft?: number;
+  /** Rolling average tokens per request over the last 10 inferences. */
+  rollingAvgTokensPerReq?: number;
+  /** Rolling average tok/s per slot over the last 10 inferences. */
+  rollingAvgTpsPerSlot?: number;
+  /** Per-position speculative-decode acceptance (pos0, pos1, pos2, ...), 0–1 each. */
+  perPositionAcceptance?: number[];
+  /** Per-slot telemetry rows for the table view. */
+  slots?: SlotTelemetry[];
 }
 
 // ─── Full metrics snapshot ────────────────────────────────

@@ -27,7 +27,7 @@ interface LlmPanelProps {
 
 const VLLM_METRIC_INFO = {
   kvCache:
-    "Fraction of the engine’s KV cache memory currently in use (0–100%). High values (≥80%) mean little room for new or long contexts and often lead to queuing or preemptions.",
+    "Fraction of the engine's KV cache memory currently in use (0–100%). High values (≥80%) mean little room for new or long contexts and often lead to queuing or preemptions.",
   requests:
     "Run = requests actively generating on the GPU. Wait = accepted but not yet scheduled (capacity or constraints). Growing wait with high KV cache usually means the server is overloaded.",
   ttftP95:
@@ -310,7 +310,7 @@ function MetricInfoTip({
   text,
   openId,
   setOpenId,
-  /** Anchor tooltip to the right so edge columns don’t clip off-screen */
+  /** Anchor tooltip to the right so edge columns don't clip off-screen */
   align = "left",
 }: {
   id: string;
@@ -458,6 +458,7 @@ export function LlmPanel({
     }
   }, [llmPort, showSettings]);
 
+
   const parsedPort = (() => {
     const n = parseInt(portDraft, 10);
     if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
@@ -512,6 +513,16 @@ export function LlmPanel({
       setSaving(false);
     }
   };
+
+  const runningSlots = llm?.runningSlots ?? llm?.slotsActive ?? 0;
+  const waitingSlots = llm?.waitingSlots ?? 0;
+  const kvUsage = llm?.kvCacheUsage ?? null;
+  const genTps = llm?.generationTps ?? 0;
+  const mtpRate = llm?.mtpAcceptanceRate ?? null;
+  const prefixHit = llm?.prefixCacheHitRate ?? null;
+  const slots: SlotTelemetry[] = llm?.slots ?? [];
+  const mtpAccepted = llm?.mtpAcceptedTokens ?? null;
+  const mtpDrafted = llm?.mtpDraftedTokens ?? null;
 
   return (
     <Panel
@@ -777,81 +788,6 @@ export function LlmPanel({
           <LlmTrendChart sparkId={sparkId} llmPort={llmPort} />
           <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
 
-          <div className="grid grid-cols-4 gap-2 border-t border-border pt-3">
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-muted">Slots</div>
-              <div className="font-tabular text-sm text-text">
-                {(llm?.slotsTotal ?? 0) > 0
-                  ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
-                  : (llm?.slotsActive ?? 0) > 0
-                    ? `${llm?.slotsActive} running`
-                    : "—"}
-              </div>
-            </div>
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-muted">Context</div>
-              <div className="font-tabular text-sm text-text">
-                {llm?.contextLength ? llm.contextLength.toLocaleString() : "—"}
-              </div>
-            </div>
-            <div className="space-y-0.5">
-              <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted">
-                <span>Engine</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEngineInfoOpen((v) => {
-                      if (!v) startEngineInfoTimer();
-                      return !v;
-                    });
-                  }}
-                  onMouseEnter={clearEngineInfoTimer}
-                  onMouseLeave={startEngineInfoTimer}
-                  className="relative cursor-pointer opacity-60 hover:opacity-100"
-                  aria-label="Engine state info"
-                >
-                  <svg
-                    width="10"
-                    height="10"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <circle cx="12" cy="12" r="10" />
-                    <path d="M12 16v-4" />
-                    <path d="M12 8h.01" />
-                  </svg>
-                  {engineInfoOpen && (
-                    <div
-                      onMouseEnter={clearEngineInfoTimer}
-                      onMouseLeave={startEngineInfoTimer}
-                      className="absolute left-0 top-full z-10 mt-1 w-56 rounded-md border border-border bg-surface-elevated px-3 py-2 text-left text-[11px] font-normal normal-case text-text shadow-lg"
-                    >
-                      Active = processing or ready for requests. Sleeping = idle, GPU memory freed until next request.
-                    </div>
-                  )}
-                </button>
-              </div>
-              <div className="font-tabular text-sm text-text">
-                {llm?.gpuMemoryUtilization != null
-                  ? llm.gpuMemoryUtilization === 0
-                    ? "Sleeping"
-                    : "Active"
-                  : "—"}
-              </div>
-            </div>
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-muted">Total Generated</div>
-              <div className="font-tabular text-sm text-text">
-                {llm && llm.totalOutputTokens > 0
-                  ? llm.totalOutputTokens.toLocaleString()
-                  : "—"}
-              </div>
-            </div>
-          </div>
 
           {llm && (llm.backend === "vllm" || llm.backend === "q27") && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">

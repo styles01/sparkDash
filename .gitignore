@@ -28,3 +28,7 @@ HANDOFF.md
 HANDOFF-HERMES.md
 handoff.md
 test/
+*.bak
+*.bak.*
+dist_backup/
+config/sparks.json.bak

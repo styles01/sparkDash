@@ -5,6 +5,8 @@
  * Ported from legacy `probeLlamaServerType` and `_getLlamaMetricsFor`.
  */
 import { LLM_PROBE_TIMEOUT_MS } from "../config.js";
+import { execSync } from "node:child_process";
+import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { classifyHostScope } from "../validate.js";
 import { llmProbeHost } from "./llmHost.js";
 
@@ -19,6 +21,30 @@ const SGLANG_MODEL_INFO_PATHS = ["/model_info", "/get_model_info"];
  * expire back to 0 if it stops changing.
  */
 const SGLANG_STICKY_TPS_LIVE_MS = 6_000;
+
+const HOST_ROOT = process.env.HOST_ROOT_PATH || "/host/root";
+const HOST_PROC = process.env.HOST_PROC_PATH || "/host/proc";
+const DS4_LOG_PATH = process.env.DS4_LOG_PATH || "/host/root/tmp/ds4-serve.log";
+const KV_PAGE_SIZE_BYTES = 2048 * 1024; // 2048 KiB per page
+// GB10 device total memory: 121 GiB (128 GB nominal, 121 GiB usable)
+const DS4_DEVICE_MEMORY_BYTES = 121 * 1024 * 1024 * 1024;
+
+function resolveLlamaLogPath() {
+  const envPath = process.env.LLAMA_LOG_PATH;
+  if (envPath) return envPath;
+  try {
+    const dir = "/host/root/tmp";
+    const logs = readdirSync(dir)
+      .filter((f) => /qwen.*\.log$/.test(f))
+      .map((f) => ({ f, mtime: statSync(`${dir}/${f}`).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (logs.length > 0) return `${dir}/${logs[0].f}`;
+  } catch (e) {
+    console.log("[llama-log] resolve error:", e && e.message);
+  }
+  return "/host/root/tmp/qwen4-q4-server.log";
+}
+const LLAMA_LOG_PATH = resolveLlamaLogPath();
 
 /**
  * Prefer a short model id when the server returns a Hugging Face hub cache path.
@@ -119,6 +145,101 @@ export class LlmProbe {
     /** Speculative/MTP acceptance rate 0–1 (accepted/drafted). */
     this.mtpAcceptanceRate = null;
 
+    // ── llama.cpp /slots expanded data surface ──
+    this.promptTokens = null;          // n_prompt_tokens (total prompt tokens in current slot)
+    this.promptTokensProcessed = null; // n_prompt_tokens_processed
+    this.promptTokensCache = null;     // n_prompt_tokens_cache (tokens served from cache)
+    this.cacheHitRatio = null;         // computed: cache / (cache + processed)
+    this.nCtx = null;                  // n_ctx (context window size)
+    this.isProcessing = false;         // any slot currently processing
+    this.nRemain = null;               // next_token.n_remain (tokens remaining to generate)
+    this.nDecoded = null;              // next_token.n_decoded (tokens decoded this request)
+    this.samplingParams = null;        // params: temperature, top_k, top_p, min_p, etc.
+    this.speculativeTypes = null;      // params["speculative.types"] e.g. "none,ngram-mod"
+    this.reasoningFormat = null;       // params.reasoning_format
+    this.chatFormat = null;            // params.chat_format
+    this.samplers = null;              // params.samplers[]
+    // ── llama.cpp speculative-decode (from server log) ──
+    this.specAcceptanceRate = null;    // latest "draft acceptance = X"
+    this.specAcceptedTokens = null;    // latest accepted count
+    this.specGeneratedTokens = null;   // latest generated (drafted) count
+    this.specMeanLen = null;           // latest mean draft length
+    this._llamaLogSize = 0;            // last read position in llama log
+
+    // llama.cpp per-cycle deltas + rolling window (for latency/moving-avg derivation)
+    this._llamaPrev = { decoded: 0, prompted: 0, time: 0 };
+    this._llamaRolling = [];
+
+    // Reasoning effort tracking (from ds4 request logs)
+    this.reasoningEffort = null; // 'low' | 'medium' | 'high' | null
+    this.reasoningEffortTs = null; // ms epoch when last set
+    this.waitingSlots = null;
+    this.ttft = null;
+    this.e2eLatency = null;
+    this.genTokensPerReq = null;
+    this.mtpAcceptedTokens = null;
+    this.mtpDraftedTokens = null;
+    this.perPositionAcceptance = null;
+    this.aggregateDecodeTps = null;
+    this.rollingAvgE2e = null;
+    this.rollingAvgTtft = null;
+    this.rollingAvgTokensPerReq = null;
+    this.rollingAvgTpsPerSlot = null;
+    this.recipeInfo = null;
+    this.recipeMetadata = null;
+    this.peakAggregateTps = null;
+    this.perStreamHigh = null;
+    this.perStreamLow = null;
+    this.perStreamAvg = null;
+    this.totalTokensDecoded = null;
+    this.dsparkAcceptRatio = null;
+    this.banksLive = null;
+    this.banksTotal = null;
+    this.kvPagesResident = null;
+    this.prefillCached = null;
+    this.prefillComputed = null;
+    this.specDrafts = null;
+    this.specHits = null;
+    this.warmRecords = null;
+    this.specQuench = null;
+    this.tokPerStep = null;
+    this.decodeSteps = null;
+    this.derivedArtifacts = null;
+    this.derivedArtifactBytes = null;
+    this.ds4Uptime = null;
+    this.admitsCold = null;
+    this.admitsWarm = null;
+    this.admitsFork = null;
+    this.admitsPartialFork = null;
+    this.admitsPartialTruncate = null;
+    this.requestsStarted = null;
+    this.requestsCompleted = null;
+    this.requestsFailed = null;
+    this.requestsRefusedDeepSerial = null;
+    this.requestsInflight = null;
+    this.requestsSerial = null;
+    this.contAdmitRejects = null;
+    this.contBatchFailures = null;
+    this.graphFitRefusals = null;
+    this.contextUsedBytes = null;
+    this._ds4LogSize = 0; // last read position in ds4 log file
+
+    // Active context tracking (from ds4 request logs: ctx=0..N:N)
+    this.activeContext = null; // total context tokens in the most recent request
+    this.activeContextTs = null; // ms epoch when last seen
+    this._ds4LogSizeCtx = 0; // separate read position for context tailing
+
+    // DS4 per-cycle deltas + rolling window (for latency/moving-avg derivation)
+    this._ds4Prev = {
+      tokensDecoded: null,
+      decodeSteps: null,
+      requestsStarted: null,
+      requestsCompleted: null,
+      prefillComputed: null,
+      prefillCached: null,
+      time: 0,
+    };
+    this._ds4Rolling = [];
     this._consecutiveFailures = 0;
     this._lastDetectAt = 0;
     /** @type {{ value: number, liveUntil: number } | null} */
@@ -201,6 +322,11 @@ export class LlmProbe {
         this._noteSuccess();
         return snap;
       } else if (this.serverIsOpenAI === true) {
+        if (this.backendType === "ds4") {
+          const snap = await this._probeDs4();
+          this._noteSuccess();
+          return snap;
+        }
         const snap = await this._probeOpenAICompatible();
         this._noteSuccess();
         return snap;
@@ -259,6 +385,76 @@ export class LlmProbe {
     this.lastTtftCount = null;
     this.lastIterSum = null;
     this._sglangStickyTps = null;
+    this.recipeInfo = null;
+    this._vllmPrefixCaching = null;
+    this.reasoningEffort = null; // 'low' | 'medium' | 'high' | null
+    this.reasoningEffortTs = null; // ms epoch when last set
+    this.waitingSlots = null;
+    this.ttft = null;
+    this.e2eLatency = null;
+    this.genTokensPerReq = null;
+    this.mtpAcceptedTokens = null;
+    this.mtpDraftedTokens = null;
+    this.perPositionAcceptance = null;
+    this.aggregateDecodeTps = null;
+    this.rollingAvgE2e = null;
+    this.rollingAvgTtft = null;
+    this.rollingAvgTokensPerReq = null;
+    this.rollingAvgTpsPerSlot = null;
+    this.recipeInfo = null;
+    this.recipeMetadata = null;
+    this.peakAggregateTps = null;
+    this.perStreamHigh = null;
+    this.perStreamLow = null;
+    this.perStreamAvg = null;
+    this.totalTokensDecoded = null;
+    this.dsparkAcceptRatio = null;
+    this.banksLive = null;
+    this.banksTotal = null;
+    this.kvPagesResident = null;
+    this.prefillCached = null;
+    this.prefillComputed = null;
+    this.specDrafts = null;
+    this.specHits = null;
+    this.warmRecords = null;
+    this.specQuench = null;
+    this.tokPerStep = null;
+    this.decodeSteps = null;
+    this.derivedArtifacts = null;
+    this.derivedArtifactBytes = null;
+    this.ds4Uptime = null;
+    this.admitsCold = null;
+    this.admitsWarm = null;
+    this.admitsFork = null;
+    this.admitsPartialFork = null;
+    this.admitsPartialTruncate = null;
+    this.requestsStarted = null;
+    this.requestsCompleted = null;
+    this.requestsFailed = null;
+    this.requestsRefusedDeepSerial = null;
+    this.requestsInflight = null;
+    this.requestsSerial = null;
+    this.contAdmitRejects = null;
+    this.contBatchFailures = null;
+    this.graphFitRefusals = null;
+    this.contextUsedBytes = null;
+    this._ds4LogSize = 0; // last read position in ds4 log file
+    this.activeContext = null; // total context tokens in the most recent request
+    this.activeContextTs = null; // ms epoch when last seen
+    this._ds4LogSizeCtx = 0; // separate read position for context tailing
+    this._ds4Prev = {
+      tokensDecoded: null,
+      decodeSteps: null,
+      requestsStarted: null,
+      requestsCompleted: null,
+      prefillComputed: null,
+      prefillCached: null,
+      time: 0,
+    };
+    this._ds4Rolling = [];
+    this._consecutiveFailures = 0;
+    this._lastDetectAt = 0;
+    this._vllmMetricsParser = new VllmMetricsParser();
   }
 
   /** Note auth from an HTTP status on an unauthenticated probe request. */
@@ -1221,6 +1417,611 @@ export class LlmProbe {
   }
 
   // ─── llama.cpp native path ────────────────────────────────
+  async _probeDs4() {
+    const now = Date.now();
+    const dtSec = (now - this.lastProbeTime) / 1000;
+    this.lastProbeTime = now;
+
+    // Model info from /v1/models
+    let modelsOk = false;
+    try {
+      const modelsRes = await this._fetch(`${this.baseUrl}/v1/models`);
+      if (modelsRes.ok) {
+        modelsOk = true;
+        const modelsData = await modelsRes.json();
+        const model = modelsData?.data?.[0];
+        this.modelId = model?.id || null;
+        this.contextLength = model?.context_length || null;
+        this.recipeMetadata = {
+          name: model?.id || null,
+          model: model?.name || null,
+          contextLength: model?.context_length || null,
+          ownedBy: model?.owned_by || null,
+          supportedParameters: model?.supported_parameters || [],
+        };
+      }
+    } catch {}
+
+    if (!modelsOk) {
+      throw new Error("ds4 /v1/models unreachable");
+    }
+
+    // Real reasoning effort from the engine itself (/v1/stats carries
+    // server.reasoning_effort). Beats the log-tail guess.
+    try {
+      const statsRes = await this._fetch(`${this.baseUrl}/v1/stats`, {
+        headers: { Accept: "application/json" },
+      });
+      if (statsRes.ok) {
+        const stats = await statsRes.json();
+        const effort = stats?.server?.reasoning_effort;
+        if (effort) {
+          this.reasoningEffort = effort;
+          this.reasoningEffortTs = Date.now();
+        }
+      }
+    } catch {}
+
+    // Parse /metrics
+    try {
+      const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+      if (metricsRes.ok) {
+        const txt = await metricsRes.text();
+
+        // Gauges
+        this.ds4Uptime = this._getDs4Metric(txt, "ds4_uptime_seconds");
+        this.generationTps = this._getDs4Metric(txt, "ds4_decode_tok_s") ?? 0;
+        this.prefillTps = this._getDs4Metric(txt, "ds4_prefill_tok_s") ?? 0;
+        this.dsparkAcceptRatio = this._getDs4Metric(txt, "ds4_spec_accept_ratio");
+        this.tokPerStep = this._getDs4Metric(txt, "ds4_tok_per_step");
+        this.banksLive = this._getDs4Metric(txt, "ds4_banks_live");
+        this.banksTotal = this._getDs4Metric(txt, "ds4_banks_total");
+        this.kvPagesResident = this._getDs4Metric(txt, "ds4_kv_pages_resident");
+        this.warmRecords = this._getDs4Metric(txt, "ds4_warm_records");
+        this.derivedArtifacts = this._getDs4Metric(txt, "ds4_derived_artifacts");
+        this.derivedArtifactBytes = this._getDs4Metric(txt, "ds4_derived_artifact_bytes");
+        this.requestsInflight = this._getDs4Metric(txt, "ds4_requests_inflight");
+
+        // Counters
+        this.totalTokensDecoded = this._getDs4Metric(txt, "ds4_tokens_decoded_total");
+        this.decodeSteps = this._getDs4Metric(txt, "ds4_decode_steps_total");
+        this.specDrafts = this._getDs4Metric(txt, "ds4_spec_drafts_total");
+        this.specHits = this._getDs4Metric(txt, "ds4_spec_hits_total");
+        this.specQuench = this._getDs4Metric(txt, "ds4_spec_quench_total");
+        this.requestsStarted = this._getDs4Metric(txt, "ds4_requests_started_total");
+        this.requestsSerial = this._getDs4Metric(txt, "ds4_requests_serial_total");
+        this.contAdmitRejects = this._getDs4Metric(txt, "ds4_cont_admit_rejects_total");
+        this.contBatchFailures = this._getDs4Metric(txt, "ds4_cont_batch_failures_total");
+        this.graphFitRefusals = this._getDs4Metric(txt, "ds4_graph_fit_refusals_total");
+
+        // Labeled counters
+        this.requestsCompleted = this._getDs4LabeledMetric(txt, "ds4_requests_total", "outcome", "completed");
+        this.requestsFailed = this._getDs4LabeledMetric(txt, "ds4_requests_total", "outcome", "failed");
+        this.requestsRefusedDeepSerial = this._getDs4LabeledMetric(txt, "ds4_requests_total", "outcome", "refused_deep_serial");
+        this.prefillCached = this._getDs4LabeledMetric(txt, "ds4_tokens_prefilled_total", "kind", "cached");
+        this.prefillComputed = this._getDs4LabeledMetric(txt, "ds4_tokens_prefilled_total", "kind", "computed");
+        this.admitsCold = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "cold");
+        this.admitsWarm = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "warm");
+        this.admitsFork = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "fork");
+        this.admitsPartialFork = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "partial_fork");
+        this.admitsPartialTruncate = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "partial_truncate");
+
+        // Slots = banks_live (active lanes), slotsTotal = banks_total
+        this.slotsActive = this.banksLive != null ? Math.round(this.banksLive) : 0;
+        this.slotsTotal = this.banksTotal != null ? Math.round(this.banksTotal) : 0;
+        this.requestsRunning = this.requestsInflight;
+
+        // Total output tokens from decoded counter
+        if (this.totalTokensDecoded != null) {
+          this.totalOutputTokens = Math.round(this.totalTokensDecoded);
+        }
+
+        // Track peak aggregate tok/s
+        const currentAggregate = this.generationTps;
+        if (currentAggregate > this.peakAggregateTps) {
+          this.peakAggregateTps = currentAggregate;
+        }
+
+        // Per-stream tracking: use banks_live as the number of active streams
+        // When inflight > 0, per-stream = decode_tok_s / inflight
+        const inflight = this.requestsInflight != null ? this.requestsInflight : 0;
+        if (inflight > 0 && currentAggregate > 0) {
+          const perStream = currentAggregate / inflight;
+          if (this.perStreamHigh == null || perStream > this.perStreamHigh) {
+            this.perStreamHigh = Math.round(perStream * 100) / 100;
+          }
+          if (this.perStreamLow == null || perStream < this.perStreamLow) {
+            this.perStreamLow = Math.round(perStream * 100) / 100;
+          }
+          this.perStreamAvg = Math.round(perStream * 100) / 100;
+        }
+
+        // MTP/spec acceptance — use ds4_spec_accept_ratio as the gauge
+        this.mtpAcceptanceRate = this.dsparkAcceptRatio;
+        this.mtpAcceptedTokens = this.specHits;
+        this.mtpDraftedTokens = this.specDrafts;
+
+        // ── Derive latency, genTokensPerReq, and rolling averages from
+        //    ds4 counter deltas (ds4 has no latency histograms, so we
+        //    approximate from throughput + completed-request counts). ──
+        const nowMs = Date.now();
+        const prev = this._ds4Prev;
+        const dt = prev.time > 0 ? (nowMs - prev.time) / 1000 : 0;
+
+        const deltaDecoded =
+            this.totalTokensDecoded != null && prev.tokensDecoded != null
+                ? Math.max(0, this.totalTokensDecoded - prev.tokensDecoded)
+                : 0;
+        const deltaSteps =
+            this.decodeSteps != null && prev.decodeSteps != null
+                ? Math.max(0, this.decodeSteps - prev.decodeSteps)
+                : 0;
+        const deltaStarted =
+            this.requestsStarted != null && prev.requestsStarted != null
+                ? Math.max(0, this.requestsStarted - prev.requestsStarted)
+                : 0;
+        const deltaCompleted =
+            this.requestsCompleted != null && prev.requestsCompleted != null
+                ? Math.max(0, this.requestsCompleted - prev.requestsCompleted)
+                : 0;
+        const deltaPrefillComputed =
+            this.prefillComputed != null && prev.prefillComputed != null
+                ? Math.max(0, this.prefillComputed - prev.prefillComputed)
+                : 0;
+
+        // Per-request average tokens (generation) — if requests completed
+        // this cycle, avg tokens per request = deltaDecoded / deltaCompleted.
+        // Fallback to cumulative if we have totals.
+        if (deltaCompleted > 0) {
+          this.genTokensPerReq =
+              Math.round((deltaDecoded / deltaCompleted) * 100) / 100;
+        } else if (this.requestsCompleted != null && this.requestsCompleted > 0) {
+          this.genTokensPerReq =
+              Math.round((this.totalTokensDecoded / this.requestsCompleted) * 100) / 100;
+        }
+
+        // Approximate TTFT: prefill time for the average request.
+        // Use counter-based prefill rate (deltaPrefillComputed / dt) instead of
+        // the instantaneous prefillTps gauge, which is near-zero between bursts.
+        // When prefillTps is very low or zero (idle), fall back to the rolling
+        // average prefill rate from the DS4 rolling window.
+        const prefillRate = dt > 0 && deltaPrefillComputed > 0
+            ? deltaPrefillComputed / dt
+            : this.prefillTps > 0
+                ? this.prefillTps
+                : (this._ds4Rolling.length > 0
+                    ? (() => {
+                        // Estimate prefill rate from rolling window tokens and e2e
+                        const last = this._ds4Rolling[this._ds4Rolling.length - 1];
+                        return last && last.e2e > 0 ? last.tokens / last.e2e : 0;
+                      })()
+                    : 0);
+        // Also compute average prompt tokens from cumulative counters as fallback
+        // (used by the rolling-window prefill rate estimation above)
+        if (deltaCompleted > 0 && deltaPrefillComputed > 0 && prefillRate > 0) {
+          const avgPromptTokens = deltaPrefillComputed / deltaCompleted;
+          this.ttft = Math.round((avgPromptTokens / prefillRate) * 1000) / 1000;
+          this.ttftP95Seconds = this.ttft; // best estimate (no histogram)
+        } else if (this.rollingAvgTtft != null && this.rollingAvgTtft > 0) {
+          // Use rolling average TTFT from prior cycles — more reliable than
+          // a cumulative estimate when prefill rate is very low or zero.
+          this.ttft = this.rollingAvgTtft;
+          this.ttftP95Seconds = this.rollingAvgTtft;
+        }
+
+        // Approximate E2E: TTFT + decode time for avg request.
+        // decode time ≈ avgGenTokens / decodeRate, where decodeRate = generationTps / inflight.
+        if (deltaCompleted > 0 && this.genTokensPerReq != null && this.genTokensPerReq > 0) {
+          const inflight = this.requestsInflight != null ? Math.max(1, this.requestsInflight) : 1;
+          const decodeRate = this.generationTps > 0 ? this.generationTps / inflight : 0;
+          const ttftEst = this.ttft ?? 0;
+          if (decodeRate > 0) {
+            const decodeTime = this.genTokensPerReq / decodeRate;
+            this.e2eLatency = Math.round((ttftEst + decodeTime) * 1000) / 1000;
+            this.e2eP95Seconds = this.e2eLatency;
+          } else {
+            this.e2eLatency = Math.round(ttftEst * 1000) / 1000;
+            this.e2eP95Seconds = this.e2eLatency;
+          }
+        }
+
+        // ── Rolling window: last 10 completed-request batches ──
+        if (deltaCompleted > 0 && this.e2eLatency != null) {
+          const activeSlots = this.banksLive != null ? Math.max(1, this.banksLive) : 1;
+          const tpsPerSlot = dt > 0 && this.generationTps > 0
+              ? this.generationTps / activeSlots
+              : 0;
+          const tokensPerReq = (deltaPrefillComputed + deltaDecoded) / deltaCompleted;
+
+          this._ds4Rolling.push({
+            e2e: this.e2eLatency,
+            ttft: this.ttft ?? 0,
+            tokens: tokensPerReq,
+            tpsPerSlot: Math.round(tpsPerSlot * 100) / 100,
+          });
+          if (this._ds4Rolling.length > 10) {
+            this._ds4Rolling = this._ds4Rolling.slice(-10);
+          }
+        }
+
+        // Compute rolling averages
+        if (this._ds4Rolling.length > 0) {
+          const n = this._ds4Rolling.length;
+          let sumE2e = 0, sumTtft = 0, sumTokens = 0, sumTps = 0;
+          for (const r of this._ds4Rolling) {
+            sumE2e += r.e2e;
+            sumTtft += r.ttft;
+            sumTokens += r.tokens;
+            sumTps += r.tpsPerSlot;
+          }
+          this.rollingAvgE2e = Math.round((sumE2e / n) * 1000) / 1000;
+          this.rollingAvgTtft = Math.round((sumTtft / n) * 1000) / 1000;
+          this.rollingAvgTokensPerReq = Math.round((sumTokens / n) * 100) / 100;
+          this.rollingAvgTpsPerSlot = Math.round((sumTps / n) * 100) / 100;
+        }
+
+        // ── Derive prefixCacheHitRate from prefill counters ──
+        // hit rate = prefillCached / (prefillCached + prefillComputed)
+        if (this.prefillCached != null && this.prefillComputed != null) {
+          const total = this.prefillCached + this.prefillComputed;
+          this.prefixCacheHitRate =
+            total > 0 ? Math.round((this.prefillCached / total) * 10000) / 10000 : null;
+        }
+
+        // ── Derive itlP95Seconds ≈ 1 / perStreamAvg (inter-token latency) ──
+        if (this.perStreamAvg != null && this.perStreamAvg > 0) {
+          this.itlP95Seconds = Math.round((1 / this.perStreamAvg) * 1000) / 1000;
+        } else if (this.generationTps > 0) {
+          // Fallback: use aggregate generation rate
+          this.itlP95Seconds = Math.round((1 / this.generationTps) * 1000) / 1000;
+        }
+
+        // ── Derive kvCacheUsage and gpuMemoryUtilization from DS4 memory census ──
+        // ds4_memory_bytes{domain="unified_device",class="kv_primary",state="allocated"}
+        // = KV cache live bytes on device.
+        // gpuMemoryUtilization = total unified_device allocated / 121GB
+        const kvBytes = this._getDs4MultiLabeledMetric(txt,
+            "ds4_memory_bytes",
+            { domain: "unified_device", class: "kv_primary", state: "allocated" });
+        if (kvBytes != null && kvBytes > 0) {
+          this.kvCacheUsage = Math.round((kvBytes / DS4_DEVICE_MEMORY_BYTES) * 10000) / 10000;
+        }
+        // gpuMemoryUtilization: sum all unified_device allocated bytes / 121GB
+        const totalDeviceAllocated = this._getDs4MemoryDomainTotal(txt, "unified_device", "allocated");
+        if (totalDeviceAllocated != null && totalDeviceAllocated > 0) {
+          this.gpuMemoryUtilization = Math.round((totalDeviceAllocated / DS4_DEVICE_MEMORY_BYTES) * 10000) / 10000;
+        }
+
+        // ── Derive perPositionAcceptance as single-element array from overall ratio ──
+        // DS4 doesn't break down spec acceptance by position, so we provide a
+        // single-element array so the spec decode graph always has data.
+        if (this.dsparkAcceptRatio != null) {
+          this.perPositionAcceptance = [Math.round(this.dsparkAcceptRatio * 10000) / 10000];
+        } else if (this.specHits != null && this.specDrafts != null && this.specDrafts > 0) {
+          this.perPositionAcceptance = [Math.round((this.specHits / this.specDrafts) * 10000) / 10000];
+        }
+
+        // Aggregate decode TPS alias
+        this.aggregateDecodeTps = this.generationTps;
+
+        // Save state for next cycle
+        this._ds4Prev = {
+          tokensDecoded: this.totalTokensDecoded,
+          decodeSteps: this.decodeSteps,
+          requestsStarted: this.requestsStarted,
+          requestsCompleted: this.requestsCompleted,
+          prefillComputed: this.prefillComputed,
+          prefillCached: this.prefillCached,
+          time: nowMs,
+        };
+      }
+    } catch {}
+
+    this.backendType = "ds4";
+    this._tailDs4LogForReasoningEffort();
+    this._tailDs4LogForActiveContext();
+    await this._collectRecipeInfo();
+    return this._getSnapshot();
+  }
+
+  // ─── DS4 reasoning effort log tailing ──────────────────
+  /**
+   * Tail the ds4 log file for reasoning_effort entries.
+   * The ds4 engine may log "reasoning_effort" or "effort=low|medium|high"
+   * in request lines. We scan new bytes since last read.
+   */
+  _tailDs4LogForReasoningEffort() {
+    try {
+      const stat = statSync(DS4_LOG_PATH);
+      if (!stat.isFile()) return;
+      const currentSize = stat.size;
+      // File was truncated or rotated — reset
+      if (currentSize < this._ds4LogSize) {
+        this._ds4LogSize = 0;
+      }
+      // No new bytes
+      if (currentSize === this._ds4LogSize) return;
+
+      const fd = openSync(DS4_LOG_PATH, "r");
+      try {
+        const buf = Buffer.alloc(Math.min(currentSize - this._ds4LogSize, 512 * 1024));
+        const bytesRead = readSync(fd, buf, 0, buf.length, this._ds4LogSize);
+        this._ds4LogSize = currentSize;
+        if (bytesRead <= 0) return;
+
+        const text = buf.subarray(0, bytesRead).toString("utf8");
+
+        // Match patterns like:
+        //   reasoning_effort=low
+        //   reasoning_effort: medium
+        //   "reasoning_effort":"high"
+        //   effort=low
+        const re = /reasoning_effort["'\s:=]+(\w+)|effort[=\s]+(low|medium|high)/gi;
+        let m;
+        let lastEffort = null;
+        while ((m = re.exec(text)) !== null) {
+          const val = (m[1] || m[2] || "").toLowerCase();
+          if (val === "low" || val === "medium" || val === "high") {
+            lastEffort = val;
+          }
+        }
+
+        // DS4 engine doesn't log the explicit reasoning_effort value, but it
+        // does log "thinking not closed, ignoring DSML in reasoning" when
+        // reasoning/thinking mode is active. If we see that pattern and have
+        // no explicit effort, default to "high" (DeepSeek V4 thinking mode).
+        if (lastEffort == null && this.reasoningEffort == null &&
+            /thinking.*reasoning|reasoning.*thinking/i.test(text)) {
+          lastEffort = "high";
+        }
+        if (lastEffort) {
+          this.reasoningEffort = lastEffort;
+          this.reasoningEffortTs = Date.now();
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch {}
+  }
+
+  // ─── DS4 active context log tailing ─────────────────────
+  /**
+   * Tail the ds4 log file for active context size entries.
+   * ds4 logs lines like:
+   *   chat ctx=0..54515:54515 TOOLS prompt start
+   *   chat ctx=0..69306:69306 TOOLS prompt start
+   * The number after the last colon is the total context tokens in that request.
+   * We scan new bytes since last read (shared with reasoning-effort tailing).
+   */
+  _tailDs4LogForActiveContext() {
+    try {
+      const stat = statSync(DS4_LOG_PATH);
+      if (!stat.isFile()) return;
+      const currentSize = stat.size;
+      // File was truncated or rotated — reset
+      if (currentSize < this._ds4LogSizeCtx) {
+        this._ds4LogSizeCtx = 0;
+      }
+      // No new bytes
+      if (currentSize === this._ds4LogSizeCtx) return;
+
+      const fd = openSync(DS4_LOG_PATH, "r");
+      try {
+        const buf = Buffer.alloc(Math.min(currentSize - this._ds4LogSizeCtx, 512 * 1024));
+        const bytesRead = readSync(fd, buf, 0, buf.length, this._ds4LogSizeCtx);
+        this._ds4LogSizeCtx = currentSize;
+        if (bytesRead <= 0) return;
+
+        const text = buf.subarray(0, bytesRead).toString("utf8");
+
+        // Match patterns like:
+        //   chat ctx=0..54515:54515 TOOLS prompt start
+        //   chat ctx=0..69306:69306 TOOLS prompt start
+        // Capture the number after the last colon.
+        const re = /ctx=0\.\.(\d+):(\d+)/g;
+        let m;
+        let lastCtx = null;
+        while ((m = re.exec(text)) !== null) {
+          const val = parseInt(m[2], 10);
+          if (Number.isFinite(val) && val > 0) {
+            lastCtx = val;
+          }
+        }
+
+        // Fallback: parse "warm admit bank=N cached=C suffix=S" lines where
+        // the total context tokens = cached + suffix. This covers the common
+        // case where the ctx=0..N:N pattern hasn't been emitted (non-tools
+        // requests). We take the most recent warm-admit as the active context.
+        if (lastCtx == null) {
+          const reWarm = /warm admit bank=\d+ cached=(\d+) suffix=(\d+)/g;
+          let mw;
+          while ((mw = reWarm.exec(text)) !== null) {
+            const cached = parseInt(mw[1], 10);
+            const suffix = parseInt(mw[2], 10);
+            const total = cached + suffix;
+            if (Number.isFinite(total) && total > 0) {
+              lastCtx = total;
+            }
+          }
+        }
+
+        if (lastCtx != null) {
+          this.activeContext = lastCtx;
+          this.activeContextTs = Date.now();
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch {}
+  }
+
+
+  // ─── llama.cpp expanded /slots surface (re-applied from fork) ───────
+  /** Capture expanded per-slot fields + derive llama.cpp latency/rolling metrics. */
+  _applyLlamaExpandedSlots(slots, totalDecoded, totalPrompted, dtSec) {
+    let promptTokens = null;
+    let promptTokensProcessed = null;
+    let promptTokensCache = null;
+    let nCtx = null;
+    let isProcessing = false;
+    let nRemain = null;
+    let nDecoded = null;
+    let samplingParams = null;
+    let speculativeTypes = null;
+    let reasoningFormat = null;
+    let chatFormat = null;
+    let samplers = null;
+
+    for (const slot of slots) {
+      if (promptTokens == null && slot.n_prompt_tokens != null) promptTokens = slot.n_prompt_tokens;
+      if (promptTokensProcessed == null && slot.n_prompt_tokens_processed != null) promptTokensProcessed = slot.n_prompt_tokens_processed;
+      if (promptTokensCache == null && slot.n_prompt_tokens_cache != null) promptTokensCache = slot.n_prompt_tokens_cache;
+      if (nCtx == null && slot.n_ctx != null) nCtx = slot.n_ctx;
+      if (slot.is_processing) isProcessing = true;
+      const nt = Array.isArray(slot.next_token) ? slot.next_token[0] : slot.next_token;
+      if (nt) {
+        if (nRemain == null && nt.n_remain != null) nRemain = nt.n_remain;
+        if (nDecoded == null && nt.n_decoded != null) nDecoded = nt.n_decoded;
+      }
+      const p = slot.params;
+      if (p) {
+        if (samplingParams == null) {
+          samplingParams = {
+            temperature: p.temperature ?? null,
+            top_k: p.top_k ?? null,
+            top_p: p.top_p ?? null,
+            min_p: p.min_p ?? null,
+            max_tokens: p.max_tokens ?? p.n_predict ?? null,
+            n_predict: p.n_predict ?? null,
+            n_keep: p.n_keep ?? null,
+            n_discard: p.n_discard ?? null,
+            stream: p.stream ?? null,
+            repeat_penalty: p.repeat_penalty ?? null,
+            presence_penalty: p.presence_penalty ?? null,
+            frequency_penalty: p.frequency_penalty ?? null,
+          };
+        }
+        if (speculativeTypes == null && p["speculative.types"] != null) speculativeTypes = p["speculative.types"];
+        if (reasoningFormat == null && p.reasoning_format != null) reasoningFormat = p.reasoning_format;
+        if (chatFormat == null && p.chat_format != null) chatFormat = p.chat_format;
+        if (samplers == null && Array.isArray(p.samplers)) samplers = p.samplers;
+      }
+    }
+
+    this.promptTokens = promptTokens;
+    this.promptTokensProcessed = promptTokensProcessed;
+    this.promptTokensCache = promptTokensCache;
+    this.nCtx = nCtx;
+    this.isProcessing = isProcessing;
+    this.nRemain = nRemain;
+    this.nDecoded = nDecoded;
+    this.samplingParams = samplingParams;
+    this.speculativeTypes = speculativeTypes;
+    this.reasoningFormat = reasoningFormat;
+    this.chatFormat = chatFormat;
+    this.samplers = samplers;
+    // Cache hit ratio = cache tokens / (cache + processed)
+    if (promptTokensCache != null && promptTokensProcessed != null) {
+      const denom = promptTokensCache + promptTokensProcessed;
+      this.cacheHitRatio = denom > 0 ? Math.round((promptTokensCache / denom) * 10000) / 10000 : null;
+    } else {
+      this.cacheHitRatio = null;
+    }
+
+    // Rolling/latency derivation from counter deltas across probe cycles.
+    const nowMs = Date.now();
+    const prev = this._llamaPrev;
+    const dt = prev.time > 0 ? (nowMs - prev.time) / 1000 : 0;
+    const dDecoded = Math.max(0, totalDecoded - prev.decoded);
+    const dPrompted = Math.max(0, totalPrompted - prev.prompted);
+    this._llamaPrev = { decoded: totalDecoded, prompted: totalPrompted, time: nowMs };
+
+    if (dtSec > 0 && this.generationTps > 0) {
+      const activeSlots = this.slotsActive > 0 ? this.slotsActive : 1;
+      const perStream = this.generationTps / activeSlots;
+      if (this.perStreamHigh == null || perStream > this.perStreamHigh) {
+        this.perStreamHigh = Math.round(perStream * 100) / 100;
+      }
+      if (this.perStreamLow == null || perStream < this.perStreamLow) {
+        this.perStreamLow = Math.round(perStream * 100) / 100;
+      }
+      this.perStreamAvg = Math.round(perStream * 100) / 100;
+     this.itlP95Seconds = Math.round((1 / perStream) * 1000) / 1000;
+    }
+
+    if (dDecoded > 0 && this.e2eLatency != null) {
+      const activeSlots = this.slotsActive > 0 ? this.slotsActive : 1;
+      const tpsPerSlot = dt > 0 && this.generationTps > 0 ? this.generationTps / activeSlots : 0;
+      this._llamaRolling.push({
+        e2e: this.e2eLatency,
+        ttft: this.ttft ?? 0,
+        tpsPerSlot: Math.round(tpsPerSlot * 100) / 100,
+      });
+      if (this._llamaRolling.length > 10) {
+        this._llamaRolling = this._llamaRolling.slice(-10);
+      }
+      if (this._llamaRolling.length > 0) {
+        const n = this._llamaRolling.length;
+        let sumE2e = 0, sumTtft = 0, sumTps = 0;
+        for (const r of this._llamaRolling) {
+          sumE2e += r.e2e;
+          sumTtft += r.ttft;
+          sumTps += r.tpsPerSlot;
+        }
+        this.rollingAvgE2e = Math.round((sumE2e / n) * 1000) / 1000;
+        this.rollingAvgTtft = Math.round((sumTtft / n) * 1000) / 1000;
+        this.rollingAvgTpsPerSlot = Math.round((sumTps / n) * 100) / 100;
+      }
+    }
+  }
+
+  // ─── llama.cpp speculative-decode log tailing (re-applied from fork) ──
+  /**
+   * Tail the llama.cpp server log for "draft acceptance = X" lines, which the
+   * /slots API does NOT expose.
+   */
+  _tailLlamaLogForSpecDecode() {
+    try {
+      const stat = statSync(LLAMA_LOG_PATH);
+      if (!stat.isFile()) return;
+      const currentSize = stat.size;
+      if (currentSize < this._llamaLogSize) {
+        this._llamaLogSize = 0;
+      }
+      if (currentSize === this._llamaLogSize) return;
+
+      const fd = openSync(LLAMA_LOG_PATH, "r");
+      try {
+        const buf = Buffer.alloc(Math.min(currentSize - this._llamaLogSize, 512 * 1024));
+        const bytesRead = readSync(fd, buf, 0, buf.length, this._llamaLogSize);
+        this._llamaLogSize = currentSize;
+        if (bytesRead <= 0) return;
+
+        const text = buf.subarray(0, bytesRead).toString("utf8");
+        const re = /draft acceptance\s*=\s*([\d.]+)\s*\(\s*(\d+)\s+accepted\s*\/\s*(\d+)\s+generated\)[^,]*,\s*mean len\s*=\s*([\d.]+)/g;
+        let m;
+        let last = null;
+        while ((m = re.exec(text)) !== null) {
+          const rate = parseFloat(m[1]);
+          const accepted = parseInt(m[2], 10);
+          const generated = parseInt(m[3], 10);
+          const meanLen = parseFloat(m[4]);
+          if (Number.isFinite(rate)) {
+            last = { rate, accepted, generated, meanLen };
+          }
+        }
+        if (last) {
+          this.specAcceptanceRate = last.rate;
+          this.specAcceptedTokens = last.accepted;
+          this.specGeneratedTokens = last.generated;
+          this.specMeanLen = last.meanLen;
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch {}
+  }
+
   async _probeLlamaCpp() {
     const now = Date.now();
     const dtSec = (now - this.lastProbeTime) / 1000;
@@ -1274,6 +2075,7 @@ export class LlmProbe {
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
           this._setPrefillTps(totalPrefill, totalGen > 0);
           if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
+          this._applyLlamaExpandedSlots(slots, totalDecoded, promptedSum, dtSec);
         }
       }
     } catch {}
@@ -1299,6 +2101,7 @@ export class LlmProbe {
     } catch {}
 
     this.backendType = "llama.cpp";
+    this._tailLlamaLogForSpecDecode();
     return this._getSnapshot();
   }
 
@@ -1528,6 +2331,500 @@ export class LlmProbe {
     return { level, auth, scope, label, detail };
   }
 
+  async _collectRecipeInfo() {
+    try {
+      if (this.backendType === "ds4") {
+        this.recipeInfo = this._collectDs4RecipeInfo();
+      } else if (this.backendType === "sglang") {
+        this.recipeInfo = await this._collectSglangRecipeInfo();
+      } else if (this.backendType === "vllm") {
+        this.recipeInfo = this._collectVllmRecipeInfo();
+      } else {
+        this.recipeInfo = null;
+      }
+    } catch(e) {
+      console.error("[ds4-recipe] ERROR:", e.message, e.stack?.substring(0, 200));
+      this.recipeInfo = null;
+    }
+  }
+
+  /** Find the PID of the process listening on this.port by scanning host /proc. */
+  _findHostPid() {
+    try {
+      const procDir = HOST_PROC;
+      const entries = readdirSync(procDir);
+      for (const pid of entries) {
+        if (!/^\d+$/.test(pid)) continue;
+        const cmdlinePath = `${procDir}/${pid}/cmdline`;
+        try {
+          const cmdline = readFileSync(cmdlinePath, "utf8");
+          const parts = cmdline.split("\0").filter(Boolean);
+          if (parts.length === 0) continue;
+          // ds4-server or vllm or python processes
+          const exe = parts[0].toLowerCase();
+          if (exe.includes("ds4-server") || exe.includes("ds4")) {
+            // Check if this process has --port matching our port
+            const portArg = parts.find((p, i) => parts[i - 1] === "--port" && /^\d+$/.test(p));
+            if (portArg && parseInt(portArg) === this.port) return parseInt(pid);
+            // Also check for --host 0.0.0.0 --port <port> pattern
+            const allArgs = parts.join(" ");
+            if (allArgs.includes(`--port ${this.port}`) || allArgs.includes(`port=${this.port}`)) return parseInt(pid);
+          }
+          if (exe.includes("vllm") || exe.includes("python")) {
+            const allArgs = parts.join(" ");
+            if (allArgs.includes(`--port ${this.port}`) || allArgs.includes(`port=${this.port}`)) return parseInt(pid);
+          }
+        } catch {}
+      }
+    } catch {}
+    return null;
+  }
+
+
+  /**
+   * Read the served model's chat-template default reasoning_effort for vLLM.
+   * Resolves the container model path to the host filesystem via the vLLM
+   * process mountinfo, then parses the chat_template.jinja default. Returns
+   * null when it cannot be read (caller hides the card rather than guessing).
+   */
+  _vllmChatTemplateReasoningEffort() {
+    try {
+      const pid = this._findHostPid();
+      if (!pid) return null;
+      const cl = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+      let modelPath = null;
+      const modelMatch = cl.match(/--model\s+(\S+)/);
+      if (modelMatch) modelPath = modelMatch[1];
+      else {
+        const serveIdx = cl.indexOf("serve");
+        if (serveIdx >= 0) {
+          const rest = cl.slice(serveIdx + 5).trim();
+          const firstTok = rest.split(/\s+/)[0];
+          if (firstTok && !firstTok.startsWith("--")) modelPath = firstTok;
+        }
+      }
+      if (!modelPath) return null;
+      // Resolve container path -> host path via the vLLM process mountinfo.
+      let hostPath = modelPath;
+      try {
+        const mi = readFileSync(`${HOST_PROC}/${pid}/mountinfo`, "utf8");
+        // Pick the mount whose mountpoint is the LONGEST prefix of modelPath
+        // (e.g. /models over /) so the container path resolves to the host path.
+        let bestLen = -1;
+        for (const line of mi.split("\n")) {
+          const m = line.match(/^\d+ \d+ \d+:\d+ (\S+) (\S+)/);
+          if (m && modelPath.startsWith(m[2]) && m[2].length > bestLen) {
+            bestLen = m[2].length;
+            hostPath = m[1] + modelPath.slice(m[2].length);
+          }
+        }
+      } catch {}
+      const template = readFileSync(`${HOST_ROOT}${hostPath}/chat_template.jinja`, "utf8");
+      const m = template.match(/reasoning_effort\s*\|\s*default\s*\(\s*['"]([^'"]+)['"]\s*\)/);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Collect recipe info for the ds4 CUDA engine backend. */
+  _collectDs4RecipeInfo() {
+    const pid = this._findHostPid();
+    if (!pid) return null;
+
+    let environ = {};
+    let cmdline = "";
+    try {
+      const envRaw = readFileSync(`${HOST_PROC}/${pid}/environ`, "utf8");
+      for (const pair of envRaw.split("\0")) {
+        if (!pair) continue;
+        const eq = pair.indexOf("=");
+        if (eq > 0) environ[pair.slice(0, eq)] = pair.slice(eq + 1);
+      }
+    } catch {}
+    try {
+      cmdline = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    } catch {}
+
+    // Parse model file from cmdline: -m <path>
+    const modelMatch = cmdline.match(/-m\s+(\S+)/);
+    const modelPath = modelMatch ? modelMatch[1] : null;
+    const modelFile = modelPath ? modelPath.split("/").pop() : null;
+
+    // Detect quantization from model filename
+    let quantization = null;
+    if (modelFile) {
+      if (/IQ2XXS/i.test(modelFile)) quantization = "IQ2XXS";
+      else if (/IQ3/i.test(modelFile)) quantization = "IQ3";
+      else if (/IQ4/i.test(modelFile)) quantization = "IQ4";
+      else if (/Q2K/i.test(modelFile)) quantization = "Q2_K";
+      else if (/Q4_K/i.test(modelFile)) quantization = "Q4_K";
+      else if (/Q8_0/i.test(modelFile)) quantization = "Q8_0";
+      else if (/FP8/i.test(modelFile)) quantization = "FP8";
+      else if (/NVFP4/i.test(modelFile)) quantization = "NVFP4";
+    }
+
+    // Context length from cmdline: -c <num> (take last occurrence)
+    let contextLength = this.contextLength;
+    const ctxMatches = [...cmdline.matchAll(/-c\s+(\d+)/g)];
+    if (ctxMatches.length > 0) {
+      contextLength = parseInt(ctxMatches[ctxMatches.length - 1][1]);
+    }
+
+    // Max lanes from DS4_BATCH_FIT_HEADROOM_MB (maps to banks_total)
+    const maxLanes = this.banksTotal ?? null;
+
+    // DSpark config
+    const dsparkEnabled = environ.DS4_CONT_DSPARK === "1" || environ.DS4_CONT_DSPARK === "true";
+    const mtpMode = environ.DS4_CONT_MTP_MODE || null;
+    const dsparkModel = environ.DS4_DSPARK_MODEL || null;
+
+    let specDecodeMethod = null;
+    if (dsparkEnabled) {
+      const drafterFile = dsparkModel ? dsparkModel.split("/").pop() : null;
+      // k value: MTP mode 2 = k=4 for DSpark typically
+      const k = mtpMode ? `k=${mtpMode}` : "k=4";
+      specDecodeMethod = `DSpark ${k}`;
+    } else if (mtpMode) {
+      specDecodeMethod = `MTP k=${mtpMode}`;
+    }
+
+    // KV cache dtype: ds4 uses native CUDA cache, no env var for dtype
+    const kvCacheDtype = "native";
+
+    // Prefix caching: ds4 always has warm/prefix cache (warmRecords)
+    const prefixCaching = this.warmRecords != null ? this.warmRecords > 0 : null;
+
+    // Author attribution for ds4
+    const author = "@bleysg";
+    const authorName = "Bleys Goodson";
+
+    // Engine type
+    const engineType = "DS4 CUDA Engine";
+
+    // Container: native build
+    const containerImage = "Native build (Entrpi/ds4 fork)";
+
+    // Model display name from recipeMetadata
+    const modelName = this.recipeMetadata?.model || this.modelId || modelFile || null;
+
+    // Accept ratio
+    const acceptRatio = this.dsparkAcceptRatio ?? null;
+
+    // Uptime
+    const uptime = this.ds4Uptime ?? null;
+
+    return {
+      engineType,
+      modelName,
+      containerImage,
+      author,
+      authorName,
+      contextLength,
+      maxLanes,
+      specDecodeMethod,
+      quantization,
+      gmu: null, // ds4 doesn't expose GMU directly
+      kvCacheDtype,
+      prefixCaching,
+      acceptRatio,
+      uptime,
+    };
+  }
+
+  /** Collect recipe info for a vLLM container backend. */
+/** Collect recipe info for a vLLM container backend. */
+  _collectVllmRecipeInfo() {
+    // ── Source 1: docker (only reachable if the docker CLI is installed in this container) ──
+    let containerImage = null;
+    let containerName = null;
+    let cmdline = "";
+    let environ = {};
+    try {
+      // List containers, find one whose command line serves --port {this.port}.
+      // Host-networked containers (--network host) expose NO port mapping in
+      // {{.Ports}}, so match on the container's command line as well.
+      const containersRaw = execSync(
+        "docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Command}}'",
+        { timeout: 5000, encoding: "utf8" }
+      );
+      for (const line of containersRaw.trim().split("\n")) {
+        if (!line) continue;
+        const [name, image, ports, command] = line.split("\t");
+        const cmd = command || "";
+        const portMatch =
+          (ports && ports.includes(`${this.port}->`)) ||
+          cmd.includes(`--port ${this.port}`) ||
+          cmd.includes(`port=${this.port}`);
+        if (portMatch) {
+          containerImage = image;
+          containerName = name;
+          break;
+        }
+      }
+    } catch {}
+
+    // Pull env + cmdline from docker inspect when a container was found.
+    if (containerName) {
+      try {
+        const inspectRaw = execSync(
+          `docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ${containerName}`,
+          { timeout: 5000, encoding: "utf8" }
+        );
+        for (const line of inspectRaw.trim().split("\n")) {
+          if (!line) continue;
+          const eq = line.indexOf("=");
+          if (eq > 0) environ[line.slice(0, eq)] = line.slice(eq + 1);
+        }
+      } catch {}
+      try {
+        cmdline = execSync(
+          `docker inspect --format '{{range .Args}}{{.}} {{end}}' ${containerName}`,
+          { timeout: 5000, encoding: "utf8" }
+        ).trim();
+      } catch {}
+    }
+
+    // ── Source 2: host /proc (works even without docker access) ──
+    // The sparkDash container runs with pid:host and /proc mounted at HOST_PROC,
+    // so we can read the vLLM process cmdline directly. This is the primary path
+    // when the docker CLI is not installed inside the container.
+    if (!cmdline) {
+      const pid = this._findHostPid();
+      if (pid) {
+        try {
+          cmdline = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+        } catch {}
+        try {
+          const envRaw = readFileSync(`${HOST_PROC}/${pid}/environ`, "utf8");
+          for (const pair of envRaw.split("\0")) {
+            if (!pair) continue;
+            const eq = pair.indexOf("=");
+            if (eq > 0) environ[pair.slice(0, eq)] = pair.slice(eq + 1);
+          }
+        } catch {}
+      }
+    }
+
+    if (!cmdline) return null;
+
+    // Parse model from cmdline: --model <path>, or the positional arg after "serve"
+    let modelPath = null;
+    const modelMatch = cmdline.match(/--model\s+(\S+)/);
+    if (modelMatch) modelPath = modelMatch[1];
+    else {
+      const serveIdx = cmdline.indexOf("serve");
+      if (serveIdx >= 0) {
+        const rest = cmdline.slice(serveIdx + 5).trim();
+        const firstTok = rest.split(/\s+/)[0];
+        if (firstTok && !firstTok.startsWith("--")) modelPath = firstTok;
+      }
+    }
+    const modelFile = modelPath ? modelPath.split("/").pop() : null;
+    // Normalize HF cache snapshots into their actual repository identity so the
+    // dashboard shows the checkpoint/quant rather than only the served alias.
+    const canonicalModel = normalizeModelId(modelPath);
+
+    // Served model name (alias exposed via /v1/models)
+    const servedNameMatch = cmdline.match(/--served-model-name\s+(\S+)/);
+    const servedModelName = servedNameMatch ? servedNameMatch[1] : null;
+
+    // Detect quantization
+    let quantization = null;
+    const quantArg = cmdline.match(/--quantization\s+(\S+)/);
+    if (quantArg) {
+      quantization = quantArg[1].toUpperCase();
+    } else {
+      // A snapshot basename is only a hash; the canonical HF repo carries the quant.
+      const quantSource = canonicalModel || modelFile || "";
+      if (/NVFP4/i.test(quantSource)) quantization = "NVFP4";
+      else if (/FP8/i.test(quantSource)) quantization = "FP8";
+      else if (/AWQ/i.test(quantSource)) quantization = "AWQ";
+      else if (/GPTQ/i.test(quantSource)) quantization = "GPTQ";
+    }
+
+    // Context length from cmdline: --max-model-len <num>
+    let contextLength = this.contextLength;
+    const ctxMatch = cmdline.match(/--max-model-len\s+(\d+)/);
+    if (ctxMatch) contextLength = parseInt(ctxMatch[1]);
+
+    // Max lanes from cmdline: --tensor-parallel-size or -tp
+    let maxLanes = null;
+    const tpMatch = cmdline.match(/--tensor-parallel-size\s+(\d+)/);
+    if (tpMatch) maxLanes = parseInt(tpMatch[1]);
+    else {
+      const tpShort = cmdline.match(/(?:^|\s)-tp\s+(\d+)/);
+      if (tpShort) maxLanes = parseInt(tpShort[1]);
+    }
+
+    // Speculative decode method
+    let specDecodeMethod = null;
+    if (/--speculative-model/.test(cmdline) || /--speculative-config/.test(cmdline)) {
+      const numSpecMatch = cmdline.match(/--num-speculative-tokens\s+(\d+)/);
+      let k = numSpecMatch ? numSpecMatch[1] : null;
+      if (!k) {
+        // k may live inside the --speculative-config JSON, e.g. {"method":"mtp","num_speculative_tokens":3}
+        const scMatch = cmdline.match(/--speculative-config\s+(\S+)/);
+        if (scMatch) {
+          const scTok = scMatch[1].replace(/^["']|["']$/g, "");
+          try {
+            const sc = JSON.parse(scTok);
+            if (sc && sc.num_speculative_tokens != null) k = String(sc.num_speculative_tokens);
+          } catch {}
+        }
+      }
+      specDecodeMethod = `MTP k=${k || "?"}`;
+    }
+
+    // KV cache dtype
+    let kvCacheDtype = null;
+    const kvMatch = cmdline.match(/--kv-cache-dtype\s+(\S+)/);
+    if (kvMatch) kvCacheDtype = kvMatch[1];
+    else kvCacheDtype = "auto";
+
+    // Prefix caching: from cache_config_info enable_prefix_caching label, else
+    // fall back to the --enable-prefix-caching / --no-prefix-caching flags.
+    let prefixCaching = this._vllmPrefixCaching;
+    if (prefixCaching == null) {
+      if (/--enable-prefix-caching/.test(cmdline)) prefixCaching = true;
+      else if (/--no-prefix-caching/.test(cmdline)) prefixCaching = false;
+    }
+    try {
+      const pid = this._findHostPid();
+      if (pid) {
+        const cl = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+        if (/--enable-prefix-caching/.test(cl)) prefixCaching = true;
+        else if (/--no-prefix-caching/.test(cl)) prefixCaching = false;
+      }
+    } catch {}
+
+    // GMU
+    let gmu = null;
+    const gmuMatch = cmdline.match(/--gpu-memory-utilization\s+([\d.]+)/);
+    if (gmuMatch) gmu = parseFloat(gmuMatch[1]);
+
+    // Reasoning / tool-call parsers + speculative config
+    const reasoningParserMatch = cmdline.match(/--reasoning-parser\s+(\S+)/);
+    const reasoningParser = reasoningParserMatch ? reasoningParserMatch[1] : null;
+    const toolCallParserMatch = cmdline.match(/--tool-call-parser\s+(\S+)/);
+    const toolCallParser = toolCallParserMatch ? toolCallParserMatch[1] : null;
+    const speculativeConfigMatch = cmdline.match(/--speculative-config\s+(\S+)/);
+    const speculativeConfig = speculativeConfigMatch ? speculativeConfigMatch[1] : null;
+
+    // Author attribution for vLLM recipes
+    const author = "@styles01";
+    const authorName = "styles01";
+
+    // Engine type
+    const engineType = "vLLM";
+
+    // Prefer the canonical checkpoint identity to its user-facing API alias.
+    const modelName = canonicalModel || this.modelId || servedModelName || modelFile || null;
+
+    // Accept ratio
+    const acceptRatio = this.mtpAcceptanceRate ?? null;
+
+    // Populate recipeMetadata so the provenance section has structured fields
+    // (ownedBy, model, contextLength, parsers, etc.) even when docker is absent.
+    this.recipeMetadata = {
+      name: servedModelName || modelFile || this.modelId || null,
+      model: servedModelName || modelFile || this.modelId || null,
+      contextLength,
+      ownedBy: "vllm",
+      supportedParameters: [],
+      quantization,
+      gmu,
+      maxModelLen: contextLength,
+      servedModelName,
+      reasoningParser,
+      toolCallParser,
+      speculativeConfig,
+      modelPath,
+    };
+
+    return {
+      engineType,
+      modelName,
+      containerImage,
+      author,
+      authorName,
+      contextLength,
+      maxLanes,
+      specDecodeMethod,
+      quantization,
+      gmu,
+      kvCacheDtype,
+      prefixCaching,
+      acceptRatio,
+      uptime: this.ds4Uptime ?? null,
+      servedModelName,
+      reasoningParser,
+      toolCallParser,
+      speculativeConfig,
+      modelPath,
+    };
+  }
+
+  /**
+   * Observational exposure hint from probe target + unauthenticated reachability.
+   * Does not claim process bind address (0.0.0.0 vs interface).
+   */
+  _buildPosture() {
+    if (this.authOpen == null) return null;
+
+    const host = llmProbeHost(this.spark);
+    const scope = classifyHostScope(host);
+    const keyed = Boolean(this._apiKey());
+    /** @type {"open" | "protected" | "keyed"} */
+    let auth;
+    if (keyed) {
+      // Key configured: success → keyed; 401/403 → protected (rejected)
+      auth = this.authOpen === false ? "protected" : "keyed";
+    } else {
+      auth = this.authOpen ? "open" : "protected";
+    }
+
+    let level = "ok";
+    if (auth === "open") {
+      if (scope === "public") level = "danger";
+      else if (scope === "local") level = "ok";
+      else level = "warn"; // lan or unknown hostname
+    } else if (keyed && auth === "protected") {
+      level = "danger";
+    }
+
+    const scopeWords = {
+      local: "loopback",
+      lan: "LAN",
+      public: "public",
+      unknown: "unknown-host",
+    };
+    const shortScope = {
+      local: "Local",
+      lan: "LAN",
+      public: "Public",
+      unknown: "Host",
+    };
+    const label =
+      auth === "protected"
+        ? keyed
+          ? "Bad API key"
+          : "Auth required"
+        : auth === "keyed"
+          ? `API key · ${shortScope[scope]}`
+          : `Open · ${shortScope[scope]}`;
+    const detail =
+      auth === "protected"
+        ? keyed
+          ? `Configured API key was rejected (401/403) · ${scopeWords[scope]} target (${host || "—"}).`
+          : `API key required · ${scopeWords[scope]} target (${host || "—"}). Based on the configured probe host, not the process bind address.`
+        : auth === "keyed"
+          ? `Using configured API key · ${scopeWords[scope]} target (${host || "—"}). Based on the configured probe host, not the process bind address.`
+          : `Unauthenticated · ${scopeWords[scope]} target (${host || "—"}). Based on the configured probe host, not the process bind address.`;
+
+    return { level, auth, scope, label, detail };
+  }
+
   _getSnapshot() {
     const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
     return {
@@ -1539,6 +2836,7 @@ export class LlmProbe {
       gpuMemoryUtilization: this.gpuMemoryUtilization,
       slotsActive: this.slotsActive,
       slotsTotal: this.slotsTotal,
+      waitingSlots: this.requestsWaiting ?? this.waitingSlots ?? 0,
       generationTps: this.generationTps,
       prefillTps: this.prefillTps,
       cachedPrefillTps: this.cachedPrefillTps,
@@ -1554,13 +2852,78 @@ export class LlmProbe {
       e2eP95Seconds: this.e2eP95Seconds,
       itlP95Seconds: this.itlP95Seconds,
       mtpAcceptanceRate: this.mtpAcceptanceRate,
+      ttft: this.ttft ?? this.ttftP95Seconds,
+      e2eLatency: this.e2eLatency ?? this.e2eP95Seconds,
+      genTokensPerReq: this.genTokensPerReq,
+      mtpAcceptedTokens: this.mtpAcceptedTokens,
+      mtpDraftedTokens: this.mtpDraftedTokens,
+      perPositionAcceptance: this.perPositionAcceptance,
+      aggregateDecodeTps: this.aggregateDecodeTps,
+      rollingAvgE2e: this.rollingAvgE2e,
+      rollingAvgTtft: this.rollingAvgTtft,
+      rollingAvgTokensPerReq: this.rollingAvgTokensPerReq,
+      rollingAvgTpsPerSlot: this.rollingAvgTpsPerSlot,
       posture: this._buildPosture(),
+      recipeInfo: this.recipeInfo,
+      recipeMetadata: this.recipeMetadata,
+      peakAggregateTps: this.peakAggregateTps,
+      perStreamHigh: this.perStreamHigh,
+      perStreamLow: this.perStreamLow,
+      perStreamAvg: this.perStreamAvg,
+      totalTokensDecoded: this.totalTokensDecoded,
+      dsparkAcceptRatio: this.dsparkAcceptRatio,
+      banksLive: this.banksLive,
+      banksTotal: this.banksTotal,
+      kvPagesResident: this.kvPagesResident,
+      prefillCached: this.prefillCached,
+      prefillComputed: this.prefillComputed,
+      specDrafts: this.specDrafts,
+      specHits: this.specHits,
+      warmRecords: this.warmRecords,
+      specQuench: this.specQuench,
+      tokPerStep: this.tokPerStep,
+      decodeSteps: this.decodeSteps,
+      derivedArtifacts: this.derivedArtifacts,
+      derivedArtifactBytes: this.derivedArtifactBytes,
+      ds4Uptime: this.ds4Uptime,
+      admitsCold: this.admitsCold,
+      admitsWarm: this.admitsWarm,
+      admitsFork: this.admitsFork,
+      admitsPartialFork: this.admitsPartialFork,
+      admitsPartialTruncate: this.admitsPartialTruncate,
+      requestsStarted: this.requestsStarted,
+      requestsCompleted: this.requestsCompleted,
+      requestsFailed: this.requestsFailed,
+      requestsInflight: this.requestsInflight,
+      activeContext: this.activeContext,
+      activeContextTs: this.activeContextTs,
+      contextUsedBytes: this.contextUsedBytes,
+      reasoningEffort: this.reasoningEffort,
+      reasoningEffortTs: this.reasoningEffortTs,
+      // llama.cpp expanded surface
+      promptTokens: this.promptTokens,
+      promptTokensProcessed: this.promptTokensProcessed,
+      promptTokensCache: this.promptTokensCache,
+      cacheHitRatio: this.cacheHitRatio,
+      nCtx: this.nCtx,
+      isProcessing: this.isProcessing,
+      nRemain: this.nRemain,
+      nDecoded: this.nDecoded,
+      samplingParams: this.samplingParams,
+      speculativeTypes: this.speculativeTypes,
+      reasoningFormat: this.reasoningFormat,
+      chatFormat: this.chatFormat,
+      samplers: this.samplers,
+      specAcceptanceRate: this.specAcceptanceRate,
+      specAcceptedTokens: this.specAcceptedTokens,
+      specGeneratedTokens: this.specGeneratedTokens,
+      specMeanLen: this.specMeanLen,
       error: this.error,
     };
   }
 
   _defaultLlm() {
-    return {
+    const snap = {
       available: false,
       backend: this.backendType,
       modelId: null,
@@ -1573,20 +2936,92 @@ export class LlmProbe {
       prefillTps: 0,
       cachedPrefillTps: null,
       uncachedPrefillTps: null,
+      ttftSeconds: null,
       totalOutputTokens: 0,
       kvCacheUsage: null,
       requestsRunning: null,
       requestsWaiting: null,
       ttftP95Seconds: null,
-      ttftSeconds: null,
       preemptionsTotal: null,
       prefixCacheHitRate: null,
       e2eP95Seconds: null,
       itlP95Seconds: null,
       mtpAcceptanceRate: null,
+      ttft: null,
+      e2eLatency: null,
+      genTokensPerReq: null,
+      mtpAcceptedTokens: null,
+      mtpDraftedTokens: null,
+      perPositionAcceptance: null,
+      aggregateDecodeTps: null,
+      rollingAvgE2e: null,
+      rollingAvgTtft: null,
+      rollingAvgTokensPerReq: null,
+      rollingAvgTpsPerSlot: null,
       posture: this._buildPosture(),
       error: this.error,
+      ds4Uptime: null,
+      peakAggregateTps: 0,
+      perStreamHigh: null,
+      perStreamLow: null,
+      perStreamAvg: null,
+      totalTokensDecoded: null,
+      dsparkAcceptRatio: null,
+      banksLive: null,
+      banksTotal: null,
+      kvPagesResident: null,
+      prefillCached: null,
+      prefillComputed: null,
+      specDrafts: null,
+      specHits: null,
+      specQuench: null,
+      warmRecords: null,
+      derivedArtifacts: null,
+      derivedArtifactBytes: null,
+      requestsStarted: null,
+      requestsCompleted: null,
+      requestsFailed: null,
+      requestsRefusedDeepSerial: null,
+      requestsInflight: null,
+      requestsSerial: null,
+      contAdmitRejects: null,
+      contBatchFailures: null,
+      graphFitRefusals: null,
+      admitsCold: null,
+      admitsWarm: null,
+      admitsFork: null,
+      admitsPartialFork: null,
+      admitsPartialTruncate: null,
+      decodeSteps: null,
+      tokPerStep: null,
+      recipeMetadata: null,
+      recipeInfo: null,
+      reasoningEffort: null,
+      reasoningEffortTs: null,
+      activeContext: null,
+      activeContextTs: null,
+      contextUsedBytes: null,
+      waitingSlots: 0,
+      // llama.cpp expanded surface
+      promptTokens: null,
+      promptTokensProcessed: null,
+      promptTokensCache: null,
+      cacheHitRatio: null,
+      nCtx: null,
+      isProcessing: false,
+      nRemain: null,
+      nDecoded: null,
+      samplingParams: null,
+      speculativeTypes: null,
+      reasoningFormat: null,
+      chatFormat: null,
+      samplers: null,
+      specAcceptanceRate: null,
+      specAcceptedTokens: null,
+      specGeneratedTokens: null,
+      specMeanLen: null,
     };
+    return snap;
   }
 
   // ─── HTTP helpers ────────────────────────────────────────
@@ -1598,10 +3033,10 @@ export class LlmProbe {
     return key || null;
   }
 
-  async _fetch(url) {
+  async _fetch(url, init) {
     const headers = {};
     const apiKey = this._apiKey();
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    return fetch(url, { signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS), headers });
+    return fetch(url, { signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS), headers, ...(init || {}) });
   }
 }
