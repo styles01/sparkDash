@@ -415,7 +415,7 @@ export class SparkMonitor {
     this._restartTailscalePollInterval();
     // Liveness on a slightly slower cadence
     this._intervals.push(setInterval(() => this._checkOnline(), POLL_INTERVAL_LIVENESS));
-    console.log(`[SparkMonitor] ${this.spark.id} started`);
+    console.log(`[SparkMonitor] ${this.spark.id} started — llmProbes=${this.llmProbes.size} ports=[${[...this.llmProbes.keys()].join(",")}] workerNode=${!!this.spark.workerNode}`);
   }
 
   /** Stop background polling. */
@@ -614,9 +614,12 @@ export class SparkMonitor {
           break;
         case "llm":
           // Probe all ports in parallel
+          const _llmT0 = Date.now();
           result = await Promise.all(
             Array.from(this.llmProbes.values()).map((probe) => probe.probe())
           );
+          console.log(`[SparkMonitor] ${this.spark.id} llm poll done: ${result.length} probe(s), took=${Date.now()-_llmT0}ms, ` +
+            result.map((r,i)=>`[#${i} avail=${r.available} backend=${r.backend} model=${r.modelId}]`).join(" "));
           break;
         case "comfy":
           result = this.comfyProbe ? await this.comfyProbe.probe() : null;

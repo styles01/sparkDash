@@ -22,6 +22,8 @@ interface LlmPanelProps {
   llmPorts?: number[];
   hasApiKey?: boolean;
   onRemovePort?: (port: number) => void;
+  /** Total number of LLM ports configured for this Spark (controls remove-button visibility). */
+  llmPortsCount?: number;
   className?: string;
 }
 
@@ -563,6 +565,17 @@ export function LlmPanel({
             <GearIcon />
             <span>{showSettings ? "Done" : "Settings"}</span>
           </button>
+          {llmPortsCount != null && llmPortsCount > 1 && onRemovePort && (
+            <button
+              type="button"
+              title={`Remove port :${llmPort}`}
+              onClick={() => onRemovePort(llmPort)}
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-surface-hover"
+            >
+              <span>×</span>
+              <span>Remove</span>
+            </button>
+          )}
         </div>
       }
     >

@@ -9,6 +9,9 @@ import { useEffect, useRef } from "react";
  *
  * Each series: { label, color (CSS var or hex), data: number[] }
  * All series share the same x positions; missing trailing values are skipped.
+ *
+ * Supports dual y-axis: series with yAxis: 'right' are scaled to a secondary
+ * axis drawn on the right side. Left-axis series use the primary (left) axis.
  */
 
 export interface ChartSeries {
@@ -17,20 +20,26 @@ export interface ChartSeries {
   data: number[];
   /** Optional: draw a translucent area-fill under the line. */
   area?: boolean;
+  /** Which y-axis to scale against. Default 'left'. */
+  yAxis?: "left" | "right";
 }
 
 export interface TelemetryChartProps {
   series: ChartSeries[];
   /** Max number of samples shown (the x-axis window). */
   maxPoints?: number;
-  /** Fixed y-axis maximum; auto-scales from data when omitted. */
+  /** Fixed y-axis maximum (left axis); auto-scales from data when omitted. */
   yMax?: number;
-  /** Fixed y-axis minimum (default 0). */
+  /** Fixed y-axis maximum for the right axis; auto-scales from data when omitted. */
+  yMaxRight?: number;
+  /** Fixed y-axis minimum (default 0, applies to both axes). */
   yMin?: number;
   /** Height in CSS pixels (canvas is sized to container width). */
   height?: number;
   /** Label for the y-axis values, e.g. "tok/s" or "s". */
   yUnit?: string;
+  /** Label for the right y-axis values (shown in right ticks). */
+  yUnitRight?: string;
   /** Show a faint legend top-left. */
   legend?: boolean;
   /** ClassName passthrough. */
@@ -38,6 +47,7 @@ export interface TelemetryChartProps {
 }
 
 const PAD = { left: 44, right: 12, top: 14, bottom: 22 };
+const PAD_DUAL = { left: 44, right: 44, top: 14, bottom: 22 };
 
 function readCssVar(name: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
@@ -79,9 +89,11 @@ export function TelemetryChart({
   series,
   maxPoints = 60,
   yMax,
+  yMaxRight,
   yMin = 0,
   height = 160,
   yUnit = "",
+  yUnitRight = "",
   legend = true,
   className = "",
 }: TelemetryChartProps) {
@@ -89,8 +101,8 @@ export function TelemetryChart({
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
   // Keep latest props in a ref so the rAF loop reads fresh data without restarting.
-  const propsRef = useRef({ series, maxPoints, yMax, yMin, yUnit, legend });
-  propsRef.current = { series, maxPoints, yMax, yMin, yUnit, legend };
+  const propsRef = useRef({ series, maxPoints, yMax, yMaxRight, yMin, yUnit, yUnitRight, legend });
+  propsRef.current = { series, maxPoints, yMax, yMaxRight, yMin, yUnit, yUnitRight, legend };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -116,33 +128,65 @@ export function TelemetryChart({
       ctx.clearRect(0, 0, cssW, cssH);
 
       const colors = resolveColors();
-      const { series: ss, maxPoints: mp, yMax: fixedMax, yMin: lo, yUnit: unit, legend: showLegend } = propsRef.current;
+      const {
+        series: ss,
+        maxPoints: mp,
+        yMax: fixedMax,
+        yMaxRight: fixedMaxRight,
+        yMin: lo,
+        yUnit: unit,
+        yUnitRight: unitRight,
+        legend: showLegend,
+      } = propsRef.current;
 
-      // Determine y range from all series
-      let dataMax = -Infinity;
-      let dataMin = Infinity;
+      // Check if any series uses the right axis
+      const hasRightAxis = ss.some((s) => s.yAxis === "right");
+      const pad = hasRightAxis ? PAD_DUAL : PAD;
+
+      // Determine y range for LEFT axis (series without yAxis='right')
+      let leftDataMax = -Infinity;
+      let leftDataMin = Infinity;
       for (const s of ss) {
+        if (s.yAxis === "right") continue;
         for (const v of s.data) {
           if (Number.isFinite(v)) {
-            if (v > dataMax) dataMax = v;
-            if (v < dataMin) dataMin = v;
+            if (v > leftDataMax) leftDataMax = v;
+            if (v < leftDataMin) leftDataMin = v;
           }
         }
       }
-      if (!Number.isFinite(dataMax)) dataMax = 1;
-      if (!Number.isFinite(dataMin)) dataMin = 0;
-      const yTop = fixedMax != null ? fixedMax : niceMax(Math.max(dataMax, 1));
-      const yBot = lo;
-      const ySpan = yTop - yBot || 1;
+      if (!Number.isFinite(leftDataMax)) leftDataMax = 1;
+      if (!Number.isFinite(leftDataMin)) leftDataMin = 0;
+      const yTopLeft = fixedMax != null ? fixedMax : niceMax(Math.max(leftDataMax, 1));
+      const yBotLeft = lo;
+      const ySpanLeft = yTopLeft - yBotLeft || 1;
 
-      const plotX0 = PAD.left;
-      const plotX1 = cssW - PAD.right;
-      const plotY0 = PAD.top;
-      const plotY1 = cssH - PAD.bottom;
+      // Determine y range for RIGHT axis (series with yAxis='right')
+      let rightDataMax = -Infinity;
+      let rightDataMin = Infinity;
+      for (const s of ss) {
+        if (s.yAxis !== "right") continue;
+        for (const v of s.data) {
+          if (Number.isFinite(v)) {
+            if (v > rightDataMax) rightDataMax = v;
+            if (v < rightDataMin) rightDataMin = v;
+          }
+        }
+      }
+      if (!Number.isFinite(rightDataMax)) rightDataMax = 1;
+      if (!Number.isFinite(rightDataMin)) rightDataMin = 0;
+      const yTopRight = fixedMaxRight != null ? fixedMaxRight : niceMax(Math.max(rightDataMax, 1));
+      const yBotRight = lo;
+      const ySpanRight = yTopRight - yBotRight || 1;
+
+      const plotX0 = pad.left;
+      const plotX1 = cssW - pad.right;
+      const plotY0 = pad.top;
+      const plotY1 = cssH - pad.bottom;
       const plotW = plotX1 - plotX0;
       const plotH = plotY1 - plotY0;
 
-      // Grid + y-axis ticks
+      // Grid + LEFT y-axis ticks
       ctx.font = "10px ui-monospace, 'JetBrains Mono', monospace";
       ctx.textBaseline = "middle";
       ctx.textAlign = "right";
@@ -150,7 +194,7 @@ export function TelemetryChart({
       for (let i = 0; i <= ticks; i++) {
         const frac = i / ticks;
         const y = plotY1 - frac * plotH;
-        const val = yBot + frac * ySpan;
+        const val = yBotLeft + frac * ySpanLeft;
         ctx.strokeStyle = colors.grid;
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -159,6 +203,20 @@ export function TelemetryChart({
         ctx.stroke();
         ctx.fillStyle = colors.muted;
         ctx.fillText(formatTick(val, unit), plotX0 - 6, y);
+      }
+
+      // RIGHT y-axis ticks (only when dual-axis)
+      if (hasRightAxis) {
+        ctx.textAlign = "left";
+        for (let i = 0; i <= ticks; i++) {
+          const frac = i / ticks;
+          const y = plotY1 - frac * plotH;
+          const val = yBotRight + frac * ySpanRight;
+          // No grid lines for right axis (avoid clutter), just labels
+          ctx.fillStyle = colors.muted;
+          ctx.fillText(formatTick(val, unitRight || unit), plotX1 + 6, y);
+        }
+        ctx.textAlign = "right"; // reset
       }
 
       // Plot frame
@@ -184,6 +242,11 @@ export function TelemetryChart({
         const data = s.data;
         if (data.length < 1) continue;
         const n = data.length;
+        const isRight = s.yAxis === "right";
+        const yTop = isRight ? yTopRight : yTopLeft;
+        const yBot = isRight ? yBotRight : yBotLeft;
+        const ySpan = yTop - yBot || 1;
+
         // Map data[i] -> x position within the window. Latest sample at right edge.
         const xFor = (i: number) => plotX0 + (mp <= 1 ? plotW : (i / (mp - 1)) * plotW);
         const yFor = (v: number) => plotY1 - ((Math.min(yTop, Math.max(yBot, v)) - yBot) / ySpan) * plotH;

@@ -307,7 +307,9 @@ export class LlmProbe {
 
   /** Probe the LLM server and return a snapshot. */
   async probe() {
+    this._probeT0 = Date.now();
     try {
+      console.log(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} probe() start url=${this.baseUrl}`);
       const shouldDetect =
         this.serverIsOpenAI === null ||
         Date.now() - this._lastDetectAt > REDETECT_INTERVAL_MS;
@@ -343,10 +345,12 @@ export class LlmProbe {
   _noteSuccess() {
     this._consecutiveFailures = 0;
     this.error = null;
+    console.log(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} OK backend=${this.backendType} model=${this.modelId} slotsActive=${this.slotsActive} genTps=${this.generationTps} prefillTps=${this.prefillTps} took=${Date.now()-this._probeT0}ms`);
   }
 
   _noteFailure(message) {
     this.error = message;
+    console.warn(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} failure: ${message} (consecutive=${this._consecutiveFailures})`);
     this._consecutiveFailures += 1;
     if (this._consecutiveFailures >= FAIL_RESET_THRESHOLD) {
       this._resetDetection();
@@ -526,6 +530,7 @@ export class LlmProbe {
 
     this.serverIsOpenAI = null;
     this.backendType = null;
+    console.log(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} detection FAILED (no /slots, no /v1/models)`);
   }
 
   /**
@@ -723,6 +728,7 @@ export class LlmProbe {
         /* metrics optional */
       }
       await this._enrichSglangModelInfo();
+      await this._collectRecipeInfo();
       return this._getSnapshot();
     }
 
@@ -763,6 +769,7 @@ export class LlmProbe {
         this.backendType = "vllm";
       }
     }
+    if (this.backendType === "vllm" || this.backendType === "sglang") await this._collectRecipeInfo();
 
     return this._getSnapshot();
   }
@@ -1108,6 +1115,15 @@ export class LlmProbe {
       mtpAccepted != null && mtpDrafted != null && mtpDrafted > 0
         ? Math.round((mtpAccepted / mtpDrafted) * 10000) / 10000
         : null;
+
+    // Reasoning effort — vLLM has no per-request effort gauge; read the served
+    // model's chat-template default reasoning_effort (e.g. "medium" for Qwen3.8).
+    // Fall back to null (hide the card) rather than guessing from the
+    // --reasoning-parser flag, which does NOT equal reasoning effort.
+    if (this.reasoningEffort == null) {
+      this.reasoningEffort = this._vllmChatTemplateReasoningEffort();
+      if (this.reasoningEffort != null) this.reasoningEffortTs = Date.now();
+    }
   }
 
   /**
@@ -2919,6 +2935,26 @@ export class LlmProbe {
       specGeneratedTokens: this.specGeneratedTokens,
       specMeanLen: this.specMeanLen,
       error: this.error,
+// ── Expanded telemetry (flattened from vllmParser output) ──
+      runningSlots: t?.runningSlots,
+      waitingSlots: t?.waitingSlots,
+      kvCacheUsage: t?.kvCacheUsage,
+      ttft: t?.ttft,
+      e2eLatency: t?.e2eRequestLatency,
+      interTokenLatency: t?.interTokenLatency,
+      promptTokensPerReq: t?.promptTokensPerRequest,
+      genTokensPerReq: t?.generationTokensPerRequest,
+      mtpAcceptanceRate: t?.specAcceptanceRate,
+      mtpAcceptedTokens: t?.specAcceptedTokens,
+      mtpDraftedTokens: t?.specDraftedTokens,
+      prefixCacheHitRate: t?.prefixCacheHitRate,
+      perPositionAcceptance: t?.specPerPositionAcceptance,
+      rollingAvgE2e: t?.rolling?.avgE2eLatency,
+      rollingAvgTtft: t?.rolling?.avgTtft,
+      rollingAvgTokensPerReq: t?.rolling?.avgTokensPerRequest,
+      rollingAvgTpsPerSlot: t?.rolling?.avgTpsPerSlot,
+      // Keep the raw nested object for debugging / future use
+      vllmTelemetry: t,
     };
   }
 
