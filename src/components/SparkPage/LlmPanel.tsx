@@ -29,7 +29,7 @@ interface LlmPanelProps {
 
 const VLLM_METRIC_INFO = {
   kvCache:
-    "Fraction of the engine's KV cache memory currently in use (0–100%). High values (≥80%) mean little room for new or long contexts and often lead to queuing or preemptions.",
+    "Fraction of the engine KV cache memory currently in use (0-100%). High values mean little room for new or long contexts and often lead to queuing or preemptions.",
   requests:
     "Run = requests actively generating on the GPU. Wait = accepted but not yet scheduled (capacity or constraints). Growing wait with high KV cache usually means the server is overloaded.",
   ttftP95:
@@ -37,13 +37,13 @@ const VLLM_METRIC_INFO = {
   preempts:
     "Cumulative times the engine paused a running request to free KV cache for others. Rising under load signals memory pressure; zero is normal when the server is comfortable.",
   prefixCache:
-    "Lifetime fraction of prefix-cache lookups that hit (hits ÷ queries). Higher means more prompt reuse and less prefill work; — when the series is missing or unused.",
+    "Lifetime fraction of prefix-cache lookups that hit (hits / queries). Higher means more prompt reuse and less prefill work.",
   e2eP95:
     "95th percentile end-to-end request latency from the engine’s request history: arrival until the request finishes. Includes queue wait, prefill, and decode—not just token generation speed.",
   itlP95:
     "95th percentile inter-token latency (time between successive output tokens) from the engine’s request history. Spikes mean decode stalls or contention; lower is smoother streaming.",
   mtpAccept:
-    "Lifetime speculative / MTP acceptance rate (accepted draft tokens ÷ drafted tokens). Higher means speculative decoding is paying off; — when speculation is off or unused.",
+    "Lifetime speculative / MTP acceptance rate (accepted draft tokens / drafted tokens). Higher means speculative decoding is paying off.",
 } as const;
 
 const LAUNCHER_BTN =
@@ -267,10 +267,8 @@ function LlmLaunchers({
   );
 }
 
-/** Backend badge — neutral surfaces with a single accent dot. No blue/purple. */
 function BackendBadge({ backend }: { backend: string | null }) {
   if (!backend) return <span className="text-xs text-muted">No backend</span>;
-
   const labels: Record<string, string> = {
     vllm: "vLLM",
     "llama.cpp": "llama.cpp",
@@ -279,7 +277,6 @@ function BackendBadge({ backend }: { backend: string | null }) {
     exl3: "EXL3",
     q27: "q27",
   };
-
   return (
     <span className="llm-badge">
       <span className="h-1.5 w-1.5 rounded-full bg-accent" />
@@ -312,7 +309,6 @@ function MetricInfoTip({
   text,
   openId,
   setOpenId,
-  /** Anchor tooltip to the right so edge columns don't clip off-screen */
   align = "left",
 }: {
   id: string;
@@ -324,39 +320,27 @@ function MetricInfoTip({
 }) {
   const open = openId === id;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   const clearTimer = useCallback(() => {
     if (timer.current != null) {
       clearTimeout(timer.current);
       timer.current = null;
     }
   }, []);
-
   const scheduleClose = useCallback(() => {
     clearTimer();
     timer.current = setTimeout(() => setOpenId(null), 2000);
   }, [clearTimer, setOpenId]);
-
   useEffect(() => () => clearTimer(), [clearTimer]);
-
   return (
     <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted">
       <span>{label}</span>
       <button
         type="button"
         onClick={() => {
-          if (open) {
-            clearTimer();
-            setOpenId(null);
-          } else {
-            setOpenId(id);
-            scheduleClose();
-          }
+          if (open) { clearTimer(); setOpenId(null); }
+          else { setOpenId(id); scheduleClose(); }
         }}
-        onMouseEnter={() => {
-          clearTimer();
-          setOpenId(id);
-        }}
+        onMouseEnter={() => { clearTimer(); setOpenId(id); }}
         onMouseLeave={scheduleClose}
         className="relative cursor-pointer opacity-60 hover:opacity-100"
         aria-label={`${label} info`}
@@ -366,9 +350,7 @@ function MetricInfoTip({
           <div
             onMouseEnter={clearTimer}
             onMouseLeave={scheduleClose}
-            className={`absolute top-full z-20 mt-1 w-52 max-w-[min(13rem,calc(100vw-1.5rem))] rounded-md border border-border bg-surface-elevated px-3 py-2 text-left text-[11px] font-normal normal-case leading-snug text-text shadow-lg ${
-              align === "right" ? "right-0 left-auto" : "left-0 right-auto"
-            }`}
+            className={`absolute top-full z-20 mt-1 w-52 max-w-[min(13rem,calc(100vw-1.5rem))] rounded-md border border-border bg-surface-elevated px-3 py-2 text-left text-[11px] font-normal normal-case leading-snug text-text shadow-lg ${align === "right" ? "right-0 left-auto" : "left-0 right-auto"}`}
           >
             {text}
           </div>
@@ -433,12 +415,8 @@ export function LlmPanel({
   const engineInfoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearEngineInfoTimer = useCallback(() => {
-    if (engineInfoTimer.current != null) {
-      clearTimeout(engineInfoTimer.current);
-      engineInfoTimer.current = null;
-    }
+    if (engineInfoTimer.current != null) { clearTimeout(engineInfoTimer.current); engineInfoTimer.current = null; }
   }, []);
-
   const startEngineInfoTimer = useCallback(() => {
     clearEngineInfoTimer();
     engineInfoTimer.current = setTimeout(() => setEngineInfoOpen(false), 2000);
@@ -451,7 +429,6 @@ export function LlmPanel({
   const uncachedPrefillTps = llm?.uncachedPrefillTps ?? 0;
   const available = llm?.available ?? false;
 
-  // Keep draft in sync when server pushes a different port (other tab / reload)
   useEffect(() => {
     if (!showSettings) {
       setPortDraft(String(llmPort));
@@ -525,6 +502,7 @@ export function LlmPanel({
   const slots: SlotTelemetry[] = llm?.slots ?? [];
   const mtpAccepted = llm?.mtpAcceptedTokens ?? null;
   const mtpDrafted = llm?.mtpDraftedTokens ?? null;
+  const isDs4 = llm?.backend === "ds4";
 
   return (
     <Panel
@@ -535,14 +513,8 @@ export function LlmPanel({
       actions={
         <div className="flex items-center gap-1.5">
           {onRemovePort && (
-            <button
-              type="button"
-              title={`Remove port ${llmPort}`}
-              onClick={() => onRemovePort(llmPort)}
-              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-danger/10"
-            >
-              <span aria-hidden>×</span>
-              <span>Remove</span>
+            <button type="button" title={`Remove port ${llmPort}`} onClick={() => onRemovePort(llmPort)} className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-danger/10">
+              <span aria-hidden>\u00D7</span><span>Remove</span>
             </button>
           )}
           <button
@@ -566,14 +538,8 @@ export function LlmPanel({
             <span>{showSettings ? "Done" : "Settings"}</span>
           </button>
           {llmPortsCount != null && llmPortsCount > 1 && onRemovePort && (
-            <button
-              type="button"
-              title={`Remove port :${llmPort}`}
-              onClick={() => onRemovePort(llmPort)}
-              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-surface-hover"
-            >
-              <span>×</span>
-              <span>Remove</span>
+            <button type="button" title={`Remove port :${llmPort}`} onClick={() => onRemovePort(llmPort)} className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-surface-hover">
+              <span>\u00D7</span><span>Remove</span>
             </button>
           )}
         </div>
@@ -719,6 +685,74 @@ export function LlmPanel({
               {llm.modelPath}
             </div>
           )}
+
+          {/* ── DS4 ENGINE METRICS PANEL ─────────────────────── */}
+          {isDs4 && (
+            <div className="llm-chart-block" style={{ borderTop: "1px solid var(--color-border)", paddingTop: "0.75rem" }}>
+              <div className="llm-chart-title">DS4 Engine Metrics <span className="llm-chart-sub">CUDA engine telemetry</span></div>
+
+              {/* Peak Aggregate + Per-Stream + Total Tokens */}
+              <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+                <StatCard label="Peak Aggregate tok/s" value={fmtNum(llm?.peakAggregateTps, 1)} valueColor={tpsColor(llm?.peakAggregateTps ?? 0)} />
+                <StatCard label="Per-Stream High" value={fmtNum(llm?.perStreamHigh, 1)} valueColor={tpsColor(llm?.perStreamHigh ?? 0)} />
+                <StatCard label="Per-Stream Low" value={fmtNum(llm?.perStreamLow, 1)} valueColor={tpsColor(llm?.perStreamLow ?? 0)} />
+                <StatCard label="Per-Stream Avg" value={fmtNum(llm?.perStreamAvg, 1)} valueColor={tpsColor(llm?.perStreamAvg ?? 0)} />
+                <StatCard label="Total Tokens" value={fmtInt(llm?.totalTokensDecoded)} valueColor="var(--color-accent)" />
+                <StatCard label="DSpark Accept" value={pct(llm?.dsparkAcceptRatio, 1)} valueColor={mtpColor(llm?.dsparkAcceptRatio)} bar={llm?.dsparkAcceptRatio != null ? { pct: llm.dsparkAcceptRatio * 100, color: mtpColor(llm.dsparkAcceptRatio) } : undefined} />
+              </div>
+
+              {/* Banks + KV + Prefill + Spec */}
+              <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+                <StatCard label="Banks live/total" value={fmtInt(llm?.banksLive)} sub={llm?.banksTotal != null ? `of ${llm.banksTotal}` : undefined} valueColor={(llm?.banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} bar={llm?.banksTotal != null && llm.banksTotal > 0 ? { pct: ((llm?.banksLive ?? 0) / llm.banksTotal) * 100, color: "var(--color-accent)" } : undefined} />
+                <StatCard label="KV pages resident" value={fmtInt(llm?.kvPagesResident)} valueColor="var(--color-text)" />
+                <StatCard label="Prefill cached" value={fmtInt(llm?.prefillCached)} valueColor="var(--color-success)" />
+                <StatCard label="Prefill computed" value={fmtInt(llm?.prefillComputed)} valueColor="var(--color-warning)" />
+                <StatCard label="Spec drafts" value={fmtInt(llm?.specDrafts)} valueColor="var(--color-text)" />
+                <StatCard label="Spec hits" value={fmtInt(llm?.specHits)} valueColor="var(--color-success)" />
+              </div>
+
+              {/* Additional counters row */}
+              <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+                <StatCard label="Warm records" value={fmtInt(llm?.warmRecords)} valueColor="var(--color-accent)" />
+                <StatCard label="Spec quench" value={fmtInt(llm?.specQuench)} valueColor="var(--color-danger)" />
+                <StatCard label="Tok/step" value={fmtNum(llm?.tokPerStep, 3)} valueColor="var(--color-text)" />
+                <StatCard label="Decode steps" value={fmtInt(llm?.decodeSteps)} valueColor="var(--color-text)" />
+                <StatCard label="Derived artifacts" value={fmtInt(llm?.derivedArtifacts)} sub={fmtBytes(llm?.derivedArtifactBytes)} valueColor="var(--color-text)" />
+                <StatCard label="Uptime" value={llm?.ds4Uptime != null ? `${Math.floor(llm.ds4Uptime / 60)}m ${Math.round(llm.ds4Uptime % 60)}s` : "\u2014"} valueColor="var(--color-muted)" />
+              </div>
+
+              {/* Admits breakdown */}
+              <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+                <StatCard label="Admits: cold" value={fmtInt(llm?.admitsCold)} valueColor="var(--color-danger)" />
+                <StatCard label="Admits: warm" value={fmtInt(llm?.admitsWarm)} valueColor="var(--color-success)" />
+                <StatCard label="Admits: fork" value={fmtInt(llm?.admitsFork)} valueColor="var(--color-accent)" />
+                <StatCard label="Admits: p.fork" value={fmtInt(llm?.admitsPartialFork)} valueColor="var(--color-warning)" />
+                <StatCard label="Admits: p.trunc" value={fmtInt(llm?.admitsPartialTruncate)} valueColor="var(--color-warning)" />
+                <StatCard label="Requests" value={fmtInt(llm?.requestsStarted)} sub={llm?.requestsCompleted != null ? `${llm.requestsCompleted} done` : undefined} valueColor="var(--color-text)" />
+              </div>
+
+              {/* Recipe metadata */}
+              {llm?.recipeMetadata && (
+                <div style={{ borderTop: "1px solid var(--color-border)", paddingTop: "0.75rem", marginTop: "0.75rem" }}>
+                  <div className="llm-chart-title" style={{ marginBottom: "0.5rem" }}>Recipe Metadata</div>
+                  <div className="llm-stat-grid">
+                    <StatCard label="Model" value={llm.recipeMetadata.model ?? "\u2014"} valueColor="var(--color-text)" />
+                    <StatCard label="Context" value={llm.recipeMetadata.contextLength != null ? llm.recipeMetadata.contextLength.toLocaleString() : "\u2014"} valueColor="var(--color-text)" />
+                    <StatCard label="Owned by" value={llm.recipeMetadata.ownedBy ?? "\u2014"} valueColor="var(--color-muted)" />
+                    <StatCard label="Params" value={llm.recipeMetadata.supportedParameters.length > 0 ? llm.recipeMetadata.supportedParameters.join(", ") : "\u2014"} valueColor="var(--color-muted)" />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── vLLM-specific metric tiles (unchanged) ─────── */}
+          {llm?.backend === "vllm" && (
+            <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">
+              <div className="space-y-0.5"><MetricInfoTip id="kvCache" label="KV Cache" text={VLLM_METRIC_INFO.kvCache} openId={metricInfoId} setOpenId={setMetricInfoId} /><div className={`font-tabular text-sm ${llm.kvCacheUsage == null ? "text-text" : llm.kvCacheUsage >= 0.8 ? "text-danger" : llm.kvCacheUsage >= 0.5 ? "text-warning" : "text-success"}`}>{llm.kvCacheUsage != null ? `${(llm.kvCacheUsage * 100).toFixed(1)}%` : "\u2014"}</div></div>
+              <div className="space-y-0.5"><MetricInfoTip id="requests" label="Requests" text={VLLM_METRIC_INFO.requests} openId={metricInfoId} setOpenId={setMetricInfoId} align="right" /><div className="font-tabular text-sm text-text">{llm.requestsRunning != null && llm.requestsWaiting != null ? `${Math.round(llm.requestsRunning)} run / ${Math.round(llm.requestsWaiting)} wait` : "\u2014"}</div></div>
+              <div className="space-y-0.5"><MetricInfoTip id="ttftP95" label="TTFT p95" text={VLLM_METRIC_INFO.ttftP95} openId={metricInfoId} setOpenId={setMetricInfoId} /><div className="font-tabular text-sm text-text">{llm.ttftP95Seconds != null ? `${llm.ttftP95Seconds.toFixed(3)}s` : "\u2014"}</div></div>
+              <div className="space-y-0.5"><MetricInfoTip id="preempts" label="Preempts" text={VLLM_METRIC_INFO.preempts} openId={metricInfoId} setOpenId={setMetricInfoId} align="right" /><div className="font-tabular text-sm text-text">{llm.preemptionsTotal != null ? Math.round(llm.preemptionsTotal).toLocaleString() : "\u2014"}</div></div>
 
           <div className="flex items-center justify-between">
             <span className="text-xs text-muted">Generation tok/s</span>
@@ -879,60 +913,10 @@ export function LlmPanel({
 
           {llm && (llm.backend === "vllm" || llm.backend === "q27") && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">
-              <div className="space-y-0.5">
-                <MetricInfoTip
-                  id="prefixCache"
-                  label="Prefix Cache"
-                  text={VLLM_METRIC_INFO.prefixCache}
-                  openId={metricInfoId}
-                  setOpenId={setMetricInfoId}
-                />
-                <div className="font-tabular text-sm text-text">
-                  {llm.prefixCacheHitRate != null
-                    ? `${(llm.prefixCacheHitRate * 100).toFixed(1)}%`
-                    : "—"}
-                </div>
-              </div>
-              <div className="space-y-0.5">
-                <MetricInfoTip
-                  id="e2eP95"
-                  label="E2E p95"
-                  text={VLLM_METRIC_INFO.e2eP95}
-                  openId={metricInfoId}
-                  setOpenId={setMetricInfoId}
-                  align="right"
-                />
-                <div className="font-tabular text-sm text-text">
-                  {llm.e2eP95Seconds != null ? `${llm.e2eP95Seconds.toFixed(3)}s` : "—"}
-                </div>
-              </div>
-              <div className="space-y-0.5">
-                <MetricInfoTip
-                  id="itlP95"
-                  label="ITL p95"
-                  text={VLLM_METRIC_INFO.itlP95}
-                  openId={metricInfoId}
-                  setOpenId={setMetricInfoId}
-                />
-                <div className="font-tabular text-sm text-text">
-                  {llm.itlP95Seconds != null ? `${llm.itlP95Seconds.toFixed(3)}s` : "—"}
-                </div>
-              </div>
-              <div className="space-y-0.5">
-                <MetricInfoTip
-                  id="mtpAccept"
-                  label="MTP Accept"
-                  text={VLLM_METRIC_INFO.mtpAccept}
-                  openId={metricInfoId}
-                  setOpenId={setMetricInfoId}
-                  align="right"
-                />
-                <div className="font-tabular text-sm text-text">
-                  {llm.mtpAcceptanceRate != null
-                    ? `${(llm.mtpAcceptanceRate * 100).toFixed(1)}%`
-                    : "—"}
-                </div>
-              </div>
+              <div className="space-y-0.5"><MetricInfoTip id="prefixCache" label="Prefix Cache" text={VLLM_METRIC_INFO.prefixCache} openId={metricInfoId} setOpenId={setMetricInfoId} /><div className="font-tabular text-sm text-text">{llm.prefixCacheHitRate != null ? `${(llm.prefixCacheHitRate * 100).toFixed(1)}%` : "\u2014"}</div></div>
+              <div className="space-y-0.5"><MetricInfoTip id="e2eP95" label="E2E p95" text={VLLM_METRIC_INFO.e2eP95} openId={metricInfoId} setOpenId={setMetricInfoId} align="right" /><div className="font-tabular text-sm text-text">{llm.e2eP95Seconds != null ? `${llm.e2eP95Seconds.toFixed(3)}s` : "\u2014"}</div></div>
+              <div className="space-y-0.5"><MetricInfoTip id="itlP95" label="ITL p95" text={VLLM_METRIC_INFO.itlP95} openId={metricInfoId} setOpenId={setMetricInfoId} /><div className="font-tabular text-sm text-text">{llm.itlP95Seconds != null ? `${llm.itlP95Seconds.toFixed(3)}s` : "\u2014"}</div></div>
+              <div className="space-y-0.5"><MetricInfoTip id="mtpAccept" label="MTP Accept" text={VLLM_METRIC_INFO.mtpAccept} openId={metricInfoId} setOpenId={setMetricInfoId} align="right" /><div className="font-tabular text-sm text-text">{llm.mtpAcceptanceRate != null ? `${(llm.mtpAcceptanceRate * 100).toFixed(1)}%` : "\u2014"}</div></div>
             </div>
           )}
 

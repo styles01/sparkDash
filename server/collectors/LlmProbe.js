@@ -3,6 +3,10 @@
  * computes live tokens/sec (generation + prefill).
  *
  * Ported from legacy `probeLlamaServerType` and `_getLlamaMetricsFor`.
+ *
+ * Supports vLLM, llama.cpp, sglang, and ds4 (DeepSeek-V4-Flash CUDA engine).
+ * The ds4 backend is detected via /v1/models `owned_by: "ds4.c"` and exposes
+ * its own ds4_* Prometheus metrics.
  */
 import { LLM_PROBE_TIMEOUT_MS } from "../config.js";
 import { execSync } from "node:child_process";
@@ -128,8 +132,7 @@ export class LlmProbe {
     this.totalOutputTokens = 0;
 
     // vLLM inference metrics from /metrics (null when not vLLM / missing series)
-    // Metric names follow stock vLLM Prometheus exposition (versions may differ).
-    this.kvCacheUsage = null; // 0–1 fraction
+    this.kvCacheUsage = null;
     this.requestsRunning = null;
     this.requestsWaiting = null;
     this.ttftP95Seconds = null;
@@ -138,11 +141,8 @@ export class LlmProbe {
     this.preemptionsTotal = null; // cumulative counter
     /** Prefix cache hit rate 0–1 (hits/queries). */
     this.prefixCacheHitRate = null;
-    /** End-to-end request latency p95 (seconds). */
     this.e2eP95Seconds = null;
-    /** Inter-token latency p95 (seconds). */
     this.itlP95Seconds = null;
-    /** Speculative/MTP acceptance rate 0–1 (accepted/drafted). */
     this.mtpAcceptanceRate = null;
 
     // ── llama.cpp /slots expanded data surface ──
@@ -307,9 +307,7 @@ export class LlmProbe {
 
   /** Probe the LLM server and return a snapshot. */
   async probe() {
-    this._probeT0 = Date.now();
     try {
-      console.log(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} probe() start url=${this.baseUrl}`);
       const shouldDetect =
         this.serverIsOpenAI === null ||
         Date.now() - this._lastDetectAt > REDETECT_INTERVAL_MS;
@@ -345,12 +343,10 @@ export class LlmProbe {
   _noteSuccess() {
     this._consecutiveFailures = 0;
     this.error = null;
-    console.log(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} OK backend=${this.backendType} model=${this.modelId} slotsActive=${this.slotsActive} genTps=${this.generationTps} prefillTps=${this.prefillTps} took=${Date.now()-this._probeT0}ms`);
   }
 
   _noteFailure(message) {
     this.error = message;
-    console.warn(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} failure: ${message} (consecutive=${this._consecutiveFailures})`);
     this._consecutiveFailures += 1;
     if (this._consecutiveFailures >= FAIL_RESET_THRESHOLD) {
       this._resetDetection();
@@ -382,6 +378,42 @@ export class LlmProbe {
     this.e2eP95Seconds = null;
     this.itlP95Seconds = null;
     this.mtpAcceptanceRate = null;
+    // DS4
+    this.ds4Uptime = null;
+    this.peakAggregateTps = 0;
+    this.perStreamHigh = null;
+    this.perStreamLow = null;
+    this.perStreamAvg = null;
+    this.totalTokensDecoded = null;
+    this.dsparkAcceptRatio = null;
+    this.banksLive = null;
+    this.banksTotal = null;
+    this.kvPagesResident = null;
+    this.prefillCached = null;
+    this.prefillComputed = null;
+    this.specDrafts = null;
+    this.specHits = null;
+    this.specQuench = null;
+    this.warmRecords = null;
+    this.derivedArtifacts = null;
+    this.derivedArtifactBytes = null;
+    this.requestsStarted = null;
+    this.requestsCompleted = null;
+    this.requestsFailed = null;
+    this.requestsRefusedDeepSerial = null;
+    this.requestsInflight = null;
+    this.requestsSerial = null;
+    this.contAdmitRejects = null;
+    this.contBatchFailures = null;
+    this.graphFitRefusals = null;
+    this.admitsCold = null;
+    this.admitsWarm = null;
+    this.admitsFork = null;
+    this.admitsPartialFork = null;
+    this.admitsPartialTruncate = null;
+    this.decodeSteps = null;
+    this.tokPerStep = null;
+    this.recipeMetadata = null;
     this.slotState.clear();
     this.lastTokenCounts = { input: 0, output: 0 };
     this.lastPrefillKinds = null;
@@ -530,7 +562,121 @@ export class LlmProbe {
 
     this.serverIsOpenAI = null;
     this.backendType = null;
-    console.log(`[LlmProbe] ${this.spark?.id||"?"} port=${this.port} detection FAILED (no /slots, no /v1/models)`);
+  }
+
+  // ─── DS4 engine path ─────────────────────────────────────
+  async _probeDs4() {
+    const now = Date.now();
+    const dtSec = (now - this.lastProbeTime) / 1000;
+    this.lastProbeTime = now;
+
+    // Model info from /v1/models
+    let modelsOk = false;
+    try {
+      const modelsRes = await this._fetch(`${this.baseUrl}/v1/models`);
+      if (modelsRes.ok) {
+        modelsOk = true;
+        const modelsData = await modelsRes.json();
+        const model = modelsData?.data?.[0];
+        this.modelId = model?.id || null;
+        this.contextLength = model?.context_length || null;
+        this.recipeMetadata = {
+          name: model?.id || null,
+          model: model?.name || null,
+          contextLength: model?.context_length || null,
+          ownedBy: model?.owned_by || null,
+          supportedParameters: model?.supported_parameters || [],
+        };
+      }
+    } catch {}
+
+    if (!modelsOk) {
+      throw new Error("ds4 /v1/models unreachable");
+    }
+
+    // Parse /metrics
+    try {
+      const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+      if (metricsRes.ok) {
+        const txt = await metricsRes.text();
+
+        // Gauges
+        this.ds4Uptime = this._getDs4Metric(txt, "ds4_uptime_seconds");
+        this.generationTps = this._getDs4Metric(txt, "ds4_decode_tok_s") ?? 0;
+        this.prefillTps = this._getDs4Metric(txt, "ds4_prefill_tok_s") ?? 0;
+        this.dsparkAcceptRatio = this._getDs4Metric(txt, "ds4_spec_accept_ratio");
+        this.tokPerStep = this._getDs4Metric(txt, "ds4_tok_per_step");
+        this.banksLive = this._getDs4Metric(txt, "ds4_banks_live");
+        this.banksTotal = this._getDs4Metric(txt, "ds4_banks_total");
+        this.kvPagesResident = this._getDs4Metric(txt, "ds4_kv_pages_resident");
+        this.warmRecords = this._getDs4Metric(txt, "ds4_warm_records");
+        this.derivedArtifacts = this._getDs4Metric(txt, "ds4_derived_artifacts");
+        this.derivedArtifactBytes = this._getDs4Metric(txt, "ds4_derived_artifact_bytes");
+        this.requestsInflight = this._getDs4Metric(txt, "ds4_requests_inflight");
+
+        // Counters
+        this.totalTokensDecoded = this._getDs4Metric(txt, "ds4_tokens_decoded_total");
+        this.decodeSteps = this._getDs4Metric(txt, "ds4_decode_steps_total");
+        this.specDrafts = this._getDs4Metric(txt, "ds4_spec_drafts_total");
+        this.specHits = this._getDs4Metric(txt, "ds4_spec_hits_total");
+        this.specQuench = this._getDs4Metric(txt, "ds4_spec_quench_total");
+        this.requestsStarted = this._getDs4Metric(txt, "ds4_requests_started_total");
+        this.requestsSerial = this._getDs4Metric(txt, "ds4_requests_serial_total");
+        this.contAdmitRejects = this._getDs4Metric(txt, "ds4_cont_admit_rejects_total");
+        this.contBatchFailures = this._getDs4Metric(txt, "ds4_cont_batch_failures_total");
+        this.graphFitRefusals = this._getDs4Metric(txt, "ds4_graph_fit_refusals_total");
+
+        // Labeled counters
+        this.requestsCompleted = this._getDs4LabeledMetric(txt, "ds4_requests_total", "outcome", "completed");
+        this.requestsFailed = this._getDs4LabeledMetric(txt, "ds4_requests_total", "outcome", "failed");
+        this.requestsRefusedDeepSerial = this._getDs4LabeledMetric(txt, "ds4_requests_total", "outcome", "refused_deep_serial");
+        this.prefillCached = this._getDs4LabeledMetric(txt, "ds4_tokens_prefilled_total", "kind", "cached");
+        this.prefillComputed = this._getDs4LabeledMetric(txt, "ds4_tokens_prefilled_total", "kind", "computed");
+        this.admitsCold = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "cold");
+        this.admitsWarm = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "warm");
+        this.admitsFork = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "fork");
+        this.admitsPartialFork = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "partial_fork");
+        this.admitsPartialTruncate = this._getDs4LabeledMetric(txt, "ds4_admits_total", "kind", "partial_truncate");
+
+        // Slots = banks_live (active lanes), slotsTotal = banks_total
+        this.slotsActive = this.banksLive != null ? Math.round(this.banksLive) : 0;
+        this.slotsTotal = this.banksTotal != null ? Math.round(this.banksTotal) : 0;
+        this.requestsRunning = this.requestsInflight;
+
+        // Total output tokens from decoded counter
+        if (this.totalTokensDecoded != null) {
+          this.totalOutputTokens = Math.round(this.totalTokensDecoded);
+        }
+
+        // Track peak aggregate tok/s
+        const currentAggregate = this.generationTps;
+        if (currentAggregate > this.peakAggregateTps) {
+          this.peakAggregateTps = currentAggregate;
+        }
+
+        // Per-stream tracking: use banks_live as the number of active streams
+        // When inflight > 0, per-stream = decode_tok_s / inflight
+        const inflight = this.requestsInflight != null ? this.requestsInflight : 0;
+        if (inflight > 0 && currentAggregate > 0) {
+          const perStream = currentAggregate / inflight;
+          if (this.perStreamHigh == null || perStream > this.perStreamHigh) {
+            this.perStreamHigh = Math.round(perStream * 100) / 100;
+          }
+          if (this.perStreamLow == null || perStream < this.perStreamLow) {
+            this.perStreamLow = Math.round(perStream * 100) / 100;
+          }
+          this.perStreamAvg = Math.round(perStream * 100) / 100;
+        }
+
+        // MTP/spec acceptance — use ds4_spec_accept_ratio as the gauge
+        this.mtpAcceptanceRate = this.dsparkAcceptRatio;
+        this.mtpAcceptedTokens = this.specHits;
+        this.mtpDraftedTokens = this.specDrafts;
+      }
+    } catch {}
+
+    this.backendType = "ds4";
+    return this._getSnapshot();
   }
 
   /**
@@ -2043,7 +2189,6 @@ export class LlmProbe {
     const dtSec = (now - this.lastProbeTime) / 1000;
     this.lastProbeTime = now;
 
-    // Slots
     let slotsOk = false;
     try {
       const slotsRes = await this._fetch(`${this.baseUrl}/slots`);
@@ -2056,7 +2201,6 @@ export class LlmProbe {
         if (Array.isArray(slots)) {
           slotsOk = true;
           this.slotsTotal = slots.length;
-          // Some llama.cpp builds use is_processing instead of state
           this.slotsActive = slots.filter((s) => s.is_processing || (s.state && s.state !== "idle")).length;
 
           let totalGen = 0;
@@ -2100,7 +2244,6 @@ export class LlmProbe {
       throw new Error("llama.cpp /slots unreachable");
     }
 
-    // Props (model info)
     try {
       const propsRes = await this._fetch(`${this.baseUrl}/props`);
       if (propsRes.ok) {
@@ -2203,7 +2346,6 @@ export class LlmProbe {
    */
   _parseHistogram(body, metricPrefix, countMetricName) {
     const esc = metricPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // Bucket lines: <metricPrefix>_bucket{...le="X"...} VALUE
     const bucketRe = new RegExp(
       `^${esc}_bucket\\{[^}]*\\ble="([^"]+)"[^}]*\\}\\s+([\\d.eE+-]+)\\s*$`,
       "gm"
@@ -2260,12 +2402,10 @@ export class LlmProbe {
   }
 
   _getSlotDecoded(slot) {
-    // Some llama.cpp builds nest n_decoded inside next_token[0]
     if (slot.n_decoded != null) {
       if (Array.isArray(slot.n_decoded)) return slot.n_decoded[0] || 0;
       return slot.n_decoded || 0;
     }
-    // Fallback: next_token[0].n_decoded (newer llama.cpp)
     if (Array.isArray(slot.next_token) && slot.next_token[0]?.n_decoded != null) {
       return slot.next_token[0].n_decoded;
     }
@@ -2935,27 +3075,46 @@ export class LlmProbe {
       specGeneratedTokens: this.specGeneratedTokens,
       specMeanLen: this.specMeanLen,
       error: this.error,
-// ── Expanded telemetry (flattened from vllmParser output) ──
-      runningSlots: t?.runningSlots,
-      waitingSlots: t?.waitingSlots,
-      kvCacheUsage: t?.kvCacheUsage,
-      ttft: t?.ttft,
-      e2eLatency: t?.e2eRequestLatency,
-      interTokenLatency: t?.interTokenLatency,
-      promptTokensPerReq: t?.promptTokensPerRequest,
-      genTokensPerReq: t?.generationTokensPerRequest,
-      mtpAcceptanceRate: t?.specAcceptanceRate,
-      mtpAcceptedTokens: t?.specAcceptedTokens,
-      mtpDraftedTokens: t?.specDraftedTokens,
-      prefixCacheHitRate: t?.prefixCacheHitRate,
-      perPositionAcceptance: t?.specPerPositionAcceptance,
-      rollingAvgE2e: t?.rolling?.avgE2eLatency,
-      rollingAvgTtft: t?.rolling?.avgTtft,
-      rollingAvgTokensPerReq: t?.rolling?.avgTokensPerRequest,
-      rollingAvgTpsPerSlot: t?.rolling?.avgTpsPerSlot,
-      // Keep the raw nested object for debugging / future use
-      vllmTelemetry: t,
     };
+
+    // DS4 fields (always include — null for non-ds4 backends)
+    snap.ds4Uptime = this.ds4Uptime;
+    snap.peakAggregateTps = this.peakAggregateTps;
+    snap.perStreamHigh = this.perStreamHigh;
+    snap.perStreamLow = this.perStreamLow;
+    snap.perStreamAvg = this.perStreamAvg;
+    snap.totalTokensDecoded = this.totalTokensDecoded;
+    snap.dsparkAcceptRatio = this.dsparkAcceptRatio;
+    snap.banksLive = this.banksLive;
+    snap.banksTotal = this.banksTotal;
+    snap.kvPagesResident = this.kvPagesResident;
+    snap.prefillCached = this.prefillCached;
+    snap.prefillComputed = this.prefillComputed;
+    snap.specDrafts = this.specDrafts;
+    snap.specHits = this.specHits;
+    snap.specQuench = this.specQuench;
+    snap.warmRecords = this.warmRecords;
+    snap.derivedArtifacts = this.derivedArtifacts;
+    snap.derivedArtifactBytes = this.derivedArtifactBytes;
+    snap.requestsStarted = this.requestsStarted;
+    snap.requestsCompleted = this.requestsCompleted;
+    snap.requestsFailed = this.requestsFailed;
+    snap.requestsRefusedDeepSerial = this.requestsRefusedDeepSerial;
+    snap.requestsInflight = this.requestsInflight;
+    snap.requestsSerial = this.requestsSerial;
+    snap.contAdmitRejects = this.contAdmitRejects;
+    snap.contBatchFailures = this.contBatchFailures;
+    snap.graphFitRefusals = this.graphFitRefusals;
+    snap.admitsCold = this.admitsCold;
+    snap.admitsWarm = this.admitsWarm;
+    snap.admitsFork = this.admitsFork;
+    snap.admitsPartialFork = this.admitsPartialFork;
+    snap.admitsPartialTruncate = this.admitsPartialTruncate;
+    snap.decodeSteps = this.decodeSteps;
+    snap.tokPerStep = this.tokPerStep;
+    snap.recipeMetadata = this.recipeMetadata;
+
+    return snap;
   }
 
   _defaultLlm() {

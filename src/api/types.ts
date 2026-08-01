@@ -56,8 +56,7 @@ export interface SparkConfig {
    * Only meaningful when role is worker.
    */
   workerLabel?: string | null;
-  /**
-   * Optional id of the head Spark this worker belongs to.
+  /** Optional id of the head Spark this worker belongs to.
    * Only meaningful when role is worker.
    */
   workerHeadId?: string | null;
@@ -294,6 +293,15 @@ export interface SlotTelemetry {
   roundTrip: number;
 }
 
+// ─── Recipe metadata (ds4 engine) ───────────────────────
+export interface RecipeMetadata {
+  name: string | null;
+  model: string | null;
+  contextLength: number | null;
+  ownedBy: string | null;
+  supportedParameters: string[];
+}
+
 // ─── LLM metrics ─────────────────────────────────────────
 export interface LlmMetrics {
   available: boolean;
@@ -507,6 +515,78 @@ export interface TailscaleMetrics {
   perPositionAcceptance?: number[];
   /** Per-slot telemetry rows for the table view. */
   slots?: SlotTelemetry[];
+
+  // ── DS4 engine metrics ────────────────────────────────
+  /** DS4 engine uptime in seconds */
+  ds4Uptime?: number | null;
+  /** Peak aggregate decode tok/s tracked over session */
+  peakAggregateTps?: number;
+  /** Per-stream throughput high (tok/s) */
+  perStreamHigh?: number;
+  /** Per-stream throughput low (tok/s) */
+  perStreamLow?: number;
+  /** Per-stream throughput avg (tok/s) */
+  perStreamAvg?: number;
+  /** Total decoded tokens (cumulative, ds4_tokens_decoded_total) */
+  totalTokensDecoded?: number;
+  /** DSpark speculative acceptance ratio (0-1, ds4_spec_accept_ratio) */
+  dsparkAcceptRatio?: number | null;
+  /** Active context banks / lanes in use (ds4_banks_live) */
+  banksLive?: number;
+  /** Total configured banks / max lanes (ds4_banks_total) */
+  banksTotal?: number;
+  /** KV cache pages resident in memory (ds4_kv_pages_resident) */
+  kvPagesResident?: number;
+  /** Prefill tokens from cache (cumulative, ds4_tokens_prefilled_total{kind=cached}) */
+  prefillCached?: number;
+  /** Prefill tokens computed (cumulative, ds4_tokens_prefilled_total{kind=computed}) */
+  prefillComputed?: number;
+  /** Spec decode drafts total (ds4_spec_drafts_total) */
+  specDrafts?: number;
+  /** Spec decode hits total (ds4_spec_hits_total) */
+  specHits?: number;
+  /** Spec decode quench total (ds4_spec_quench_total) */
+  specQuench?: number;
+  /** Prefix cache warm records (ds4_warm_records) */
+  warmRecords?: number;
+  /** Derived artifacts count (ds4_derived_artifacts) */
+  derivedArtifacts?: number;
+  /** Derived artifact bytes (ds4_derived_artifact_bytes) */
+  derivedArtifactBytes?: number;
+  /** Requests started total (ds4_requests_started_total) */
+  requestsStarted?: number;
+  /** Requests completed (ds4_requests_total{outcome=completed}) */
+  requestsCompleted?: number;
+  /** Requests failed (ds4_requests_total{outcome=failed}) */
+  requestsFailed?: number;
+  /** Requests refused deep serial (ds4_requests_total{outcome=refused_deep_serial}) */
+  requestsRefusedDeepSerial?: number;
+  /** Requests currently inflight (ds4_requests_inflight) */
+  requestsInflight?: number;
+  /** Requests serial total (ds4_requests_serial_total) */
+  requestsSerial?: number;
+  /** Continuity admit rejects total (ds4_cont_admit_rejects_total) */
+  contAdmitRejects?: number;
+  /** Continuity batch failures total (ds4_cont_batch_failures_total) */
+  contBatchFailures?: number;
+  /** Graph fit refusals total (ds4_graph_fit_refusals_total) */
+  graphFitRefusals?: number;
+  /** Admits: cold (ds4_admits_total{kind=cold}) */
+  admitsCold?: number;
+  /** Admits: warm (ds4_admits_total{kind=warm}) */
+  admitsWarm?: number;
+  /** Admits: fork (ds4_admits_total{kind=fork}) */
+  admitsFork?: number;
+  /** Admits: partial_fork (ds4_admits_total{kind=partial_fork}) */
+  admitsPartialFork?: number;
+  /** Admits: partial_truncate (ds4_admits_total{kind=partial_truncate}) */
+  admitsPartialTruncate?: number;
+  /** Decode steps total (ds4_decode_steps_total) */
+  decodeSteps?: number;
+  /** Tokens per step (speculative efficiency, ds4_tok_per_step) */
+  tokPerStep?: number;
+  /** Recipe metadata from /v1/models */
+  recipeMetadata?: RecipeMetadata | null;
 }
 
 // ─── Full metrics snapshot ────────────────────────────────
