@@ -360,6 +360,192 @@ function MetricInfoTip({
   );
 }
 
+function RecipeSection({
+  info,
+  metadata,
+  llm,
+}: {
+  info: RecipeInfo | null | undefined;
+  metadata: RecipeMetadata | null | undefined;
+  llm: LlmMetrics | null;
+}) {
+  const hasInfo = info != null;
+  const hasMeta = metadata != null && (metadata.model != null || metadata.supportedParameters.length > 0);
+  if (!hasInfo && !hasMeta) return null;
+
+  const acceptPct = info?.acceptRatio != null ? `${Math.round(info.acceptRatio * 100)}%` : "\u2014";
+  const acceptAccent = info?.acceptRatio != null && info.acceptRatio > 0.7 ? "success" : info?.acceptRatio != null && info.acceptRatio >= 0.5 ? "warning" : "danger";
+
+  // Params from metadata
+  const params = metadata?.supportedParameters ?? [];
+
+  // Build param→stat mappings using live DS4 metrics
+  const paramStats: Record<string, { label: string; value: string; accent?: string } | null> = {};
+  if (llm) {
+    for (const p of params) {
+      // tools / tool_choice → tool call parser (show "parser ready" type info)
+      if (p === "tools" || p === "tool_choice") {
+        // No numeric stat, but we can indicate it is parsed
+        paramStats[p] = null;
+      }
+      // stream → streaming status
+      if (p === "stream") {
+        paramStats[p] = { label: "streaming", value: "live", accent: "success" };
+      }
+      // reasoning_effort → show the reasoning effort level if available
+      if (p === "reasoning_effort") {
+        // DS4 supports reasoning — show spec decode method as proxy
+        paramStats[p] = info?.specDecodeMethod
+          ? { label: "reasoning", value: info.specDecodeMethod, accent: "accent" }
+          : null;
+      }
+    }
+  }
+
+  // Stats that map to recipe config fields with live metric counterparts
+  const liveStats: { label: string; value: string; sub?: string; accent?: string }[] = [];
+  if (llm) {
+    // Spec decode acceptance → relates to specDecodeMethod
+    if (llm.dsparkAcceptRatio != null) {
+      liveStats.push({ label: "DSpark accept", value: pct(llm.dsparkAcceptRatio, 1), accent: llm.dsparkAcceptRatio > 0.7 ? "success" : llm.dsparkAcceptRatio >= 0.5 ? "warning" : "danger" });
+    } else if (info?.acceptRatio != null) {
+      liveStats.push({ label: "Accept ratio", value: acceptPct, accent: acceptAccent });
+    }
+    // Banks live/total → relates to maxLanes
+    if (llm.banksLive != null) {
+      liveStats.push({ label: "Banks", value: `${fmtInt(llm.banksLive)}/${fmtInt(llm.banksTotal)}`, accent: llm.banksLive > 0 ? "success" : undefined });
+    }
+    // Prefill cached/computed → relates to prefixCaching
+    if (llm.prefillCached != null || llm.prefillComputed != null) {
+      const cached = llm.prefillCached ?? 0;
+      const computed = llm.prefillComputed ?? 0;
+      const total = cached + computed;
+      const ratio = total > 0 ? cached / total : 0;
+      liveStats.push({ label: "Prefill cache", value: pct(ratio, 0), sub: `${fmtInt(cached)} cached`, accent: ratio > 0.5 ? "success" : "warning" });
+    }
+    // Warm records → relates to prefixCaching
+    if (llm.warmRecords != null) {
+      liveStats.push({ label: "Warm records", value: fmtInt(llm.warmRecords), accent: "accent" });
+    }
+    // Spec drafts/hits → relates to specDecodeMethod
+    if (llm.specDrafts != null && llm.specHits != null) {
+      liveStats.push({ label: "Spec drafts", value: fmtInt(llm.specDrafts), sub: `${fmtInt(llm.specHits)} hits`, accent: "accent" });
+    }
+    // Total tokens decoded
+    if (llm.totalTokensDecoded != null) {
+      liveStats.push({ label: "Tokens decoded", value: fmtInt(llm.totalTokensDecoded), accent: "accent" });
+    }
+    // Uptime
+    if (llm.ds4Uptime != null) {
+      liveStats.push({ label: "Uptime", value: fmtUptime(llm.ds4Uptime) });
+    }
+  }
+
+  return (
+    <div className="recipe-merged-section">
+      {/* ── Header: engine type + model name + attribution ── */}
+      <div className="recipe-merged-header">
+        <div className="recipe-merged-title-row">
+          {info?.engineType && (
+            <span className="recipe-info-engine-type">{info.engineType}</span>
+          )}
+          <span className="recipe-info-model">{info?.modelName ?? metadata?.model ?? "\u2014"}</span>
+        </div>
+        {(info?.author || info?.containerImage || info?.uptime != null) && (
+          <div className="recipe-info-attribution">
+            {info?.author && (
+              <>
+                <span className="recipe-info-author-label">Recipe by</span>
+                <span className="recipe-info-author">{info.author}</span>
+                {info.authorName && info.authorName !== info.author && (
+                  <span className="recipe-info-author-name">({info.authorName})</span>
+                )}
+              </>
+            )}
+            {info?.containerImage && (
+              <>
+                {info?.author && <span className="recipe-info-sep">\u00B7</span>}
+                <span className="recipe-info-container" title={info.containerImage}>{info.containerImage}</span>
+              </>
+            )}
+            {info?.uptime != null && (
+              <>
+                <span className="recipe-info-sep">\u00B7</span>
+                <span className="recipe-info-uptime">up {fmtUptime(info.uptime)}</span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Grid: config badges (left) + live stats (right) ── */}
+      <div className="recipe-merged-grid">
+        {/* Config badges subsection */}
+        <div className="recipe-merged-subsection">
+          <div className="recipe-merged-subsection-title">Configuration</div>
+          <div className="recipe-info-badges">
+            {(info?.contextLength ?? metadata?.contextLength) != null && (
+              <RecipeBadge label="Context" value={(info?.contextLength ?? metadata?.contextLength)! >= 1024 ? `${Math.round((info?.contextLength ?? metadata?.contextLength)! / 1024)}K` : String((info?.contextLength ?? metadata?.contextLength)!)} />
+            )}
+            {info?.maxLanes != null && (
+              <RecipeBadge label="Lanes" value={String(info.maxLanes)} accent="accent" />
+            )}
+            {info?.specDecodeMethod && (
+              <RecipeBadge label="Spec Decode" value={info.specDecodeMethod} accent="success" />
+            )}
+            {info?.quantization && (
+              <RecipeBadge label="Quant" value={info.quantization} accent="warning" />
+            )}
+            {info?.kvCacheDtype && (
+              <RecipeBadge label="KV Cache" value={info.kvCacheDtype} />
+            )}
+            {info?.prefixCaching != null && (
+              <RecipeBadge label="Prefix Cache" value={info.prefixCaching ? "ON" : "OFF"} accent={info.prefixCaching ? "success" : "danger"} />
+            )}
+            {info?.gmu != null && (
+              <RecipeBadge label="GMU" value={`${Math.round(info.gmu * 100)}%`} />
+            )}
+            {info?.acceptRatio != null && (
+              <RecipeBadge label="Accept" value={acceptPct} accent={acceptAccent} />
+            )}
+            {metadata?.ownedBy && (
+              <RecipeBadge label="Owned by" value={metadata.ownedBy} />
+            )}
+          </div>
+        </div>
+
+        {/* Live stats subsection (only for DS4 with live metrics) */}
+        {liveStats.length > 0 && (
+          <div className="recipe-merged-subsection">
+            <div className="recipe-merged-subsection-title">Live Stats</div>
+            <div className="recipe-merged-live-stats">
+              {liveStats.map((s, i) => (
+                <div key={i} className={`recipe-merged-live-stat${s.accent ? ` recipe-merged-live-stat--${s.accent}` : ""}`}>
+                  <span className="recipe-merged-live-stat-label">{s.label}</span>
+                  <span className="recipe-merged-live-stat-value font-tabular">{s.value}</span>
+                  {s.sub && <span className="recipe-merged-live-stat-sub font-tabular">{s.sub}</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Supported parameters as badges ── */}
+      {params.length > 0 && (
+        <div className="recipe-merged-subsection">
+          <div className="recipe-merged-subsection-title">Supported Parameters</div>
+          <div className="recipe-merged-params">
+            {params.map((p) => (
+              <ParamBadge key={p} param={p} stat={paramStats[p] ?? null} />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function LlmPanel({
   llm,
   sparkId,
@@ -686,6 +872,9 @@ export function LlmPanel({
             </div>
           )}
 
+          {/* ── Merged Recipe Info + Metadata section ── */}
+          <RecipeSection info={llm?.recipeInfo} metadata={llm?.recipeMetadata} llm={llm ?? null} />
+
           {/* ── DS4 ENGINE METRICS PANEL ─────────────────────── */}
           {isDs4 && (
             <div className="llm-chart-block" style={{ borderTop: "1px solid var(--color-border)", paddingTop: "0.75rem" }}>
@@ -731,18 +920,6 @@ export function LlmPanel({
                 <StatCard label="Requests" value={fmtInt(llm?.requestsStarted)} sub={llm?.requestsCompleted != null ? `${llm.requestsCompleted} done` : undefined} valueColor="var(--color-text)" />
               </div>
 
-              {/* Recipe metadata */}
-              {llm?.recipeMetadata && (
-                <div style={{ borderTop: "1px solid var(--color-border)", paddingTop: "0.75rem", marginTop: "0.75rem" }}>
-                  <div className="llm-chart-title" style={{ marginBottom: "0.5rem" }}>Recipe Metadata</div>
-                  <div className="llm-stat-grid">
-                    <StatCard label="Model" value={llm.recipeMetadata.model ?? "\u2014"} valueColor="var(--color-text)" />
-                    <StatCard label="Context" value={llm.recipeMetadata.contextLength != null ? llm.recipeMetadata.contextLength.toLocaleString() : "\u2014"} valueColor="var(--color-text)" />
-                    <StatCard label="Owned by" value={llm.recipeMetadata.ownedBy ?? "\u2014"} valueColor="var(--color-muted)" />
-                    <StatCard label="Params" value={llm.recipeMetadata.supportedParameters.length > 0 ? llm.recipeMetadata.supportedParameters.join(", ") : "\u2014"} valueColor="var(--color-muted)" />
-                  </div>
-                </div>
-              )}
             </div>
           )}
 

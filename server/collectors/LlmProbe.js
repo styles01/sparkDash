@@ -414,6 +414,17 @@ export class LlmProbe {
     this.decodeSteps = null;
     this.tokPerStep = null;
     this.recipeMetadata = null;
+    this.recipeInfo = null;
+    this._ds4Prev = {
+      tokensDecoded: null,
+      decodeSteps: null,
+      requestsStarted: null,
+      requestsCompleted: null,
+      prefillComputed: null,
+      prefillCached: null,
+      time: 0,
+    };
+    this._ds4Rolling = [];
     this.slotState.clear();
     this.lastTokenCounts = { input: 0, output: 0 };
     this.lastPrefillKinds = null;
@@ -672,10 +683,127 @@ export class LlmProbe {
         this.mtpAcceptanceRate = this.dsparkAcceptRatio;
         this.mtpAcceptedTokens = this.specHits;
         this.mtpDraftedTokens = this.specDrafts;
+
+        // ── Derive latency, genTokensPerReq, and rolling averages from
+        //    ds4 counter deltas (ds4 has no latency histograms, so we
+        //    approximate from throughput + completed-request counts). ──
+        const nowMs = Date.now();
+        const prev = this._ds4Prev;
+        const dt = prev.time > 0 ? (nowMs - prev.time) / 1000 : 0;
+
+        const deltaDecoded =
+            this.totalTokensDecoded != null && prev.tokensDecoded != null
+                ? Math.max(0, this.totalTokensDecoded - prev.tokensDecoded)
+                : 0;
+        const deltaSteps =
+            this.decodeSteps != null && prev.decodeSteps != null
+                ? Math.max(0, this.decodeSteps - prev.decodeSteps)
+                : 0;
+        const deltaStarted =
+            this.requestsStarted != null && prev.requestsStarted != null
+                ? Math.max(0, this.requestsStarted - prev.requestsStarted)
+                : 0;
+        const deltaCompleted =
+            this.requestsCompleted != null && prev.requestsCompleted != null
+                ? Math.max(0, this.requestsCompleted - prev.requestsCompleted)
+                : 0;
+        const deltaPrefillComputed =
+            this.prefillComputed != null && prev.prefillComputed != null
+                ? Math.max(0, this.prefillComputed - prev.prefillComputed)
+                : 0;
+
+        // Per-request average tokens (generation) — if requests completed
+        // this cycle, avg tokens per request = deltaDecoded / deltaCompleted.
+        // Fallback to cumulative if we have totals.
+        if (deltaCompleted > 0) {
+          this.genTokensPerReq =
+              Math.round((deltaDecoded / deltaCompleted) * 100) / 100;
+        } else if (this.requestsCompleted != null && this.requestsCompleted > 0) {
+          this.genTokensPerReq =
+              Math.round((this.totalTokensDecoded / this.requestsCompleted) * 100) / 100;
+        }
+
+        // Approximate TTFT: prefill time for the average request.
+        // Use counter-based prefill rate (deltaPrefillComputed / dt) instead of
+        // the instantaneous prefillTps gauge, which is near-zero between bursts.
+        const prefillRate = dt > 0 && deltaPrefillComputed > 0
+            ? deltaPrefillComputed / dt
+            : this.prefillTps;
+        if (deltaCompleted > 0 && deltaPrefillComputed > 0 && prefillRate > 0) {
+          const avgPromptTokens = deltaPrefillComputed / deltaCompleted;
+          this.ttft = Math.round((avgPromptTokens / prefillRate) * 1000) / 1000;
+          this.ttftP95Seconds = this.ttft; // best estimate (no histogram)
+        }
+
+        // Approximate E2E: TTFT + decode time for avg request.
+        // decode time ≈ avgGenTokens / decodeRate, where decodeRate = generationTps / inflight.
+        if (deltaCompleted > 0 && this.genTokensPerReq != null && this.genTokensPerReq > 0) {
+          const inflight = this.requestsInflight != null ? Math.max(1, this.requestsInflight) : 1;
+          const decodeRate = this.generationTps > 0 ? this.generationTps / inflight : 0;
+          const ttftEst = this.ttft ?? 0;
+          if (decodeRate > 0) {
+            const decodeTime = this.genTokensPerReq / decodeRate;
+            this.e2eLatency = Math.round((ttftEst + decodeTime) * 1000) / 1000;
+            this.e2eP95Seconds = this.e2eLatency;
+          } else {
+            this.e2eLatency = Math.round(ttftEst * 1000) / 1000;
+            this.e2eP95Seconds = this.e2eLatency;
+          }
+        }
+
+        // ── Rolling window: last 10 completed-request batches ──
+        if (deltaCompleted > 0 && this.e2eLatency != null) {
+          const activeSlots = this.banksLive != null ? Math.max(1, this.banksLive) : 1;
+          const tpsPerSlot = dt > 0 && this.generationTps > 0
+              ? this.generationTps / activeSlots
+              : 0;
+          const tokensPerReq = (deltaPrefillComputed + deltaDecoded) / deltaCompleted;
+
+          this._ds4Rolling.push({
+            e2e: this.e2eLatency,
+            ttft: this.ttft ?? 0,
+            tokens: tokensPerReq,
+            tpsPerSlot: Math.round(tpsPerSlot * 100) / 100,
+          });
+          if (this._ds4Rolling.length > 10) {
+            this._ds4Rolling = this._ds4Rolling.slice(-10);
+          }
+        }
+
+        // Compute rolling averages
+        if (this._ds4Rolling.length > 0) {
+          const n = this._ds4Rolling.length;
+          let sumE2e = 0, sumTtft = 0, sumTokens = 0, sumTps = 0;
+          for (const r of this._ds4Rolling) {
+            sumE2e += r.e2e;
+            sumTtft += r.ttft;
+            sumTokens += r.tokens;
+            sumTps += r.tpsPerSlot;
+          }
+          this.rollingAvgE2e = Math.round((sumE2e / n) * 1000) / 1000;
+          this.rollingAvgTtft = Math.round((sumTtft / n) * 1000) / 1000;
+          this.rollingAvgTokensPerReq = Math.round((sumTokens / n) * 100) / 100;
+          this.rollingAvgTpsPerSlot = Math.round((sumTps / n) * 100) / 100;
+        }
+
+        // Aggregate decode TPS alias
+        this.aggregateDecodeTps = this.generationTps;
+
+        // Save state for next cycle
+        this._ds4Prev = {
+          tokensDecoded: this.totalTokensDecoded,
+          decodeSteps: this.decodeSteps,
+          requestsStarted: this.requestsStarted,
+          requestsCompleted: this.requestsCompleted,
+          prefillComputed: this.prefillComputed,
+          prefillCached: this.prefillCached,
+          time: nowMs,
+        };
       }
     } catch {}
 
     this.backendType = "ds4";
+    this._collectRecipeInfo();
     return this._getSnapshot();
   }
 
@@ -2981,6 +3109,296 @@ export class LlmProbe {
     return { level, auth, scope, label, detail };
   }
 
+  // ─── Recipe info / attribution collection ────────────────
+  /**
+   * Collect rich recipe info (engine type, model, container, author, config badges)
+   * by inspecting the host process environment and command line.
+   * Called once per probe cycle; cheap because it caches and short-circuits.
+   */
+  _collectRecipeInfo() {
+    try {
+      if (this.backendType === "ds4") {
+        this.recipeInfo = this._collectDs4RecipeInfo();
+      } else if (this.backendType === "vllm") {
+        this.recipeInfo = this._collectVllmRecipeInfo();
+      } else {
+        this.recipeInfo = null;
+      }
+    } catch(e) {
+      console.error("[ds4-recipe] ERROR:", e.message, e.stack?.substring(0, 200));
+      this.recipeInfo = null;
+    }
+  }
+
+  /** Find the PID of the process listening on this.port by scanning host /proc. */
+  _findHostPid() {
+    try {
+      const procDir = HOST_PROC;
+      const entries = readdirSync(procDir);
+      for (const pid of entries) {
+        if (!/^\d+$/.test(pid)) continue;
+        const cmdlinePath = `${procDir}/${pid}/cmdline`;
+        try {
+          const cmdline = readFileSync(cmdlinePath, "utf8");
+          const parts = cmdline.split("\0").filter(Boolean);
+          if (parts.length === 0) continue;
+          // ds4-server or vllm or python processes
+          const exe = parts[0].toLowerCase();
+          if (exe.includes("ds4-server") || exe.includes("ds4")) {
+            // Check if this process has --port matching our port
+            const portArg = parts.find((p, i) => parts[i - 1] === "--port" && /^\d+$/.test(p));
+            if (portArg && parseInt(portArg) === this.port) return parseInt(pid);
+            // Also check for --host 0.0.0.0 --port <port> pattern
+            const allArgs = parts.join(" ");
+            if (allArgs.includes(`--port ${this.port}`) || allArgs.includes(`port=${this.port}`)) return parseInt(pid);
+          }
+          if (exe.includes("vllm") || exe.includes("python")) {
+            const allArgs = parts.join(" ");
+            if (allArgs.includes(`--port ${this.port}`) || allArgs.includes(`port=${this.port}`)) return parseInt(pid);
+          }
+        } catch {}
+      }
+    } catch {}
+    return null;
+  }
+
+  /** Collect recipe info for the ds4 CUDA engine backend. */
+  _collectDs4RecipeInfo() {
+    const pid = this._findHostPid();
+    if (!pid) return null;
+
+    let environ = {};
+    let cmdline = "";
+    try {
+      const envRaw = readFileSync(`${HOST_PROC}/${pid}/environ`, "utf8");
+      for (const pair of envRaw.split("\0")) {
+        if (!pair) continue;
+        const eq = pair.indexOf("=");
+        if (eq > 0) environ[pair.slice(0, eq)] = pair.slice(eq + 1);
+      }
+    } catch {}
+    try {
+      cmdline = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    } catch {}
+
+    // Parse model file from cmdline: -m <path>
+    const modelMatch = cmdline.match(/-m\s+(\S+)/);
+    const modelPath = modelMatch ? modelMatch[1] : null;
+    const modelFile = modelPath ? modelPath.split("/").pop() : null;
+
+    // Detect quantization from model filename
+    let quantization = null;
+    if (modelFile) {
+      if (/IQ2XXS/i.test(modelFile)) quantization = "IQ2XXS";
+      else if (/IQ3/i.test(modelFile)) quantization = "IQ3";
+      else if (/IQ4/i.test(modelFile)) quantization = "IQ4";
+      else if (/Q2K/i.test(modelFile)) quantization = "Q2_K";
+      else if (/Q4_K/i.test(modelFile)) quantization = "Q4_K";
+      else if (/Q8_0/i.test(modelFile)) quantization = "Q8_0";
+      else if (/FP8/i.test(modelFile)) quantization = "FP8";
+      else if (/NVFP4/i.test(modelFile)) quantization = "NVFP4";
+    }
+
+    // Context length from cmdline: -c <num> (take last occurrence)
+    let contextLength = this.contextLength;
+    const ctxMatches = [...cmdline.matchAll(/-c\s+(\d+)/g)];
+    if (ctxMatches.length > 0) {
+      contextLength = parseInt(ctxMatches[ctxMatches.length - 1][1]);
+    }
+
+    // Max lanes from DS4_BATCH_FIT_HEADROOM_MB (maps to banks_total)
+    const maxLanes = this.banksTotal ?? null;
+
+    // DSpark config
+    const dsparkEnabled = environ.DS4_CONT_DSPARK === "1" || environ.DS4_CONT_DSPARK === "true";
+    const mtpMode = environ.DS4_CONT_MTP_MODE || null;
+    const dsparkModel = environ.DS4_DSPARK_MODEL || null;
+
+    let specDecodeMethod = null;
+    if (dsparkEnabled) {
+      const drafterFile = dsparkModel ? dsparkModel.split("/").pop() : null;
+      // k value: MTP mode 2 = k=4 for DSpark typically
+      const k = mtpMode ? `k=${mtpMode}` : "k=4";
+      specDecodeMethod = `DSpark ${k}`;
+    } else if (mtpMode) {
+      specDecodeMethod = `MTP k=${mtpMode}`;
+    }
+
+    // KV cache dtype: ds4 uses native CUDA cache, no env var for dtype
+    const kvCacheDtype = "native";
+
+    // Prefix caching: ds4 always has warm/prefix cache (warmRecords)
+    const prefixCaching = this.warmRecords != null ? this.warmRecords > 0 : null;
+
+    // Author attribution for ds4
+    const author = "@bleysg";
+    const authorName = "Bleys Goodson";
+
+    // Engine type
+    const engineType = "DS4 CUDA Engine";
+
+    // Container: native build
+    const containerImage = "Native build (Entrpi/ds4 fork)";
+
+    // Model display name from recipeMetadata
+    const modelName = this.recipeMetadata?.model || this.modelId || modelFile || null;
+
+    // Accept ratio
+    const acceptRatio = this.dsparkAcceptRatio ?? null;
+
+    // Uptime
+    const uptime = this.ds4Uptime ?? null;
+
+    return {
+      engineType,
+      modelName,
+      containerImage,
+      author,
+      authorName,
+      contextLength,
+      maxLanes,
+      specDecodeMethod,
+      quantization,
+      gmu: null, // ds4 doesn't expose GMU directly
+      kvCacheDtype,
+      prefixCaching,
+      acceptRatio,
+      uptime,
+    };
+  }
+
+  /** Collect recipe info for a vLLM container backend. */
+  _collectVllmRecipeInfo() {
+    // Try to find the container via docker
+    let containerImage = null;
+    let containerName = null;
+    try {
+      // List containers, find one with port mapping to this.port
+      const containersRaw = execSync("docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'", {
+        timeout: 5000,
+        encoding: "utf8",
+      });
+      for (const line of containersRaw.trim().split("\n")) {
+        if (!line) continue;
+        const [name, image, ports] = line.split("\t");
+        if (ports && ports.includes(`${this.port}->`)) {
+          containerImage = image;
+          containerName = name;
+          break;
+        }
+      }
+    } catch {}
+
+    if (!containerImage) return null;
+
+    // Try docker inspect for env vars
+    let environ = {};
+    if (containerName) {
+      try {
+        const inspectRaw = execSync(
+          `docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ${containerName}`,
+          { timeout: 5000, encoding: "utf8" }
+        );
+        for (const line of inspectRaw.trim().split("\n")) {
+          if (!line) continue;
+          const eq = line.indexOf("=");
+          if (eq > 0) environ[line.slice(0, eq)] = line.slice(eq + 1);
+        }
+      } catch {}
+    }
+
+    // Try docker inspect for cmdline args
+    let cmdline = "";
+    if (containerName) {
+      try {
+        cmdline = execSync(
+          `docker inspect --format '{{range .Args}}{{.}} {{end}}' ${containerName}`,
+          { timeout: 5000, encoding: "utf8" }
+        ).trim();
+      } catch {}
+    }
+
+    // Parse model from cmdline: --model <path>
+    const modelMatch = cmdline.match(/--model\s+(\S+)/);
+    const modelPath = modelMatch ? modelMatch[1] : null;
+    const modelFile = modelPath ? modelPath.split("/").pop() : null;
+
+    // Detect quantization
+    let quantization = null;
+    const quantArg = cmdline.match(/--quantization\s+(\S+)/);
+    if (quantArg) {
+      quantization = quantArg[1].toUpperCase();
+    } else if (modelFile) {
+      if (/FP8/i.test(modelFile)) quantization = "FP8";
+      else if (/NVFP4/i.test(modelFile)) quantization = "NVFP4";
+      else if (/AWQ/i.test(modelFile)) quantization = "AWQ";
+      else if (/GPTQ/i.test(modelFile)) quantization = "GPTQ";
+    }
+
+    // Context length from cmdline: --max-model-len <num>
+    let contextLength = this.contextLength;
+    const ctxMatch = cmdline.match(/--max-model-len\s+(\d+)/);
+    if (ctxMatch) contextLength = parseInt(ctxMatch[1]);
+
+    // Max lanes from cmdline: --tensor-parallel-size or --gpu-memory-utilization
+    const tpMatch = cmdline.match(/--tensor-parallel-size\s+(\d+)/);
+    const maxLanes = tpMatch ? parseInt(tpMatch[1]) : null;
+
+    // Speculative decode method
+    let specDecodeMethod = null;
+    if (/--speculative-model/.test(cmdline) || /--speculative_config/.test(cmdline)) {
+      const numSpecMatch = cmdline.match(/--num-speculative-tokens\s+(\d+)/);
+      const k = numSpecMatch ? numSpecMatch[1] : "?";
+      specDecodeMethod = `MTP k=${k}`;
+    }
+
+    // KV cache dtype
+    let kvCacheDtype = null;
+    const kvMatch = cmdline.match(/--kv-cache-dtype\s+(\S+)/);
+    if (kvMatch) kvCacheDtype = kvMatch[1];
+    else kvCacheDtype = "auto";
+
+    // Prefix caching
+    let prefixCaching = null;
+    if (/--enable-prefix-caching/.test(cmdline)) prefixCaching = true;
+    else if (/--no-prefix-caching/.test(cmdline)) prefixCaching = false;
+
+    // GMU
+    let gmu = null;
+    const gmuMatch = cmdline.match(/--gpu-memory-utilization\s+([\d.]+)/);
+    if (gmuMatch) gmu = parseFloat(gmuMatch[1]);
+
+    // Author attribution for vLLM recipes
+    const author = "@styles01";
+    const authorName = "styles01";
+
+    // Engine type
+    const engineType = "vLLM";
+
+    // Model display name
+    const modelName = this.modelId || modelFile || null;
+
+    // Accept ratio
+    const acceptRatio = this.mtpAcceptanceRate ?? null;
+
+    return {
+      engineType,
+      modelName,
+      containerImage,
+      author,
+      authorName,
+      contextLength,
+      maxLanes,
+      specDecodeMethod,
+      quantization,
+      gmu,
+      kvCacheDtype,
+      prefixCaching,
+      acceptRatio,
+      uptime: null,
+    };
+  }
+
   _getSnapshot() {
     const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
     return {
@@ -3113,6 +3531,7 @@ export class LlmProbe {
     snap.decodeSteps = this.decodeSteps;
     snap.tokPerStep = this.tokPerStep;
     snap.recipeMetadata = this.recipeMetadata;
+    snap.recipeInfo = this.recipeInfo;
 
     return snap;
   }

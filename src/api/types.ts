@@ -302,6 +302,39 @@ export interface RecipeMetadata {
   supportedParameters: string[];
 }
 
+// ─── Recipe info / attribution ──────────────────────────
+/** Rich recipe configuration + attribution shown in the Recipe Info card. */
+export interface RecipeInfo {
+  /** Engine type label, e.g. "DS4 CUDA Engine", "vLLM v26", "vLLM-Moet" */
+  engineType: string | null;
+  /** Model display name, e.g. "DeepSeek V4 Flash" */
+  modelName: string | null;
+  /** Container image (vLLM) or "Native build" (ds4) */
+  containerImage: string | null;
+  /** Recipe author / attribution handle, e.g. "@bleysg", "@styles01" */
+  author: string | null;
+  /** Author display name, e.g. "Bleys Goodson" */
+  authorName: string | null;
+  /** Context length in tokens */
+  contextLength: number | null;
+  /** Max lanes / parallel context banks */
+  maxLanes: number | null;
+  /** Speculative decode method label, e.g. "DSpark k=4", "MTP k=2" */
+  specDecodeMethod: string | null;
+  /** Quantization label, e.g. "IQ2XXS", "FP8", "NVFP4" */
+  quantization: string | null;
+  /** GPU memory utilization (0-1) */
+  gmu: number | null;
+  /** KV cache dtype label, e.g. "fp8", "auto" */
+  kvCacheDtype: string | null;
+  /** Prefix caching enabled */
+  prefixCaching: boolean | null;
+  /** DSpark / MTP acceptance ratio (0-1) */
+  acceptRatio: number | null;
+  /** Engine uptime in seconds */
+  uptime: number | null;
+}
+
 // ─── LLM metrics ─────────────────────────────────────────
 export interface LlmMetrics {
   available: boolean;
@@ -587,6 +620,8 @@ export interface TailscaleMetrics {
   tokPerStep?: number;
   /** Recipe metadata from /v1/models */
   recipeMetadata?: RecipeMetadata | null;
+  /** Rich recipe info / attribution for the Recipe Info card */
+  recipeInfo?: RecipeInfo | null;
 }
 
 // ─── Full metrics snapshot ────────────────────────────────
