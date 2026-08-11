@@ -637,7 +637,7 @@ export class LlmProbe {
     this.backendType = "ds4";
     this._tailDs4LogForReasoningEffort();
     this._tailDs4LogForActiveContext();
-    this._collectRecipeInfo();
+    await this._collectRecipeInfo();
     return this._getSnapshot();
   }
 
@@ -877,6 +877,8 @@ export class LlmProbe {
         }
       }
       await this._enrichSglangModelInfo();
+      await this._collectRecipeInfo();
+      console.log("[sglang-recipe] final recipeInfo=", JSON.stringify(this.recipeInfo));
       return this._getSnapshot();
     }
 
@@ -901,7 +903,7 @@ export class LlmProbe {
     } catch {
       if (this.backendType !== "ds4") this.backendType = "vllm";
     }
-    if (this.backendType === "vllm") this._collectRecipeInfo();
+    if (this.backendType === "vllm" || this.backendType === "sglang") await this._collectRecipeInfo();
 
     return this._getSnapshot();
   }
@@ -1546,10 +1548,52 @@ _applySglangMetrics(txt, dtSec) {
    * by inspecting the host process environment and command line.
    * Called once per probe cycle; cheap because it caches and short-circuits.
    */
-  _collectRecipeInfo() {
+async _collectSglangRecipeInfo() {
+    try {
+      const info = await this._getSglangModelInfo();
+      console.log("[sglang-recipe] info=", JSON.stringify(info));
+      if (!info) return null;
+      const ctx = info.context_length || this.contextLength || null;
+      const arch = Array.isArray(info.architectures) ? info.architectures[0] : null;
+      const quant = info.quantization || (info.model_path && /nvfp4|fp4|int4|fp8/i.test(info.model_path) ? (info.model_path.match(/(nvfp4|fp4|int4|fp8)/i) || [])[1] : null) || null;
+      return {
+        engineType: "SGLang",
+        modelName: info.model_path ? info.model_path.split("/").pop() : this.modelId,
+        containerImage: "lmsysorg/sglang:dev-muse-glimmer",
+        author: null,
+        authorName: null,
+        contextLength: ctx,
+        maxLanes: null,
+        specDecodeMethod: "DFlash",
+        quantization: quant,
+        gmu: info.mem_fraction_static != null ? info.mem_fraction_static : null,
+        kvCacheDtype: info.kv_cache_dtype || null,
+        prefixCaching: true,
+        acceptRatio: this.mtpAcceptanceRate,
+        ownedBy: info.model_type || arch || null,
+      };
+    } catch (e) {
+      console.error("[sglang-recipe] ERROR:", e.message);
+      return null;
+    }
+  }
+
+  async _getSglangModelInfo() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/get_model_info`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async _collectRecipeInfo() {
     try {
       if (this.backendType === "ds4") {
         this.recipeInfo = this._collectDs4RecipeInfo();
+      } else if (this.backendType === "sglang") {
+        this.recipeInfo = await this._collectSglangRecipeInfo();
       } else if (this.backendType === "vllm") {
         this.recipeInfo = this._collectVllmRecipeInfo();
       } else {
@@ -1924,6 +1968,8 @@ _applySglangMetrics(txt, dtSec) {
       rollingAvgTokensPerReq: this.rollingAvgTokensPerReq,
       rollingAvgTpsPerSlot: this.rollingAvgTpsPerSlot,
       posture: this._buildPosture(),
+      recipeInfo: this.recipeInfo,
+      recipeMetadata: this.recipeMetadata,
       error: this.error,
     };
 

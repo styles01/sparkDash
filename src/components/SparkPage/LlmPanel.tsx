@@ -848,6 +848,8 @@ export function LlmPanel({
 
           {/* 2. Stat cards: KV cache, Gen tok/s, MTP accept, Prefix cache */}
           <div className="llm-stat-grid">
+            <StatCard label="Running slots" value={fmtInt(runningSlots)} sub={llm?.slotsTotal ? `of ${llm.slotsTotal}` : undefined} valueColor={runningSlots > 0 ? "var(--color-success)" : "var(--color-muted)"} />
+            <StatCard label="Waiting slots" value={fmtInt(waitingSlots)} valueColor={waitingSlots > 0 ? "var(--color-danger)" : "var(--color-muted)"} />
             <StatCard label="KV cache" value={pct(kvUsage, 0)} valueColor={kvUsage != null && kvUsage > 0.85 ? "var(--color-danger)" : kvUsage != null && kvUsage > 0.6 ? "var(--color-warning)" : "var(--color-text)"} bar={kvUsage != null ? { pct: kvUsage * 100, color: kvUsage > 0.85 ? "var(--color-danger)" : kvUsage > 0.6 ? "var(--color-warning)" : "var(--color-accent)" } : undefined} />
             <StatCard label="Gen tok/s" value={fmtNum(genTps, 1)} sub={fmtNum(llm?.prefillTps, 1, " prefill")} valueColor={tpsColor(genTps)} />
             <StatCard label={isDs4 ? "DSpark accept" : "MTP accept"} value={pct(mtpRate, 0)} valueColor={mtpColor(mtpRate)} bar={mtpRate != null ? { pct: mtpRate * 100, color: mtpColor(mtpRate) } : undefined} />
@@ -952,7 +954,7 @@ export function LlmPanel({
           </div>
 
           {/* ── DS4 ENGINE METRICS PANEL ─────────────────────── */}
-          {isDs4 && (
+          {(llm?.backend === "ds4" || llm?.backend === "sglang" || llm?.backend === "vllm") && (
             <div className="llm-chart-block" style={{ borderTop: "1px solid var(--color-border)", paddingTop: "0.75rem" }}>
               <div className="llm-chart-title">DS4 Engine Metrics <span className="llm-chart-sub">CUDA engine telemetry</span></div>
 
@@ -1001,7 +1003,7 @@ export function LlmPanel({
           )}
 
           {/* ── vLLM-specific metric tiles (unchanged) ─────── */}
-          {llm?.backend === "vllm" && (
+          {(llm?.backend === "vllm" || llm?.backend === "sglang") && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">
               <div className="space-y-0.5"><MetricInfoTip id="kvCache" label="KV Cache" text={VLLM_METRIC_INFO.kvCache} openId={metricInfoId} setOpenId={setMetricInfoId} /><div className={`font-tabular text-sm ${llm.kvCacheUsage == null ? "text-text" : llm.kvCacheUsage >= 0.8 ? "text-danger" : llm.kvCacheUsage >= 0.5 ? "text-warning" : "text-success"}`}>{llm.kvCacheUsage != null ? `${(llm.kvCacheUsage * 100).toFixed(1)}%` : "\u2014"}</div></div>
               <div className="space-y-0.5"><MetricInfoTip id="requests" label="Requests" text={VLLM_METRIC_INFO.requests} openId={metricInfoId} setOpenId={setMetricInfoId} align="right" /><div className="font-tabular text-sm text-text">{llm.requestsRunning != null && llm.requestsWaiting != null ? `${Math.round(llm.requestsRunning)} run / ${Math.round(llm.requestsWaiting)} wait` : "\u2014"}</div></div>
@@ -1010,7 +1012,7 @@ export function LlmPanel({
             </div>
           )}
 
-          {llm?.backend === "vllm" && (
+          {(llm?.backend === "vllm" || llm?.backend === "sglang") && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">
               <div className="space-y-0.5"><MetricInfoTip id="prefixCache" label="Prefix Cache" text={VLLM_METRIC_INFO.prefixCache} openId={metricInfoId} setOpenId={setMetricInfoId} /><div className="font-tabular text-sm text-text">{llm.prefixCacheHitRate != null ? `${(llm.prefixCacheHitRate * 100).toFixed(1)}%` : "\u2014"}</div></div>
               <div className="space-y-0.5"><MetricInfoTip id="e2eP95" label="E2E p95" text={VLLM_METRIC_INFO.e2eP95} openId={metricInfoId} setOpenId={setMetricInfoId} align="right" /><div className="font-tabular text-sm text-text">{llm.e2eP95Seconds != null ? `${llm.e2eP95Seconds.toFixed(3)}s` : "\u2014"}</div></div>
