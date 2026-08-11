@@ -1209,6 +1209,16 @@ _applySglangMetrics(txt, dtSec) {
       }
       this.lastTokenCounts.output = gen;
       this.totalOutputTokens = gen;
+      this.totalTokensDecoded = gen;
+    }
+
+    // Peak aggregate tok/s = max of gen_throughput over poll history
+    const gt = this._getPromMetric(txt, "sglang:gen_throughput");
+    if (gt != null) {
+      this.generationTps = Math.max(0, Math.round(gt * 100) / 100);
+      if (this.peakAggregateTps == null || this.generationTps > this.peakAggregateTps) {
+        this.peakAggregateTps = this.generationTps;
+      }
     }
 
     const running =
@@ -1217,21 +1227,35 @@ _applySglangMetrics(txt, dtSec) {
     if (running != null) {
       this.requestsRunning = running;
       this.slotsActive = Math.round(running);
+      this.requestsInflight = Math.round(running);
+      this.banksLive = Math.round(running);
     }
     const waiting =
       this._getPromMetric(txt, "sglang:num_queue_reqs") ??
       this._getPromMetric(txt, "sglang_num_queue_reqs");
     if (waiting != null) this.requestsWaiting = waiting;
 
+    // In-flight HTTP requests
+    const httpActive = this._getPromMetricLabeled(txt, "sglang:http_requests_active", "method", "POST");
+    if (httpActive != null) this.requestsInflight = Math.round(httpActive);
+
+    // KV cache usage (0..1 fraction of pool used)
     const kvUsed = this._getPromMetric(txt, "sglang:token_usage");
     if (kvUsed != null) this.kvCacheUsage = kvUsed;
 
+    // Prefix cache hit rate
     const hit = this._getPromMetric(txt, "sglang:cache_hit_rate");
     if (hit != null) this.prefixCacheHitRate = hit;
 
+    // Context length
     const ctx = this._getPromMetric(txt, "sglang:context_len");
     if (ctx != null) this.contextLength = ctx;
 
+    // Active context size (tokens in KV cache)
+    const usedTokens = this._getPromMetric(txt, "sglang:num_used_tokens");
+    if (usedTokens != null) this.activeContext = Math.round(usedTokens);
+
+    // Speculative decode acceptance rate (DFlash/MTP)
     const acceptRate = this._getPromMetric(txt, "sglang:spec_accept_rate");
     if (acceptRate != null) this.mtpAcceptanceRate = acceptRate;
     const drafted = this._getPromMetric(txt, "sglang:spec_num_draft_tokens");
@@ -1239,6 +1263,27 @@ _applySglangMetrics(txt, dtSec) {
     const accepted = this._getPromMetric(txt, "sglang:spec_accept_length");
     if (accepted != null) this.mtpAcceptedTokens = Math.round(accepted);
 
+    // Tok/step = sum of seq lens in decode batch
+    const decodeSum = this._getPromMetric(txt, "sglang:decode_sum_seq_lens");
+    if (decodeSum != null) this.tokPerStep = decodeSum;
+
+    // Decode steps = spec verify calls (counter)
+    const verifyCalls = this._getPromMetric(txt, "sglang:spec_verify_calls_total");
+    if (verifyCalls != null) this.decodeSteps = Math.round(verifyCalls);
+
+    // Prefill cached vs computed
+    const prefillCached = this._getPromMetricLabeled(txt, "sglang:realtime_tokens_total", "mode", "prefill_cache");
+    if (prefillCached != null) this.prefillCached = Math.round(prefillCached);
+    const prefillComputed = this._getPromMetricLabeled(txt, "sglang:realtime_tokens_total", "mode", "prefill_compute");
+    if (prefillComputed != null) this.prefillComputed = Math.round(prefillComputed);
+
+    // Requests started / completed
+    const reqsStarted = this._getPromMetric(txt, "sglang:num_requests_total");
+    if (reqsStarted != null) this.requestsStarted = Math.round(reqsStarted);
+    const reqsCompleted = this._getPromMetric(txt, "sglang:http_responses_total");
+    if (reqsCompleted != null) this.requestsCompleted = Math.round(reqsCompleted);
+
+    // TTFT histogram -> P95 + rolling avg
     const ttftHist = this._parseSglangHistogram(txt, "sglang:time_to_first_token_seconds");
     if (ttftHist && ttftHist.total > 0) {
       const p95 = this._histogramQuantile(ttftHist.buckets, ttftHist.total, 0.95);
@@ -1248,6 +1293,7 @@ _applySglangMetrics(txt, dtSec) {
       this.ttft = this.rollingAvgTtft;
     }
 
+    // E2E latency histogram -> P95 + rolling avg
     const e2eHist = this._parseSglangHistogram(txt, "sglang:e2e_request_latency_seconds");
     if (e2eHist && e2eHist.total > 0) {
       const p95 = this._histogramQuantile(e2eHist.buckets, e2eHist.total, 0.95);
@@ -1257,12 +1303,14 @@ _applySglangMetrics(txt, dtSec) {
       this.e2eLatency = this.rollingAvgE2e;
     }
 
+    // Inter-token latency histogram -> P95
     const itlHist = this._parseSglangHistogram(txt, "sglang:inter_token_latency_seconds");
     if (itlHist && itlHist.total > 0) {
       const p95 = this._histogramQuantile(itlHist.buckets, itlHist.total, 0.95);
       if (p95 != null) this.itlP95Seconds = Math.round(p95 * 1000) / 1000;
     }
 
+    // Tokens per request (generation tokens histogram)
     const genHist = this._parseSglangHistogram(txt, "sglang:generation_tokens_histogram");
     if (genHist && genHist.total > 0) {
       this.genTokensPerReq = Math.round(genHist.sum / genHist.total);
@@ -1970,6 +2018,37 @@ async _collectSglangRecipeInfo() {
       posture: this._buildPosture(),
       recipeInfo: this.recipeInfo,
       recipeMetadata: this.recipeMetadata,
+      peakAggregateTps: this.peakAggregateTps,
+      perStreamHigh: this.perStreamHigh,
+      perStreamLow: this.perStreamLow,
+      perStreamAvg: this.perStreamAvg,
+      totalTokensDecoded: this.totalTokensDecoded,
+      dsparkAcceptRatio: this.dsparkAcceptRatio,
+      banksLive: this.banksLive,
+      banksTotal: this.banksTotal,
+      kvPagesResident: this.kvPagesResident,
+      prefillCached: this.prefillCached,
+      prefillComputed: this.prefillComputed,
+      specDrafts: this.specDrafts,
+      specHits: this.specHits,
+      warmRecords: this.warmRecords,
+      specQuench: this.specQuench,
+      tokPerStep: this.tokPerStep,
+      decodeSteps: this.decodeSteps,
+      derivedArtifacts: this.derivedArtifacts,
+      derivedArtifactBytes: this.derivedArtifactBytes,
+      ds4Uptime: this.ds4Uptime,
+      admitsCold: this.admitsCold,
+      admitsWarm: this.admitsWarm,
+      admitsFork: this.admitsFork,
+      admitsPartialFork: this.admitsPartialFork,
+      admitsPartialTruncate: this.admitsPartialTruncate,
+      requestsStarted: this.requestsStarted,
+      requestsCompleted: this.requestsCompleted,
+      requestsInflight: this.requestsInflight,
+      activeContext: this.activeContext,
+      activeContextTs: this.activeContextTs,
+      contextUsedBytes: this.contextUsedBytes,
       error: this.error,
     };
 
