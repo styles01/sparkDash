@@ -846,6 +846,49 @@ export function LlmPanel({
             </div>
           )}
 
+          {/* 2. Stat cards: KV cache, Gen tok/s, MTP accept, Prefix cache */}
+          <div className="llm-stat-grid">
+            <StatCard label="KV cache" value={pct(kvUsage, 0)} valueColor={kvUsage != null && kvUsage > 0.85 ? "var(--color-danger)" : kvUsage != null && kvUsage > 0.6 ? "var(--color-warning)" : "var(--color-text)"} bar={kvUsage != null ? { pct: kvUsage * 100, color: kvUsage > 0.85 ? "var(--color-danger)" : kvUsage > 0.6 ? "var(--color-warning)" : "var(--color-accent)" } : undefined} />
+            <StatCard label="Gen tok/s" value={fmtNum(genTps, 1)} sub={fmtNum(llm?.prefillTps, 1, " prefill")} valueColor={tpsColor(genTps)} />
+            <StatCard label={isDs4 ? "DSpark accept" : "MTP accept"} value={pct(mtpRate, 0)} valueColor={mtpColor(mtpRate)} bar={mtpRate != null ? { pct: mtpRate * 100, color: mtpColor(mtpRate) } : undefined} />
+            <StatCard label="Prefix cache" value={pct(prefixHit, 0)} valueColor={prefixHit != null ? "var(--color-accent)" : "var(--color-muted)"} bar={prefixHit != null ? { pct: prefixHit * 100, color: "var(--color-accent)" } : undefined} />
+          </div>
+
+          {/* 3. Real-time t/s chart */}
+          <div className="llm-chart-block">
+            <div className="llm-chart-title">Throughput <span className="llm-chart-sub">tok/s \u00B7 last 60 samples</span></div>
+            <TelemetryChart series={[genSeries, preSeries]} maxPoints={HISTORY} height={170} yUnit="" yUnitRight="" yMin={0} yMax={140} yMaxRight={2000} />
+          </div>
+
+          {/* 4. TTFT + E2E latency chart */}
+          <div className="llm-chart-block">
+            <div className="llm-chart-title">Latency <span className="llm-chart-sub">seconds \u00B7 TTFT + E2E</span></div>
+            <TelemetryChart series={[ttftSeries, e2eSeries]} maxPoints={HISTORY} height={150} yUnit="s" yMin={0} />
+          </div>
+
+          {/* 5. Per-slot table */}
+          {slots.length > 0 && (
+            <div className="llm-chart-block">
+              <div className="llm-chart-title">Per-slot <span className="llm-chart-sub">{slots.length} active</span></div>
+              <div className="llm-slot-table">
+                <table>
+                  <thead><tr><th>Slot</th><th>Context</th><th>t/s</th><th>TTFT</th><th>RTT</th></tr></thead>
+                  <tbody>
+                    {slots.map((s) => (
+                      <tr key={s.id}>
+                        <td className="font-tabular">#{s.id}</td>
+                        <td className="font-tabular">{s.contextLength.toLocaleString()}</td>
+                        <td className="font-tabular" style={{ color: tpsColor(s.tps) }}>{fmtNum(s.tps, 1)}</td>
+                        <td className="font-tabular" style={{ color: latencyColor(s.ttft, 0.2, 1.0) }}>{fmtNum(s.ttft, 3, "s")}</td>
+                        <td className="font-tabular" style={{ color: latencyColor(s.roundTrip, 0.5, 3.0) }}>{fmtNum(s.roundTrip, 3, "s")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {/* 6. Moving averages + 7. MTP panel */}
           <div className="llm-bottom-grid">
             <div className="llm-chart-block">
