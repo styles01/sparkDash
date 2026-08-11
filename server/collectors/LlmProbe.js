@@ -1181,7 +1181,7 @@ export class LlmProbe {
    * @param {string} txt
    * @param {number} dtSec
    */
-  _applySglangMetrics(txt, dtSec) {
+_applySglangMetrics(txt, dtSec) {
     const gen =
       this._getPromMetric(txt, "sglang:generation_tokens_total") ??
       this._getPromMetric(txt, "sglang_generation_tokens_total");
@@ -1195,20 +1195,19 @@ export class LlmProbe {
       if (gauge != null) {
         this.generationTps = Math.max(0, Math.round(gauge * 100) / 100);
       }
-      return;
-    }
-
-    if (dtSec > 0 && dtSec < 10) {
-      const deltaOut = gen - this.lastTokenCounts.output;
-      this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-      if (prompt != null) {
-        const deltaIn = prompt - this.lastTokenCounts.input;
-        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
-        this.lastTokenCounts.input = prompt;
+    } else {
+      if (dtSec > 0 && dtSec < 10) {
+        const deltaOut = gen - this.lastTokenCounts.output;
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        if (prompt != null) {
+          const deltaIn = prompt - this.lastTokenCounts.input;
+          this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+          this.lastTokenCounts.input = prompt;
+        }
       }
+      this.lastTokenCounts.output = gen;
+      this.totalOutputTokens = gen;
     }
-    this.lastTokenCounts.output = gen;
-    this.totalOutputTokens = gen;
 
     const running =
       this._getPromMetric(txt, "sglang:num_running_reqs") ??
@@ -1217,6 +1216,87 @@ export class LlmProbe {
       this.requestsRunning = running;
       this.slotsActive = Math.round(running);
     }
+    const waiting =
+      this._getPromMetric(txt, "sglang:num_queue_reqs") ??
+      this._getPromMetric(txt, "sglang_num_queue_reqs");
+    if (waiting != null) this.requestsWaiting = waiting;
+
+    const kvUsed = this._getPromMetric(txt, "sglang:token_usage");
+    if (kvUsed != null) this.kvCacheUsage = kvUsed;
+
+    const hit = this._getPromMetric(txt, "sglang:cache_hit_rate");
+    if (hit != null) this.prefixCacheHitRate = hit;
+
+    const ctx = this._getPromMetric(txt, "sglang:context_len");
+    if (ctx != null) this.contextLength = ctx;
+
+    const acceptRate = this._getPromMetric(txt, "sglang:spec_accept_rate");
+    if (acceptRate != null) this.mtpAcceptanceRate = acceptRate;
+    const drafted = this._getPromMetric(txt, "sglang:spec_num_draft_tokens");
+    if (drafted != null) this.mtpDraftedTokens = Math.round(drafted);
+    const accepted = this._getPromMetric(txt, "sglang:spec_accept_length");
+    if (accepted != null) this.mtpAcceptedTokens = Math.round(accepted);
+
+    const ttftHist = this._parseSglangHistogram(txt, "sglang:time_to_first_token_seconds");
+    if (ttftHist && ttftHist.total > 0) {
+      const p95 = this._histogramQuantile(ttftHist.buckets, ttftHist.total, 0.95);
+      if (p95 != null) this.ttftP95Seconds = Math.round(p95 * 1000) / 1000;
+      const avg = ttftHist.sum / ttftHist.total;
+      this.rollingAvgTtft = Math.round(avg * 1000) / 1000;
+      this.ttft = this.rollingAvgTtft;
+    }
+
+    const e2eHist = this._parseSglangHistogram(txt, "sglang:e2e_request_latency_seconds");
+    if (e2eHist && e2eHist.total > 0) {
+      const p95 = this._histogramQuantile(e2eHist.buckets, e2eHist.total, 0.95);
+      if (p95 != null) this.e2eP95Seconds = Math.round(p95 * 1000) / 1000;
+      const avg = e2eHist.sum / e2eHist.total;
+      this.rollingAvgE2e = Math.round(avg * 1000) / 1000;
+      this.e2eLatency = this.rollingAvgE2e;
+    }
+
+    const itlHist = this._parseSglangHistogram(txt, "sglang:inter_token_latency_seconds");
+    if (itlHist && itlHist.total > 0) {
+      const p95 = this._histogramQuantile(itlHist.buckets, itlHist.total, 0.95);
+      if (p95 != null) this.itlP95Seconds = Math.round(p95 * 1000) / 1000;
+    }
+
+    const genHist = this._parseSglangHistogram(txt, "sglang:generation_tokens_histogram");
+    if (genHist && genHist.total > 0) {
+      this.genTokensPerReq = Math.round(genHist.sum / genHist.total);
+      this.rollingAvgTokensPerReq = this.genTokensPerReq;
+    }
+
+    if (this.slotsActive > 0 && this.generationTps > 0) {
+      this.rollingAvgTpsPerSlot = Math.round((this.generationTps / this.slotsActive) * 100) / 100;
+    }
+  }
+
+  _parseSglangHistogram(body, metricPrefix) {
+    const esc = metricPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const bucketRe = new RegExp(
+      "^" + esc + "_bucket\\{[^}]*\\ble=\"([^\"]+)\"[^}]*\\}\\s+([\\d.eE+-]+)\\s*$",
+      "gm"
+    );
+    const buckets = [];
+    let m;
+    while ((m = bucketRe.exec(body)) !== null) {
+      const upper = m[1] === "+Inf" ? Infinity : parseFloat(m[1]);
+      const count = parseFloat(m[2]);
+      if (Number.isFinite(upper) && Number.isFinite(count)) {
+        buckets.push({ upper, count });
+      }
+    }
+    if (buckets.length === 0) return null;
+    buckets.sort((a, b) => a.upper - b.upper);
+    const total = buckets[buckets.length - 1].count;
+    const sumRe = new RegExp("^" + esc + "_sum\\{[^}]*\\}\\s+([\\d.eE+-]+)\\s*$", "gm");
+    let sum = 0;
+    while ((m = sumRe.exec(body)) !== null) {
+      const v = parseFloat(m[1]);
+      if (Number.isFinite(v)) sum += v;
+    }
+    return { buckets, total, sum };
   }
 
   /** Prefer SGLang /get_model_info (or /model_info) over raw HF cache paths. */
@@ -1341,10 +1421,6 @@ export class LlmProbe {
   }
 
   // ─── vLLM metrics helpers ─────────────────────────────
-  _getVllmMetric(body, name) {
-    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`^vllm:${esc}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)\\s*$`, "gm");
-  // ─── Metrics helpers ─────────────────────────────────────
   /**
    * Sum all Prometheus series matching `name` (optional labels).
    * @param {string} body
