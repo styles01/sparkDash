@@ -29,6 +29,7 @@ sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)
 
 - [Latest version changelog](#latest-version-changelog)
 - [Features](#features)
+- [ComfyUI monitoring](#comfyui-monitoring)
 - [Full changelog](./CHANGELOG.md)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -46,10 +47,11 @@ sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)
 
 ## Latest version changelog
 
-### Version 1.3.0 — major feature release
-- **LLM Prompt Showcase** — full-page multi-terminal streaming demo (up to 32 concurrent prompts) from the LLM panel
-- Aggregate server tok/s during runs, copy one/all terminals, collapsible reasoning, thinking-flag adapter
-- Shared streaming path for Showcase + DecodeBench; mutual exclusion between the two
+### Version 1.6.0 — ComfyUI monitoring & compact default
+- **ComfyUI** — opt-in per Spark (port 8188): live jobs, progress, last run, cancel, queue ETA, Open on LAN IP, model inventory
+- **Overview** — Comfy status chip (`idle` / `run` / `Nq`)
+- **Layout** — collapsible Resources / Services; LLM + Comfy side-by-side; multi-LLM row rules
+- **Compact UI** — default density (comfortable still in Settings)
 
 Full history: [CHANGELOG.md](./CHANGELOG.md)
 
@@ -62,7 +64,8 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Multi-unit** | Any number of Sparks; each has a tabbed detail page plus a shared Overview |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, or sglang; live tok/s per server |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, or ds4-server; live tok/s per server |
+| **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
 | **Decode benchmark** | Multi-concurrency streaming decode tok/s (server + per-stream), persisted last run |
 | **Prompt Showcase** | Full-page multi-terminal LLM streaming demo (up to 32 prompts) with live tok/s and copy-out |
 | **vLLM health** | KV cache %, run/wait queue, TTFT/E2E/ITL p95, preemptions, prefix cache, MTP accept from Prometheus `/metrics` |
@@ -76,6 +79,64 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Secrets** | SSH passwords AES-256-GCM encrypted; never in `sparks.json` or API responses |
 | **Docker-first** | Single privileged container for host metrics; prod and dev Compose files |
 | **Hot config** | Add / edit / remove / reorder Sparks from the UI with no process restart |
+
+---
+
+## ComfyUI monitoring
+
+sparkDash can **optionally** monitor a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) instance on each Spark — the same way it probes local LLMs, but focused on **jobs and queue**, not a second copy of GPU/RAM bars (those stay on the GPU / CPU panels).
+
+### What is supported
+
+| Capability | Details |
+|------------|---------|
+| **Opt-in per Spark** | `comfyMonitoring` (default **off**) + `comfyPort` (default **8188**) |
+| **Any role** | Head, worker, and standalone can enable ComfyUI independently of LLM cluster role |
+| **Liveness** | `GET /system_stats` — online, ComfyUI / PyTorch version, device type (cpu/cuda) |
+| **Queue / jobs** | `GET /queue` — running + pending items; workflow **title**, **model/LoRA** filenames from the graph, footprint (**resolution · steps · sampler · batch · node count**) |
+| **Progress** | Progress bar on the active job — Comfy WebSocket when events are available; otherwise elapsed / average-duration **estimate** |
+| **Last finished job** | Status + duration via `/api/jobs` (fallback `/history`) |
+| **Queue ETA** | Estimate from recent job durations × pending (+ progress remainder when known) |
+| **Cancel / remove** | From the Comfy card: interrupt a running job or dequeue a pending one (`POST /api/sparks/:id/comfy/cancel`) |
+| **Open ComfyUI** | One-click link to `http://{lanIp}:{comfyPort}` (LAN IP preferred so remote browsers do not hit localhost) |
+| **Model inventory** | Checkpoints + LoRAs from `/models/*` (UI section only when at least one file is listed) |
+| **Overview chip** | When monitoring is on: `Comfy · idle` / `run` / `Nq` / muted if unreachable |
+| **Layout** | Under **Services**: primary LLM + Comfy side-by-side when both are enabled; collapsible **Resources** / **Services** sections |
+
+**Not claimed:** true per-job VRAM (Comfy does not expose that cleanly over HTTP). Host GPU/VRAM remains on the GPU panel. Live step progress depends on Comfy broadcasting WS events; stock Comfy often scopes detailed progress to the client that submitted the prompt.
+
+### How to enable (per Spark)
+
+1. Open the Spark tab → **Edit** (pencil).
+2. Enable **ComfyUI monitoring**.
+3. Set **port** if needed (default **8188**).
+4. **Save**.
+
+The Spark page **Services** section shows the ComfyUI card. On Overview, a small Comfy chip appears for that unit.
+
+**Connectivity Test** (in Edit) includes ComfyUI when monitoring is enabled.
+
+### ComfyUI side requirements
+
+- ComfyUI must be reachable from the **sparkDash server** on the probe host:
+  - **Local Spark** (`isLocal`): sparkDash probes `127.0.0.1:{port}` (use Docker `network_mode: host` if the dashboard runs in a container).
+  - **Remote Spark**: probe uses the Spark **LAN IP** (same as LLM probes).
+- For **Open** from another machine’s browser, Comfy should listen on a reachable interface (e.g. `--listen 0.0.0.0`), not only loopback, and the Spark’s **LAN IP** must be set correctly in Edit.
+
+### Config fields (persisted on the Spark)
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `comfyMonitoring` | `false` | Probe ComfyUI and show the card / overview chip |
+| `comfyPort` | `8188` | ComfyUI HTTP port |
+
+### Related API
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/sparks/:id/comfy/cancel` | Cancel a job (`{ "promptId": "<uuid>" }`) — interrupt running and/or remove from queue |
+
+Env (optional): `COMFY_PORT` (default `8188`), `COMFY_PROBE_TIMEOUT_MS`, `POLL_INTERVAL_COMFY`.
 
 ---
 
@@ -182,8 +243,9 @@ sparkDash/
 | DELETE | `/api/sparks/:id` | Remove Spark and drain monitor |
 | PUT | `/api/sparks/order` | Persist tab order |
 | GET | `/api/sparks/:id/metrics` | One-shot metrics snapshot |
-| POST | `/api/sparks/test` | Ephemeral SSH + LLM test (no persist) |
+| POST | `/api/sparks/test` | Ephemeral SSH + LLM (+ Comfy if enabled) test (no persist) |
 | POST | `/api/sparks/:id/test` | Connectivity test (can save password) |
+| POST | `/api/sparks/:id/comfy/cancel` | Cancel ComfyUI job by `promptId` |
 | PUT | `/api/sparks/:id/password` | Save SSH password (works offline) |
 | PUT | `/api/sparks/:id/disabled-devices` | Hide storage devices (hot) |
 | PUT | `/api/sparks/:id/disabled-interfaces` | Hide network interfaces (hot) |
@@ -218,9 +280,12 @@ Copy `.env.example` to `.env` if needed:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `BIND_HOST` | `0.0.0.0` | HTTP and WebSocket listen address |
 | `PORT` | `5555` | HTTP + WebSocket listen port |
 | `LLM_PORT` | `8888` | Default LLM probe port |
+| `COMFY_PORT` | `8188` | Default ComfyUI probe port |
 | `POLL_INTERVAL_GPU` | `2000` | GPU poll (ms) |
+| `POLL_INTERVAL_COMFY` | `2000` | ComfyUI probe poll (ms) |
 | `POLL_INTERVAL_CPU` | `2000` | CPU / RAM poll (ms) |
 | `POLL_INTERVAL_NETWORK` | `2000` | Network poll (ms) |
 | `POLL_INTERVAL_STORAGE` | `5000` | Storage poll (ms) |
@@ -231,6 +296,9 @@ Copy `.env.example` to `.env` if needed:
 | `HOST_PROC_PATH` | `/host/proc` | Host proc mount inside container |
 | `HOST_SYS_PATH` | `/host/sys` | Host sys mount |
 | `HOST_ROOT_PATH` | `/host/root` | Host root mount |
+
+> When using Docker's default bridge network, keep `BIND_HOST=0.0.0.0`.  
+> With `network_mode: host`, use `BIND_HOST=127.0.0.1` to restrict access to the local host or a reverse proxy.
 
 ### Adding a Spark
 
@@ -314,9 +382,10 @@ Name, IP, SSH credentials, LLM port, and device/interface filters update the run
 Each configured LLM port gets its own `LlmProbe` instance running in parallel. Probes auto-detect backends:
 
 - **llama.cpp** — `/slots` for live decode rates; model from `/props`
-- **vLLM / sglang** — `/v1/models`; sglang via `/get_server_info`, vLLM via Prometheus `/metrics` counters (scientific notation supported)
+- **ds4-server** (Entrpi/ds4-on-spark) — `/v1/models` (`owned_by: ds4.c`) + Prometheus `ds4_*` token counters for live tok/s
+- **vLLM / sglang** — `/v1/models`; sglang via `/get_server_info` (`last_gen_throughput` when metrics off), vLLM via Prometheus `/metrics` counters (scientific notation supported)
 
-Rates are derived from per-probe cumulative counter diffs. Multiple ports can be added or removed at runtime without restarting the monitor.
+Rates are derived from per-probe cumulative counter diffs (or SGLang sticky throughput while it moves). Multiple ports can be added or removed at runtime without restarting the monitor.
 
 ---
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { LlmMetrics, SlotTelemetry, RecipeMetadata, RecipeInfo } from "../../api/types";
-import { updateLlmPort } from "../../api/client";
+import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
+import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
 import { TelemetryChart, type ChartSeries } from "../ui/TelemetryChart";
 import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
@@ -14,6 +15,8 @@ interface LlmPanelProps {
 /** Legacy single-port change callback. Optional now that SparkPage manages multi-port. */
   onLlmPortChange?: (port: number) => void;
   /** Called when the user clicks the remove-port button (only when >1 port configured). */
+  llmPorts?: number[];
+  hasApiKey?: boolean;
   onRemovePort?: (port: number) => void;
   /** Total number of LLM ports configured for this Spark (controls remove-button visibility). */
   llmPortsCount?: number;
@@ -44,10 +47,9 @@ const DS4_METRIC_INFO = {
   perStream: "Per-stream decode throughput: high/low/avg tok/s across active context banks.",
   totalTokens: "Cumulative decoded tokens (ds4_tokens_decoded_total counter).",
   dspark: "DSpark speculative decode acceptance ratio (ds4_spec_accept_ratio gauge). Higher is better.",
-  banks: "Context banks: live = lanes currently in use, total = max configured banks.",
-  kvPages: "KV cache pages resident in memory (ds4_kv_pages_resident).",
-  prefill: "Prefill tokens: cached (served from prefix cache) vs computed (full prefill).",
-  spec: "Speculative decode: drafts total, hits (accepted), quench (rejected/aborted).",
+  banks: "Active Lanes: context banks currently in use / total configured.",
+  kvPages: "KV cache memory in use (ds4_kv_pages_resident × 2048 KiB page size).",
+  prefill: "Prefill tokens served from prefix cache vs computed.",
   warm: "Prefix cache warm records (ds4_warm_records). Higher means more cache hits.",
   recipe: "Recipe metadata from /v1/models: model name, context length, supported parameters.",
 } as const;
@@ -87,6 +89,24 @@ function BackendBadge({ backend }: { backend: string | null }) {
   );
 }
 
+/** Exposure / auth posture from the unauthenticated probe (issue #17). */
+function PostureBadge({
+  posture,
+}: {
+  posture: NonNullable<LlmMetrics["posture"]>;
+}) {
+  return (
+    <span
+      className={`llm-posture llm-posture--${posture.level}`}
+      title={posture.detail}
+    >
+      <span className="llm-posture__dot" />
+      {posture.label}
+    </span>
+  );
+}
+
+/** Small (i) next to a metric label; one open tooltip at a time. */
 function MetricInfoTip({
   id,
   label,
@@ -266,6 +286,13 @@ function fmtUptime(seconds: number | null | undefined): string {
   return `${sec}s`;
 }
 
+/** Format a token count with K suffix, e.g. 54515 → "54.5K", 69306 → "69.3K" */
+function fmtK(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "\u2014";
+  if (v >= 1000) return `${(v / 1000).toFixed(1)}K`;
+  return String(Math.round(v));
+}
+
 /** Badge for a supported parameter, with optional inline stat. */
 function ParamBadge({
   param,
@@ -319,12 +346,15 @@ function RecipeSection({
       if (p === "stream") {
         paramStats[p] = { label: "streaming", value: "live", accent: "success" };
       }
-      // reasoning_effort → show the reasoning effort level if available
+      // reasoning_effort → show the actual last-known reasoning effort level
       if (p === "reasoning_effort") {
-        // DS4 supports reasoning — show spec decode method as proxy
-        paramStats[p] = info?.specDecodeMethod
-          ? { label: "reasoning", value: info.specDecodeMethod, accent: "accent" }
-          : null;
+        const effort = llm.reasoningEffort;
+        if (effort) {
+          const accent = effort === "high" ? "danger" : effort === "medium" ? "warning" : "success";
+          paramStats[p] = { label: "last", value: effort, accent };
+        } else {
+          paramStats[p] = null;
+        }
       }
     }
   }
@@ -354,13 +384,24 @@ function RecipeSection({
     if (llm.warmRecords != null) {
       liveStats.push({ label: "Warm records", value: fmtInt(llm.warmRecords), accent: "accent" });
     }
-    // Spec drafts/hits → relates to specDecodeMethod
-    if (llm.specDrafts != null && llm.specHits != null) {
-      liveStats.push({ label: "Spec drafts", value: fmtInt(llm.specDrafts), sub: `${fmtInt(llm.specHits)} hits`, accent: "accent" });
-    }
+    // Spec drafts/hits → removed per user request (not useful dashboard metrics)
+
     // Total tokens decoded
     if (llm.totalTokensDecoded != null) {
       liveStats.push({ label: "Tokens decoded", value: fmtInt(llm.totalTokensDecoded), accent: "accent" });
+    }
+    // Context used (KV cache)
+    if (llm.contextUsedBytes != null) {
+      liveStats.push({ label: "KV Cache", value: fmtBytes(llm.contextUsedBytes), accent: "accent" });
+    }
+    // Requests inflight
+    if (llm.requestsInflight != null) {
+      liveStats.push({ label: "In Flight", value: fmtInt(llm.requestsInflight), accent: llm.requestsInflight > 0 ? "success" : undefined });
+    }
+    // Reasoning effort
+    if (llm.reasoningEffort) {
+      const accent = llm.reasoningEffort === "high" ? "danger" : llm.reasoningEffort === "medium" ? "warning" : "success";
+      liveStats.push({ label: "Reasoning", value: llm.reasoningEffort, accent });
     }
     // Uptime
     if (llm.ds4Uptime != null) {
@@ -481,10 +522,24 @@ function fmtBytes(v: number | undefined | null): string {
   return `${v} B`;
 }
 
-export function LlmPanel({ llm, sparkId, llmPort, onLlmPortChange, onRemovePort, llmPortsCount, className }: LlmPanelProps) {
+export function LlmPanel({
+  llm,
+  sparkId,
+  llmPort,
+  llmPorts,
+  hasApiKey = false,
+  onLlmPortChange,
+  onRemovePort,
+  llmPortsCount,
+  className,
+}: LlmPanelProps) {
+  // Tail keyed by port so multi-port LLM sparklines stay distinct (8b).
+  const genHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.tps`);
   const [history, setHistory] = useState<History>({ genTps: [], prefillTps: [], ttft: [], e2e: [] });
   const [showSettings, setShowSettings] = useState(false);
   const [portDraft, setPortDraft] = useState(String(llmPort));
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [clearApiKey, setClearApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [engineInfoOpen, setEngineInfoOpen] = useState(false);
@@ -503,7 +558,11 @@ export function LlmPanel({ llm, sparkId, llmPort, onLlmPortChange, onRemovePort,
   const available = llm?.available ?? false;
 
   useEffect(() => {
-    if (!showSettings) setPortDraft(String(llmPort));
+    if (!showSettings) {
+      setPortDraft(String(llmPort));
+      setApiKeyDraft("");
+      setClearApiKey(false);
+    }
   }, [llmPort, showSettings]);
 
   useEffect(() => {
@@ -532,18 +591,51 @@ export function LlmPanel({ llm, sparkId, llmPort, onLlmPortChange, onRemovePort,
 
   const portDirty = parsedPort !== null && parsedPort !== llmPort;
   const portInvalid = portDraft.trim() !== "" && parsedPort === null;
+  const apiKeyDirty = apiKeyDraft.trim() !== "" || clearApiKey;
+  const settingsDirty = portDirty || apiKeyDirty;
 
-  const handleSavePort = async () => {
-    if (parsedPort === null) { setSaveError("Port must be an integer 1-65535"); return; }
-    if (parsedPort === llmPort) { setShowSettings(false); return; }
-    setSaving(true); setSaveError(null);
+  const handleSaveSettings = async () => {
+    if (parsedPort === null) {
+      setSaveError("Port must be an integer 1–65535");
+      return;
+    }
+    if (!settingsDirty) {
+      setShowSettings(false);
+      return;
+    }
+    setSaving(true);
+    setSaveError(null);
     try {
-      await updateLlmPort(sparkId, parsedPort);
-      onLlmPortChange?.(parsedPort);
+      if (portDirty) {
+        const currentPorts =
+          Array.isArray(llmPorts) && llmPorts.length > 0 ? llmPorts : [llmPort];
+        if (currentPorts.includes(parsedPort) && parsedPort !== llmPort) {
+          setSaveError(`Port ${parsedPort} is already configured`);
+          setSaving(false);
+          return;
+        }
+        // Rename this panel's port in-place so sibling ports (and their keys) survive
+        if (currentPorts.length > 1) {
+          const next = currentPorts.map((p) => (p === llmPort ? parsedPort : p));
+          await updateLlmPorts(sparkId, next);
+        } else {
+          await updateLlmPort(sparkId, parsedPort);
+        }
+      }
+      const keyPort = parsedPort;
+      if (clearApiKey) {
+        await setLlmApiKey(sparkId, keyPort, "");
+      } else if (apiKeyDraft.trim() !== "") {
+        await setLlmApiKey(sparkId, keyPort, apiKeyDraft.trim());
+      }
+      setApiKeyDraft("");
+      setClearApiKey(false);
       setShowSettings(false);
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Failed to save port");
-    } finally { setSaving(false); }
+      setSaveError(err instanceof Error ? err.message : "Failed to save LLM settings");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const genSeries: ChartSeries = { label: "gen tok/s", color: "var(--color-success)", data: history.genTps, area: true, yAxis: "left" };
@@ -576,8 +668,25 @@ export function LlmPanel({ llm, sparkId, llmPort, onLlmPortChange, onRemovePort,
               <span aria-hidden>\u00D7</span><span>Remove</span>
             </button>
           )}
-          <button type="button" title={showSettings ? "Done" : "LLM settings"} onClick={() => { if (showSettings) { setPortDraft(String(llmPort)); setSaveError(null); } setShowSettings(!showSettings); }} disabled={saving} className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-hover disabled:opacity-50 ${showSettings ? "bg-surface-elevated text-text" : ""}`}>
-            <GearIcon /><span>{showSettings ? "Done" : "Settings"}</span>
+          <button
+            type="button"
+            title={showSettings ? "Done" : "LLM settings"}
+            onClick={() => {
+              if (showSettings) {
+                setPortDraft(String(llmPort));
+                setApiKeyDraft("");
+                setClearApiKey(false);
+                setSaveError(null);
+              }
+              setShowSettings(!showSettings);
+            }}
+            disabled={saving}
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-hover disabled:opacity-50 ${
+              showSettings ? "bg-surface-elevated text-text" : ""
+            }`}
+          >
+            <GearIcon />
+            <span>{showSettings ? "Done" : "Settings"}</span>
           </button>
           {llmPortsCount != null && llmPortsCount > 1 && onRemovePort && (
             <button type="button" title={`Remove port :${llmPort}`} onClick={() => onRemovePort(llmPort)} className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-surface-hover">
@@ -589,92 +698,151 @@ export function LlmPanel({ llm, sparkId, llmPort, onLlmPortChange, onRemovePort,
     >
       {showSettings ? (
         <div className="space-y-3">
-          <p className="text-[10px] text-muted">HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4).</p>
+          <p className="text-[10px] text-muted">
+            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / OpenAI-compatible gateway).
+          </p>
           <label className="block space-y-1">
             <span className="text-xs text-muted">Port</span>
-            <input type="number" min={1} max={65535} inputMode="numeric" value={portDraft} onChange={(e) => { setPortDraft(e.target.value); setSaveError(null); }} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleSavePort(); } }} className="w-full rounded-md border border-border bg-surface-elevated px-3 py-1.5 font-tabular text-sm text-text outline-none focus:border-accent" />
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              inputMode="numeric"
+              value={portDraft}
+              onChange={(e) => {
+                setPortDraft(e.target.value);
+                setSaveError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveSettings();
+                }
+              }}
+              className="w-full rounded-md border border-border bg-surface-elevated px-3 py-1.5 font-tabular text-sm text-text outline-none focus:border-accent"
+            />
           </label>
-          {portInvalid && <p className="text-[10px] text-danger">Enter an integer between 1 and 65535</p>}
+          <label className="block space-y-1">
+            <span className="text-xs text-muted">API key (optional)</span>
+            <input
+              type="password"
+              autoComplete="new-password"
+              spellCheck={false}
+              value={apiKeyDraft}
+              disabled={clearApiKey}
+              placeholder={hasApiKey && !clearApiKey ? "•••••••• (saved — leave blank to keep)" : "Bearer token if required"}
+              onChange={(e) => {
+                setApiKeyDraft(e.target.value);
+                setClearApiKey(false);
+                setSaveError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveSettings();
+                }
+              }}
+              className="w-full rounded-md border border-border bg-surface-elevated px-3 py-1.5 font-mono text-sm text-text outline-none focus:border-accent disabled:opacity-50"
+            />
+          </label>
+          {hasApiKey && (
+            <label className="flex cursor-pointer items-center gap-2 text-[11px] text-muted">
+              <input
+                type="checkbox"
+                checked={clearApiKey}
+                onChange={(e) => {
+                  setClearApiKey(e.target.checked);
+                  if (e.target.checked) setApiKeyDraft("");
+                  setSaveError(null);
+                }}
+                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              Clear saved API key
+            </label>
+          )}
+          {portInvalid && (
+            <p className="text-[10px] text-danger">Enter an integer between 1 and 65535</p>
+          )}
           {saveError && <p className="text-[10px] text-danger">{saveError}</p>}
           <div className="flex items-center justify-end gap-2">
-            <button type="button" onClick={() => { setPortDraft(String(llmPort)); setSaveError(null); setShowSettings(false); }} disabled={saving} className="rounded border border-border px-2 py-1 text-[10px] text-muted hover:bg-surface-hover disabled:opacity-50">Cancel</button>
-            <button type="button" onClick={() => void handleSavePort()} disabled={saving || portInvalid || (!portDirty && parsedPort === llmPort)} className="rounded bg-accent px-2 py-1 text-[10px] font-medium text-white hover:bg-accent-hover disabled:opacity-50">{saving ? "Saving\u2026" : "Save"}</button>
+            <button
+              type="button"
+              onClick={() => {
+                setPortDraft(String(llmPort));
+                setApiKeyDraft("");
+                setClearApiKey(false);
+                setSaveError(null);
+                setShowSettings(false);
+              }}
+              disabled={saving}
+              className="rounded border border-border px-2 py-1 text-[10px] text-muted hover:bg-surface-hover disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleSaveSettings()}
+              disabled={saving || portInvalid || !settingsDirty}
+              className="rounded bg-accent px-2 py-1 text-[10px] font-medium text-white hover:bg-accent-hover disabled:opacity-50"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
           </div>
         </div>
       ) : !available ? (
-        <div className="space-y-4">
-          <div className="llm-header-bar llm-header-down">
-            <div className="llm-health">
-              <span className="llm-health-dot llm-health-down" />
-              <span className="llm-health-text">Offline</span>
-            </div>
-            <div className="llm-header-meta">
-              <span className="llm-header-field"><span className="llm-header-key">Model</span><span className="llm-header-val">\u2014</span></span>
-              <span className="llm-header-field"><span className="llm-header-key">Backend</span><span className="llm-header-val">\u2014</span></span>
-              <span className="llm-header-field"><span className="llm-header-key">Context</span><span className="llm-header-val">\u2014</span></span>
-              <span className="llm-header-field"><span className="llm-header-key">Port</span><span className="llm-header-val font-tabular">:{llmPort}</span></span>
-            </div>
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2 py-1">
+            {llm?.posture ? (
+              <PostureBadge posture={llm.posture} />
+            ) : (
+              <span className="h-1.5 w-1.5 rounded-full bg-muted" />
+            )}
+            <p className="text-xs text-muted">
+              {llm?.posture?.auth === "protected"
+                ? `${llm.posture.label} on :${llmPort}`
+                : `No model loaded on :${llmPort}`}
+            </p>
           </div>
-          <p className="text-xs text-muted">No model loaded on :{llmPort}{llm?.error ? ` \u2014 ${llm.error}` : ""}</p>
+          <div className="border-t border-border pt-3 space-y-2">
+            <button
+              type="button"
+              onClick={() => {
+                const params = new URLSearchParams();
+                if (llmPort) params.set("port", String(llmPort));
+                const q = params.toString() ? `?${params.toString()}` : "";
+                window.open(
+                  `/showcase/${encodeURIComponent(sparkId)}${q}`,
+                  "_blank",
+                  "noopener,noreferrer"
+                );
+              }}
+              className="w-full rounded border border-border bg-surface-elevated px-3 py-1.5 text-xs font-medium text-text transition-colors hover:border-accent hover:bg-accent-soft"
+              title="Open prompt showcase (works offline to view history or prepare a run)"
+            >
+              Showcase
+            </button>
+          </div>
         </div>
       ) : (
-        <div className="llm-dashboard space-y-4">
-          {/* 1. Header bar */}
-          <div className="llm-header-bar">
-            <div className="llm-health">
-              <span className={`llm-health-dot ${runningSlots > 0 ? "llm-health-up" : "llm-health-idle"}`} />
-              <span className="llm-health-text">{runningSlots > 0 ? "Serving" : "Ready"}</span>
-            </div>
-            <div className="llm-header-meta">
-              <span className="llm-header-field"><span className="llm-header-key">Model</span><span className="llm-header-val truncate" title={llm?.modelId ?? ""}>{llm?.modelId || "\u2014"}</span></span>
-              <span className="llm-header-field"><span className="llm-header-key">Backend</span><span className="llm-header-val"><BackendBadge backend={llm?.backend ?? null} /></span></span>
-              <span className="llm-header-field"><span className="llm-header-key">Context</span><span className="llm-header-val font-tabular">{llm?.contextLength ? llm.contextLength.toLocaleString() : "\u2014"}</span></span>
-              <span className="llm-header-field"><span className="llm-header-key">Port</span><span className="llm-header-val font-tabular">:{llmPort}</span></span>
-            </div>
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <BackendBadge backend={llm?.backend ?? null} />
+            {llm?.posture && <PostureBadge posture={llm.posture} />}
+            {llm?.modelId && (
+              <span
+                className="min-w-0 flex-1 whitespace-normal break-words text-xs leading-snug text-text [overflow-wrap:anywhere]"
+                title={llm.modelId}
+              >
+                {llm.modelId}
+              </span>
+            )}
+            <span className="shrink-0 font-tabular text-[10px] text-muted">:{llmPort}</span>
           </div>
-
-          {/* 2. Live stats row — shared */}
-          <div className="llm-stat-grid">
-            <StatCard label="Running slots" value={fmtInt(runningSlots)} sub={llm?.slotsTotal ? `of ${llm.slotsTotal}` : undefined} valueColor={runningSlots > 0 ? "var(--color-success)" : "var(--color-muted)"} />
-            <StatCard label="Waiting slots" value={fmtInt(waitingSlots)} valueColor={waitingSlots > 0 ? "var(--color-danger)" : "var(--color-muted)"} />
-            <StatCard label="KV cache" value={pct(kvUsage, 0)} valueColor={kvUsage != null && kvUsage > 0.85 ? "var(--color-danger)" : kvUsage != null && kvUsage > 0.6 ? "var(--color-warning)" : "var(--color-text)"} bar={kvUsage != null ? { pct: kvUsage * 100, color: kvUsage > 0.85 ? "var(--color-danger)" : kvUsage > 0.6 ? "var(--color-warning)" : "var(--color-accent)" } : undefined} />
-            <StatCard label="Gen tok/s" value={fmtNum(genTps, 1)} sub={fmtNum(llm?.prefillTps, 1, " prefill")} valueColor={tpsColor(genTps)} />
-            <StatCard label={isDs4 ? "DSpark accept" : "MTP accept"} value={pct(mtpRate, 0)} valueColor={mtpColor(mtpRate)} bar={mtpRate != null ? { pct: mtpRate * 100, color: mtpColor(mtpRate) } : undefined} />
-            <StatCard label="Prefix cache" value={pct(prefixHit, 0)} valueColor={prefixHit != null ? "var(--color-accent)" : "var(--color-muted)"} bar={prefixHit != null ? { pct: prefixHit * 100, color: "var(--color-accent)" } : undefined} />
-          </div>
-
-          {/* 3. Real-time t/s chart */}
-          <div className="llm-chart-block">
-            <div className="llm-chart-title">Throughput <span className="llm-chart-sub">tok/s \u00B7 last 60 samples</span></div>
-            <TelemetryChart series={[genSeries, preSeries]} maxPoints={HISTORY} height={170} yUnit="" yUnitRight="" yMin={0} yMax={140} yMaxRight={2000} />
-          </div>
-
-          {/* 4. TTFT + E2E latency chart */}
-          <div className="llm-chart-block">
-            <div className="llm-chart-title">Latency <span className="llm-chart-sub">seconds \u00B7 TTFT + E2E</span></div>
-            <TelemetryChart series={[ttftSeries, e2eSeries]} maxPoints={HISTORY} height={150} yUnit="s" yMin={0} />
-          </div>
-
-          {/* 5. Per-slot table */}
-          {slots.length > 0 && (
-            <div className="llm-chart-block">
-              <div className="llm-chart-title">Per-slot <span className="llm-chart-sub">{slots.length} active</span></div>
-              <div className="llm-slot-table">
-                <table>
-                  <thead><tr><th>Slot</th><th>Context</th><th>t/s</th><th>TTFT</th><th>RTT</th></tr></thead>
-                  <tbody>
-                    {slots.map((s) => (
-                      <tr key={s.id}>
-                        <td className="font-tabular">#{s.id}</td>
-                        <td className="font-tabular">{s.contextLength.toLocaleString()}</td>
-                        <td className="font-tabular" style={{ color: tpsColor(s.tps) }}>{fmtNum(s.tps, 1)}</td>
-                        <td className="font-tabular" style={{ color: latencyColor(s.ttft, 0.2, 1.0) }}>{fmtNum(s.ttft, 3, "s")}</td>
-                        <td className="font-tabular" style={{ color: latencyColor(s.roundTrip, 0.5, 3.0) }}>{fmtNum(s.roundTrip, 3, "s")}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+          {llm?.modelPath &&
+            llm.modelPath !== llm.modelId &&
+            !llm.modelPath.includes("models--") && (
+            <div className="-mt-1.5 truncate text-[10px] text-muted" title={llm.modelPath}>
+              {llm.modelPath}
             </div>
           )}
 
@@ -752,27 +920,28 @@ export function LlmPanel({ llm, sparkId, llmPort, onLlmPortChange, onRemovePort,
                 <StatCard label="Per-Stream Low" value={fmtNum(llm?.perStreamLow, 1)} valueColor={tpsColor(llm?.perStreamLow ?? 0)} />
                 <StatCard label="Per-Stream Avg" value={fmtNum(llm?.perStreamAvg, 1)} valueColor={tpsColor(llm?.perStreamAvg ?? 0)} />
                 <StatCard label="Total Tokens" value={fmtInt(llm?.totalTokensDecoded)} valueColor="var(--color-accent)" />
-                <StatCard label="DSpark Accept" value={pct(llm?.dsparkAcceptRatio, 1)} valueColor={mtpColor(llm?.dsparkAcceptRatio)} bar={llm?.dsparkAcceptRatio != null ? { pct: llm.dsparkAcceptRatio * 100, color: mtpColor(llm.dsparkAcceptRatio) } : undefined} />
+                <StatCard label="DSpark Accept %" value={pct(llm?.dsparkAcceptRatio, 1)} valueColor={mtpColor(llm?.dsparkAcceptRatio)} bar={llm?.dsparkAcceptRatio != null ? { pct: llm.dsparkAcceptRatio * 100, color: mtpColor(llm.dsparkAcceptRatio) } : undefined} />
               </div>
 
-              {/* Banks + KV + Prefill + Spec */}
+              {/* Key metrics: Decode, Prefill, Active Lanes, Context, Inflight, Uptime */}
               <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
-                <StatCard label="Banks live/total" value={fmtInt(llm?.banksLive)} sub={llm?.banksTotal != null ? `of ${llm.banksTotal}` : undefined} valueColor={(llm?.banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} bar={llm?.banksTotal != null && llm.banksTotal > 0 ? { pct: ((llm?.banksLive ?? 0) / llm.banksTotal) * 100, color: "var(--color-accent)" } : undefined} />
-                <StatCard label="KV pages resident" value={fmtInt(llm?.kvPagesResident)} valueColor="var(--color-text)" />
-                <StatCard label="Prefill cached" value={fmtInt(llm?.prefillCached)} valueColor="var(--color-success)" />
-                <StatCard label="Prefill computed" value={fmtInt(llm?.prefillComputed)} valueColor="var(--color-warning)" />
-                <StatCard label="Spec drafts" value={fmtInt(llm?.specDrafts)} valueColor="var(--color-text)" />
-                <StatCard label="Spec hits" value={fmtInt(llm?.specHits)} valueColor="var(--color-success)" />
+                <StatCard label="Decode tok/s" value={fmtNum(llm?.generationTps, 1)} valueColor={tpsColor(llm?.generationTps ?? 0)} />
+                <StatCard label="Prefill Speed" value={fmtNum(llm?.prefillTps, 1)} valueColor={tpsColor(llm?.prefillTps ?? 0)} />
+                <StatCard label="Active Lanes" value={fmtInt(llm?.banksLive)} sub={llm?.banksTotal != null ? `of ${llm.banksTotal}` : undefined} valueColor={(llm?.banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} bar={llm?.banksTotal != null && llm.banksTotal > 0 ? { pct: ((llm?.banksLive ?? 0) / llm.banksTotal) * 100, color: "var(--color-accent)" } : undefined} />
+                <StatCard label="KV Cache" value={fmtBytes(llm?.contextUsedBytes)} sub={llm?.kvPagesResident != null ? `${fmtInt(llm.kvPagesResident)} pages` : undefined} valueColor="var(--color-accent)" />
+                <StatCard label="In Flight" value={fmtInt(llm?.requestsInflight)} valueColor={(llm?.requestsInflight ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} />
+                <StatCard label="Uptime" value={fmtUptime(llm?.ds4Uptime)} valueColor="var(--color-muted)" />
               </div>
 
               {/* Additional counters row */}
               <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
                 <StatCard label="Warm records" value={fmtInt(llm?.warmRecords)} valueColor="var(--color-accent)" />
-                <StatCard label="Spec quench" value={fmtInt(llm?.specQuench)} valueColor="var(--color-danger)" />
                 <StatCard label="Tok/step" value={fmtNum(llm?.tokPerStep, 3)} valueColor="var(--color-text)" />
                 <StatCard label="Decode steps" value={fmtInt(llm?.decodeSteps)} valueColor="var(--color-text)" />
                 <StatCard label="Derived artifacts" value={fmtInt(llm?.derivedArtifacts)} sub={fmtBytes(llm?.derivedArtifactBytes)} valueColor="var(--color-text)" />
-                <StatCard label="Uptime" value={llm?.ds4Uptime != null ? `${Math.floor(llm.ds4Uptime / 60)}m ${Math.round(llm.ds4Uptime % 60)}s` : "\u2014"} valueColor="var(--color-muted)" />
+                <StatCard label="Prefill cached" value={fmtInt(llm?.prefillCached)} valueColor="var(--color-success)" />
+                <StatCard label="Reasoning" value={llm?.reasoningEffort ?? "\u2014"} sub={llm?.reasoningEffortTs != null ? new Date(llm.reasoningEffortTs).toLocaleTimeString() : undefined} valueColor={llm?.reasoningEffort === "high" ? "var(--color-danger)" : llm?.reasoningEffort === "medium" ? "var(--color-warning)" : llm?.reasoningEffort === "low" ? "var(--color-success)" : "var(--color-muted)"} />
+                <StatCard label="Active Context" value={fmtK(llm?.activeContext)} sub={llm?.activeContextTs != null ? new Date(llm.activeContextTs).toLocaleTimeString() : undefined} valueColor="var(--color-accent)" />
               </div>
 
               {/* Admits breakdown */}

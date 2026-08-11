@@ -7,9 +7,9 @@ services:
         - linux/arm64
     container_name: sparkDash-dev
     restart: unless-stopped
-    ports:
-      - "5555:5555"   # Express API
-      - "5173:5173"   # Vite HMR frontend
+    # Host network: Vite :5173 + API :5555 bind on the host; local LLM
+    # probes reach 127.0.0.1-bound servers (ds4-server / start.sh default).
+    network_mode: host
     volumes:
       # Full source — server --watch + Vite HMR, no rebuild for code edits
       - .:/app
@@ -33,9 +33,3 @@ services:
       - HOST_PROC_PATH=/host/proc
       - HOST_SYS_PATH=/host/sys
       - HOST_ROOT_PATH=/host/root
-    networks:
-      - sparkdash-net
-
-networks:
-  sparkdash-net:
-    driver: bridge

@@ -14,7 +14,6 @@ import {
   applyThinkingFlags,
   mean,
   median,
-  pollServerGenerationRates,
   round2,
   runStreamingRequest,
   sleep,
@@ -25,6 +24,9 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "../..");
 const HISTORY_PATH =
   process.env.BENCH_HISTORY_PATH || path.join(ROOT, "config", "bench-history.json");
+/** In-flight jobs checkpointed here so a --watch / SIGTERM restart does not 404 polls. */
+const ACTIVE_PATH =
+  process.env.BENCH_ACTIVE_PATH || path.join(ROOT, "config", "bench-active.json");
 
 /**
  * Structured generation prompts (JSON / HTML). Models usually sustain higher
@@ -66,7 +68,7 @@ const BENCH_PROMPTS = [
   "Write only valid HTML5 (no markdown fences). Create a multi-chapter tutorial with <h1>–<h3>, code samples in <pre>, and notes. Keep writing chapters.",
 ];
 
-const ALLOWED_CONCURRENCIES = new Set([1, 2, 3, 4, 6, 8, 16, 32]);
+const ALLOWED_CONCURRENCIES = new Set([1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32]);
 const DEFAULT_MAX_TOKENS = 500;
 const MIN_MAX_TOKENS = 64;
 const MAX_MAX_TOKENS = 2048;
@@ -159,7 +161,7 @@ function emptyWaveResult(concurrency, waveMs, results, modelId, error, prompts =
      * Server-side generation tok/s (same basis as live Generation tok/s panel).
      * Null when the backend does not expose counters.
      */
-    serverGenerationTps: null,
+
     totalDecodeTokens: 0,
     totalCompletionTokens: 0,
     durationMs: round2(waveMs),
@@ -182,6 +184,8 @@ function streamPublicResult(r, index, prompt, reqMeta, debug = false) {
   /** @type {Record<string, unknown>} */
   const out = {
     index,
+    ttftContentMs: r?.ttftContentMs ?? null,
+    reasoningChunks: r?.reasoningChunks ?? 0,
     ttftMs: r?.ttftMs ?? 0,
     decodeTps: r?.decodeTps ?? 0,
     decodeTokens: r?.decodeTokens ?? 0,
@@ -223,6 +227,7 @@ async function runConcurrencyWave({
   abortSignal,
   sampleHardware = null,
   debug = false,
+  apiKey = null,
 }) {
   const url = `${baseUrl}/v1/chat/completions`;
   const prompts = pickDistinctPrompts(concurrency);
@@ -231,17 +236,14 @@ async function runConcurrencyWave({
   const wallStart = performance.now();
 
   // Poll /metrics like the live panel while streams run (steady-state gen tok/s)
-  const ratePollAbort = new AbortController();
   const hwPollAbort = new AbortController();
   const onParentForPoll = () => {
-    ratePollAbort.abort();
     hwPollAbort.abort();
   };
   if (abortSignal) {
     if (abortSignal.aborted) onParentForPoll();
     else abortSignal.addEventListener("abort", onParentForPoll, { once: true });
   }
-  const ratePollPromise = pollServerGenerationRates(baseUrl, ratePollAbort.signal, 400);
   const hwPollPromise = debug
     ? pollHardwareSamples(sampleHardware, hwPollAbort.signal, HARDWARE_SAMPLE_MS)
     : Promise.resolve([]);
@@ -275,6 +277,7 @@ async function runConcurrencyWave({
     return runStreamingRequest(url, body, ctrl.signal, {
       debug,
       retryOnThinking400: true,
+      apiKey,
     }).finally(() => {
       clearTimeout(timeout);
       if (abortSignal) abortSignal.removeEventListener("abort", onParentAbort);
@@ -294,14 +297,12 @@ async function runConcurrencyWave({
   } finally {
     clearTimeout(waveTimer);
     // Stop metrics / hardware polling as soon as streams finish
-    ratePollAbort.abort();
     hwPollAbort.abort();
     if (abortSignal) abortSignal.removeEventListener("abort", onParentForPoll);
   }
 
   const wallEnd = performance.now();
   const waveMs = wallEnd - wallStart;
-  const rateStats = await ratePollPromise;
   const hardwareSamples = await hwPollPromise;
 
   if (waveTimedOut && results.every((r) => r.error)) {
@@ -336,13 +337,6 @@ async function runConcurrencyWave({
     }
   }
 
-  // Primary server number: median of live-style poll samples (matches dashboard)
-  let serverGenerationTps = rateStats.median;
-  // Fallback: total completion tokens / client decode window if no metrics endpoint
-  if (serverGenerationTps == null && aggregateDecodeTps > 0) {
-    serverGenerationTps = round2(aggregateDecodeTps);
-  }
-
   const model = results.find((r) => r.model)?.model || modelId || null;
 
   /** @type {Record<string, unknown>} */
@@ -357,9 +351,7 @@ async function runConcurrencyWave({
     meanTtftMs: round2(mean(ttftList)),
     medianTtftMs: round2(median(ttftList)),
     aggregateDecodeTps: round2(aggregateDecodeTps),
-    serverGenerationTps,
-    serverGenerationTpsMax: rateStats.max,
-    serverGenerationSamples: rateStats.samples,
+
     totalDecodeTokens,
     totalCompletionTokens,
     durationMs: round2(waveMs),
@@ -380,9 +372,13 @@ async function runConcurrencyWave({
 /**
  * Job manager: one active job per spark, short history persisted to disk
  * so last results survive page refresh and process restart.
+ *
+ * Running jobs are also checkpointed to bench-active.json. On boot (or
+ * graceful shutdown), any leftover "running" entries are finalized as
+ * interrupted so GET /bench/:id keeps working instead of returning 404.
  */
 export class DecodeBenchManager {
-  constructor(historyPath = HISTORY_PATH) {
+  constructor(historyPath = HISTORY_PATH, activePath = ACTIVE_PATH) {
     /** @type {Map<string, object>} */
     this.jobs = new Map();
     /** @type {Map<string, string>} sparkId → active benchId */
@@ -390,7 +386,9 @@ export class DecodeBenchManager {
     /** @type {Map<string, object[]>} */
     this.historyBySpark = new Map();
     this.historyPath = historyPath;
+    this.activePath = activePath;
     this._loadHistory();
+    this._recoverInterruptedActive();
   }
 
   getJob(benchId) {
@@ -496,6 +494,112 @@ export class DecodeBenchManager {
     }
   }
 
+  /**
+   * Promote leftover active checkpoints (process died mid-run) into history
+   * so clients polling GET /:benchId still get a final job instead of 404.
+   */
+  _recoverInterruptedActive() {
+    const leftovers = this._readActiveFile();
+    if (!leftovers.length) return;
+
+    let changed = false;
+    for (const snap of leftovers) {
+      if (!snap?.benchId || !snap?.sparkId) continue;
+      // Already in history from a prior clean finalize — skip
+      const hist = this.getHistory(snap.sparkId);
+      if (hist.some((j) => j.benchId === snap.benchId)) continue;
+
+      const interrupted = {
+        ...snap,
+        status: "failed",
+        error:
+          snap.error ||
+          "Interrupted — server restarted while the benchmark was running",
+        completedAt: snap.completedAt || Date.now(),
+        progress: {
+          ...(snap.progress || {}),
+          message: "Interrupted",
+          currentConcurrency: null,
+        },
+      };
+      if (interrupted.completedAt && interrupted.startedAt) {
+        interrupted.durationMs = interrupted.completedAt - interrupted.startedAt;
+      }
+      this.jobs.set(interrupted.benchId, interrupted);
+      this._pushHistory(interrupted);
+      changed = true;
+      console.warn(
+        `[DecodeBench] recovered interrupted job ${interrupted.benchId} on ${interrupted.sparkId}`
+      );
+    }
+
+    // Clear active file either way — nothing is actually running after boot
+    this._writeActiveFile([]);
+    if (changed) this._saveHistory();
+  }
+
+  _readActiveFile() {
+    try {
+      if (!fs.existsSync(this.activePath)) return [];
+      const raw = fs.readFileSync(this.activePath, "utf8");
+      const data = JSON.parse(raw);
+      if (Array.isArray(data)) return data;
+      if (data && typeof data === "object" && Array.isArray(data.jobs)) {
+        return data.jobs;
+      }
+      return [];
+    } catch (err) {
+      console.warn("[DecodeBench] failed to load active jobs:", err?.message || err);
+      return [];
+    }
+  }
+
+  _writeActiveFile(jobs) {
+    try {
+      atomicWrite(
+        this.activePath,
+        JSON.stringify({ jobs }, null, 2),
+        0o600
+      );
+    } catch (err) {
+      console.warn("[DecodeBench] failed to save active jobs:", err?.message || err);
+    }
+  }
+
+  /** Persist public snapshots of all currently running jobs. */
+  _checkpointActive() {
+    /** @type {object[]} */
+    const running = [];
+    for (const job of this.jobs.values()) {
+      if (job.status === "running") running.push(publicJob(job));
+    }
+    this._writeActiveFile(running);
+  }
+
+  /**
+   * Finalize every running job (used on SIGTERM / --watch reload).
+   * Aborts in-flight streams and writes history so polls do not 404.
+   * @param {string} [reason]
+   */
+  interruptAll(reason = "Interrupted — server shutting down") {
+    for (const job of this.jobs.values()) {
+      if (job.status !== "running") continue;
+      try {
+        job._abort?.abort();
+      } catch {
+        /* ignore */
+      }
+      job.status = "failed";
+      job.error = reason;
+      job.progress.message = "Interrupted";
+      job.progress.currentConcurrency = null;
+      job.completedAt = Date.now();
+      this.activeBySpark.delete(job.sparkId);
+      this._pushHistory(job);
+    }
+    this._writeActiveFile([]);
+  }
+
   _saveHistory() {
     try {
       /** @type {Record<string, object[]>} */
@@ -519,6 +623,7 @@ export class DecodeBenchManager {
    *   maxTokens?: number,
    *   debug?: boolean,
    *   sampleHardware?: (() => Promise<object | null> | object | null) | null,
+   *   apiKey?: string | null,
    * }} opts
    */
   start(opts) {
@@ -531,6 +636,7 @@ export class DecodeBenchManager {
       maxTokens: rawMax,
       debug = false,
       sampleHardware = null,
+      apiKey = null,
     } = opts;
 
     if (this.activeBySpark.has(sparkId)) {
@@ -541,7 +647,7 @@ export class DecodeBenchManager {
 
     const concurrencies = normalizeConcurrencies(rawConc);
     if (!concurrencies.length) {
-      const err = new Error("Select at least one concurrency level (1, 2, 3, 4, 6, 8, 16, or 32)");
+      const err = new Error("Select at least one concurrency level (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, or 32)");
       err.status = 400;
       throw err;
     }
@@ -588,12 +694,14 @@ export class DecodeBenchManager {
       error: null,
       _abort: abort,
       _debug: debugOn,
+      _apiKey: apiKey != null && String(apiKey).trim() ? String(apiKey).trim() : null,
       _sampleHardware:
         debugOn && typeof sampleHardware === "function" ? sampleHardware : null,
     };
 
     this.jobs.set(benchId, job);
     this.activeBySpark.set(sparkId, benchId);
+    this._checkpointActive();
 
     // Fire and forget — client polls GET
     this._runJob(job, lanIp).catch(() => {
@@ -619,14 +727,17 @@ export class DecodeBenchManager {
     try {
       for (const c of job.config.concurrencies) {
         if (job._abort.signal.aborted) {
-          job.status = "cancelled";
-          job.error = "Cancelled by user";
-          job.progress.message = "Cancelled";
+          if (job.status === "running") {
+            job.status = "cancelled";
+            job.error = "Cancelled by user";
+            job.progress.message = "Cancelled";
+          }
           break;
         }
 
         job.progress.currentConcurrency = c;
         job.progress.message = `Running concurrency ${c}…`;
+        this._checkpointActive();
 
         const wave = await runConcurrencyWave({
           baseUrl,
@@ -636,6 +747,7 @@ export class DecodeBenchManager {
           abortSignal: job._abort.signal,
           sampleHardware: job._sampleHardware,
           debug,
+          apiKey: job._apiKey,
         });
 
         if (job._abort.signal.aborted) {
@@ -644,9 +756,11 @@ export class DecodeBenchManager {
             job.results.push(wave);
             job.progress.completedLevels += 1;
           }
-          job.status = "cancelled";
-          job.error = "Cancelled by user";
-          job.progress.message = "Cancelled";
+          if (job.status === "running") {
+            job.status = "cancelled";
+            job.error = "Cancelled by user";
+            job.progress.message = "Cancelled";
+          }
           break;
         }
 
@@ -656,6 +770,7 @@ export class DecodeBenchManager {
 
         job.results.push(wave);
         job.progress.completedLevels += 1;
+        this._checkpointActive();
       }
 
       if (job.status === "running") {
@@ -664,25 +779,31 @@ export class DecodeBenchManager {
         job.progress.message = "Done";
       }
     } catch (err) {
-      if (job._abort.signal.aborted) {
-        job.status = "cancelled";
-        job.error = "Cancelled by user";
-        job.progress.message = "Cancelled";
-      } else {
-        job.status = "failed";
-        job.error = err?.message || String(err);
-        job.progress.message = "Failed";
+      if (job.status === "running") {
+        if (job._abort.signal.aborted) {
+          job.status = "cancelled";
+          job.error = "Cancelled by user";
+          job.progress.message = "Cancelled";
+        } else {
+          job.status = "failed";
+          job.error = err?.message || String(err);
+          job.progress.message = "Failed";
+        }
       }
     } finally {
-      job.completedAt = Date.now();
+      if (job.completedAt == null) job.completedAt = Date.now();
       this.activeBySpark.delete(job.sparkId);
       this._pushHistory(job);
+      this._checkpointActive();
     }
   }
 
   _pushHistory(job) {
     const list = this.historyBySpark.get(job.sparkId) || [];
-    list.unshift(publicJob(job));
+    const pub = publicJob(job);
+    const existing = list.findIndex((j) => j.benchId === pub.benchId);
+    if (existing >= 0) list.splice(existing, 1);
+    list.unshift(pub);
     this.historyBySpark.set(job.sparkId, list.slice(0, HISTORY_LIMIT));
     this._saveHistory();
   }

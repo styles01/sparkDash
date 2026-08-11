@@ -9,6 +9,7 @@ interface GpuPanelProps {
   gpu: GpuMetrics | null;
   sparkId: string;
   temperatureUnit: "celsius" | "fahrenheit";
+  className?: string;
 }
 
 function celsiusToFahrenheit(c: number): number {
@@ -42,7 +43,7 @@ function MetricRow({
   );
 }
 
-export function GpuPanel({ gpu, sparkId, temperatureUnit }: GpuPanelProps) {
+export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelProps) {
   const tempHistory = useMetricsHistoryTail(sparkId, "gpu.temp");
   const usageHistory = useMetricsHistoryTail(sparkId, "gpu.usage");
 
@@ -69,7 +70,7 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit }: GpuPanelProps) {
       title="GPU"
       accent
       icon={<ActivityIcon />}
-      className="panel-gpu"
+      className={`panel-gpu ${className ?? ""}`}
       bodyClassName="space-y-3"
     >
       <MetricRow
@@ -90,6 +91,63 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit }: GpuPanelProps) {
           {powerDraw}W / {powerLimit}W
         </span>
       </div>
+
+      {/* NVIDIA throttle / thermal slowdown + SM clock headroom */}
+      {(() => {
+        const t = gpu?.throttle;
+        const reason = t?.reason ?? "ok";
+        const chipLabel =
+          reason === "thermal"
+            ? "Thermal"
+            : reason === "power"
+              ? "Power"
+              : reason === "hw"
+                ? "HW"
+                : "OK";
+        const chipClass =
+          reason === "thermal"
+            ? "border-danger/40 bg-danger/15 text-danger"
+            : reason === "power" || reason === "hw"
+              ? "border-warning/40 bg-warning/15 text-warning"
+              : "border-border bg-surface-elevated text-muted";
+        const barColor =
+          reason === "thermal"
+            ? "bg-danger"
+            : reason === "power" || reason === "hw"
+              ? "bg-warning"
+              : "bg-accent";
+        const pct = t?.smClockPct;
+        const clockCaption =
+          t?.smClockMHz != null && t?.smClockMaxMHz != null
+            ? `${t.smClockMHz} / ${t.smClockMaxMHz} MHz`
+            : pct != null
+              ? `${pct}%`
+              : "—";
+        return (
+          <div className="space-y-1.5" title={t?.detail ?? undefined}>
+            <div className="flex items-center justify-between gap-2 text-sm">
+              <span className="text-muted">Throttle</span>
+              <span
+                className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${chipClass}`}
+              >
+                {chipLabel}
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-[10px] uppercase tracking-wide text-muted">SM clock</span>
+              <span className="font-tabular text-xs text-text">{clockCaption}</span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-border">
+              <div
+                className={`h-full rounded-full transition-[width] duration-300 ease-out ${barColor}`}
+                style={{
+                  width: `${pct != null ? Math.min(100, Math.max(0, pct)) : 0}%`,
+                }}
+              />
+            </div>
+          </div>
+        );
+      })()}
 
       {/* GPU-allocated memory (portion of the unified pool held by GPU compute apps) */}
       {gpu && (

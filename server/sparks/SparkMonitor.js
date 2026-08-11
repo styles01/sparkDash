@@ -2,6 +2,8 @@ import fs from "fs";
 import path from "path";
 import { SystemCollector } from "../collectors/SystemCollector.js";
 import { LlmProbe } from "../collectors/LlmProbe.js";
+import { ComfyProbe } from "../collectors/ComfyProbe.js";
+import { HermesProbe } from "../collectors/HermesProbe.js";
 import { sshTest, sshExec } from "../collectors/ssh.js";
 import {
   POLL_INTERVAL_GPU,
@@ -9,9 +11,12 @@ import {
   POLL_INTERVAL_NETWORK,
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LLM,
+  POLL_INTERVAL_COMFY,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
+  POLL_INTERVAL_HERMES,
   LLM_PORT,
+  COMFY_PORT,
   HOST_PATHS,
 } from "../config.js";
 
@@ -29,6 +34,8 @@ export class SparkMonitor {
   constructor(spark, options = {}) {
     this.spark = spark;
     this._onWolMac = typeof options.onWolMac === "function" ? options.onWolMac : null;
+    this._onHermesChange =
+      typeof options.onHermesChange === "function" ? options.onHermesChange : null;
     this.collector = new SystemCollector(spark);
 
     // One LlmProbe per port — none when LLM monitoring is off
@@ -38,6 +45,31 @@ export class SparkMonitor {
         this.llmProbes.set(port, new LlmProbe(spark, port));
       }
     }
+
+    /** @type {ComfyProbe | null} */
+    this.comfyProbe = this._comfyMonitoringEnabled(spark)
+      ? new ComfyProbe(spark, this._comfyPort(spark))
+      : null;
+
+    /** @type {HermesProbe | null} */
+    this.hermesProbe = this._hermesMonitoringEnabled(spark)
+      ? new HermesProbe(spark)
+      : null;
+    // Hermes status is surfaced in the snapshot (not under `metrics`) and is
+    // always present so the UI never has to special-case a missing field.
+    this._hermes = {
+      monitoring: this._hermesMonitoringEnabled(spark),
+      installed: null,
+      version: null,
+      updateAvailable: null,
+      behindCommits: null,
+      checkedAt: null,
+      // idle | running | success | error
+      status: "idle",
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+    };
 
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
@@ -55,6 +87,7 @@ export class SparkMonitor {
       network: this.collector._defaultNetwork(),
       unifiedMemory: this.collector._defaultUnifiedMemory(),
       llm: [],
+      comfy: null,
     };
     this._lastUpdate = {};
 
@@ -62,6 +95,10 @@ export class SparkMonitor {
     this._intervals = [];
     /** @type {ReturnType<typeof setInterval> | null} */
     this._llmIntervalId = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._comfyIntervalId = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._hermesIntervalId = null;
     this._running = false;
     /** @type {Record<string, boolean>} in-flight domain guards */
     this._inflight = {};
@@ -70,6 +107,9 @@ export class SparkMonitor {
   /** Hot-update config without tearing down poll loops / rate baselines. */
   updateConfig(spark) {
     const wasLlm = this._llmMonitoringEnabled(this.spark);
+    const wasComfy = this._comfyMonitoringEnabled(this.spark);
+    const prevComfyPort = this._comfyPort(this.spark);
+    const wasHermes = this._hermesMonitoringEnabled(this.spark);
     this.spark = spark;
     this.collector.spark = spark;
 
@@ -90,9 +130,50 @@ export class SparkMonitor {
       this._metrics.llm = [];
     }
 
+    // ComfyUI probe — create / update / clear
+    if (this._comfyMonitoringEnabled()) {
+      const port = this._comfyPort();
+      if (this.comfyProbe) {
+        this.comfyProbe.setTarget(spark, port);
+      } else {
+        this.comfyProbe = new ComfyProbe(spark, port);
+      }
+    } else {
+      if (this.comfyProbe) {
+        try {
+          this.comfyProbe.dispose();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.comfyProbe = null;
+      this._metrics.comfy = null;
+    }
+
+    // Hermes probe — create / update / clear
+    if (this._hermesMonitoringEnabled()) {
+      if (this.hermesProbe) {
+        this.hermesProbe.setTarget(spark);
+      } else {
+        this.hermesProbe = new HermesProbe(spark);
+      }
+    } else {
+      this.hermesProbe = null;
+      this._hermes.status = "idle";
+    }
+    this._hermes.monitoring = this._hermesMonitoringEnabled();
+    if (this._running && wasHermes !== this._hermesMonitoringEnabled()) {
+      this._restartHermesPollInterval();
+    }
+
     // Toggle LLM poll interval when monitoring enablement flips
     if (this._running && wasLlm !== this._llmMonitoringEnabled()) {
       this._restartLlmPollInterval();
+    }
+    const comfyOn = this._comfyMonitoringEnabled();
+    const comfyPortChanged = comfyOn && prevComfyPort !== this._comfyPort();
+    if (this._running && (wasComfy !== comfyOn || comfyPortChanged)) {
+      this._restartComfyPollInterval();
     }
   }
 
@@ -118,6 +199,60 @@ export class SparkMonitor {
       this._llmIntervalId = setInterval(() => this._pollDomain("llm"), POLL_INTERVAL_LLM);
       this._intervals.push(this._llmIntervalId);
       void this._pollDomain("llm");
+    }
+  }
+
+  /**
+   * Opt-in ComfyUI monitoring (all roles; default off).
+   * @param {object} [spark]
+   */
+  _comfyMonitoringEnabled(spark = this.spark) {
+    return Boolean(spark?.comfyMonitoring);
+  }
+
+  /** @param {object} [spark] */
+  _comfyPort(spark = this.spark) {
+    const n = Number(spark?.comfyPort);
+    if (Number.isInteger(n) && n >= 1 && n <= 65535) return n;
+    return COMFY_PORT;
+  }
+
+  /** Start or clear the ComfyUI poll timer based on monitoring flag. */
+  _restartComfyPollInterval() {
+    if (this._comfyIntervalId != null) {
+      clearInterval(this._comfyIntervalId);
+      this._intervals = this._intervals.filter((id) => id !== this._comfyIntervalId);
+      this._comfyIntervalId = null;
+    }
+    if (this._comfyMonitoringEnabled() && this._running) {
+      this._comfyIntervalId = setInterval(() => this._pollDomain("comfy"), POLL_INTERVAL_COMFY);
+      this._intervals.push(this._comfyIntervalId);
+      void this._pollDomain("comfy");
+    }
+  }
+
+  /**
+   * Opt-in Hermes Agent monitoring (all roles; default off).
+   * @param {object} [spark]
+   */
+  _hermesMonitoringEnabled(spark = this.spark) {
+    return Boolean(spark?.hermesMonitoring);
+  }
+
+  /** Start or clear the Hermes update-check timer when monitoring flips. */
+  _restartHermesPollInterval() {
+    if (this._hermesIntervalId != null) {
+      clearInterval(this._hermesIntervalId);
+      this._intervals = this._intervals.filter((id) => id !== this._hermesIntervalId);
+      this._hermesIntervalId = null;
+    }
+    if (this._hermesMonitoringEnabled() && this._running) {
+      this._hermesIntervalId = setInterval(
+        () => this._pollDomain("hermes"),
+        POLL_INTERVAL_HERMES
+      );
+      this._intervals.push(this._hermesIntervalId);
+      void this._pollDomain("hermes");
     }
   }
 
@@ -148,6 +283,8 @@ export class SparkMonitor {
     this._intervals.push(setInterval(() => this._pollDomain("ram"), POLL_INTERVAL_CPU));
     this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
     this._restartLlmPollInterval();
+    this._restartComfyPollInterval();
+    this._restartHermesPollInterval();
     // Liveness on a slightly slower cadence
     this._intervals.push(setInterval(() => this._checkOnline(), POLL_INTERVAL_LIVENESS));
     console.log(`[SparkMonitor] ${this.spark.id} started — llmProbes=${this.llmProbes.size} ports=[${[...this.llmProbes.keys()].join(",")}] workerNode=${!!this.spark.workerNode}`);
@@ -159,18 +296,30 @@ export class SparkMonitor {
     for (const id of this._intervals) clearInterval(id);
     this._intervals = [];
     this._llmIntervalId = null;
+    this._comfyIntervalId = null;
+    this._hermesIntervalId = null;
     this._inflight = {};
+    if (this.comfyProbe) {
+      try {
+        this.comfyProbe.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
     console.log(`[SparkMonitor] ${this.spark.id} stopped`);
   }
 
   /** Return a full snapshot of this Spark's metrics. */
   snapshot() {
     const ports = this._llmMonitoringEnabled() ? this._llmPorts() : [];
+    const comfyOn = this._comfyMonitoringEnabled();
     return {
       id: this.spark.id,
       name: this.spark.name,
       online: this.online,
       uptime: this._uptimeSeconds,
+      lanIp: this.spark.lanIp || "",
+      isLocal: Boolean(this.spark.isLocal),
       disabledDevices: this.spark.disabledDevices || [],
       disabledInterfaces: this.spark.disabledInterfaces || [],
       storagePollDisabled: Boolean(this.spark.storagePollDisabled),
@@ -181,6 +330,14 @@ export class SparkMonitor {
       llmMonitoring: this._llmMonitoringEnabled(),
       llmPort: ports[0] ?? LLM_PORT,
       llmPorts: ports,
+      llmApiKeyPorts: Array.isArray(this.spark.llmApiKeyPorts)
+        ? this.spark.llmApiKeyPorts
+        : Object.keys(this.spark.llmApiKeys || {})
+            .map((p) => parseInt(p, 10))
+            .filter((n) => Number.isInteger(n)),
+      comfyMonitoring: comfyOn,
+      comfyPort: this._comfyPort(),
+      hermes: this._hermes,
       hardware: this._getHardwareSummary(),
       metrics: {
         // NOTE: no `timestamp` here on purpose. The broadcast path skips
@@ -197,6 +354,7 @@ export class SparkMonitor {
         network: this._metrics.network,
         unifiedMemory: this._metrics.unifiedMemory,
         llm: this._metrics.llm,
+        comfy: comfyOn ? this._metrics.comfy : null,
       },
     };
   }
@@ -264,6 +422,8 @@ export class SparkMonitor {
       this._pollDomain("ram"),
       this._pollDomain("memory"),
       this._pollDomain("llm"),
+      this._pollDomain("comfy"),
+      this._pollDomain("hermes"),
     ]);
   }
 
@@ -273,6 +433,8 @@ export class SparkMonitor {
     if (domain === "storage" && this.spark.storagePollDisabled) return;
     // Worker nodes: no local LLM API
     if (domain === "llm" && !this._llmMonitoringEnabled()) return;
+    if (domain === "comfy" && !this._comfyMonitoringEnabled()) return;
+    if (domain === "hermes" && !this._hermesMonitoringEnabled()) return;
     this._inflight[domain] = true;
     try {
       let result;
@@ -303,6 +465,12 @@ export class SparkMonitor {
           );
           console.log(`[SparkMonitor] ${this.spark.id} llm poll done: ${result.length} probe(s), took=${Date.now()-_llmT0}ms, ` +
             result.map((r,i)=>`[#${i} avail=${r.available} backend=${r.backend} model=${r.modelId}]`).join(" "));
+          break;
+        case "comfy":
+          result = this.comfyProbe ? await this.comfyProbe.probe() : null;
+          break;
+        case "hermes":
+          result = this.hermesProbe ? await this.hermesProbe.check() : null;
           break;
       }
       // Re-check after the await — `stop()`/`updateSpark()` may have torn
@@ -340,6 +508,12 @@ export class SparkMonitor {
         case "llm":
           this._metrics.llm = result;
           break;
+        case "comfy":
+          this._metrics.comfy = result;
+          break;
+        case "hermes":
+          this.applyHermesCheck(result);
+          break;
       }
       this._lastUpdate[domain] = Date.now();
     } catch (err) {
@@ -371,6 +545,119 @@ export class SparkMonitor {
       console.error(`[SparkMonitor] ${this.spark.id} ${domain} refresh error:`, err.message);
     } finally {
       this._inflight[domain] = false;
+    }
+  }
+
+  // ─── Hermes Agent ─────────────────────────────────────────
+  /**
+   * Apply a Hermes check result to monitor state. Fires onHermesChange (force
+   * broadcast) only when a user-meaningful field actually changed, so idle
+   * re-checks do not spam the WS.
+   * @param {object|null} result
+   */
+  applyHermesCheck(result) {
+    if (!result || !this._running) return;
+    const prev = this._hermes;
+    const changed =
+      result.updateAvailable !== prev.updateAvailable ||
+      result.installed !== prev.installed ||
+      result.version !== prev.version;
+    this._hermes = {
+      ...prev,
+      installed: result.installed,
+      version: result.version,
+      updateAvailable: result.updateAvailable,
+      behindCommits: result.behindCommits,
+      checkedAt: result.checkedAt,
+      error: result.error ?? null,
+    };
+    // A clean check self-heals the transient one-shot update job status, so a
+    // "success / error" flag never lingers past the following poll cycle.
+    if (!result.error && this._hermes.status !== "running") {
+      this._hermes.status = "idle";
+    }
+    if (changed) this._notifyHermesChange();
+  }
+
+  /**
+   * Kick off `hermes update` in the background. Returns immediately; progress
+   * and result are surfaced through the snapshot + onHermesChange broadcast.
+   * @returns {{ started: boolean, reason?: string }}
+   */
+  runHermesUpdate() {
+    if (!this.hermesProbe) {
+      return { started: false, reason: "Hermes Agent monitoring is disabled for this Spark" };
+    }
+    if (this._hermes.status === "running") {
+      return { started: false, reason: "An update is already running" };
+    }
+    this._hermes = {
+      ...this._hermes,
+      status: "running",
+      startedAt: Date.now(),
+      finishedAt: null,
+      error: null,
+    };
+    this._notifyHermesChange();
+    // Defer the long-running SSH work so the broadcast above lands first.
+    void (async () => {
+      try {
+        const res = await this.hermesProbe.update();
+        if (!this._running) return;
+        if (res?.ok) {
+          this._hermes = {
+            ...this._hermes,
+            status: "success",
+            installed: res.installed,
+            version: res.version,
+            error: null,
+            finishedAt: res.finishedAt ?? Date.now(),
+          };
+          // Refresh update availability right away (don't wait for the next poll).
+          try {
+            const check = await this.hermesProbe.check();
+            if (this._running && check) {
+              this._hermes = {
+                ...this._hermes,
+                installed: check.installed,
+                version: check.version,
+                updateAvailable: check.updateAvailable,
+                behindCommits: check.behindCommits,
+                checkedAt: check.checkedAt,
+                error: check.error ?? null,
+              };
+            }
+          } catch {
+            /* keep the success result if the follow-up check fails */
+          }
+        } else {
+          this._hermes = {
+            ...this._hermes,
+            status: "error",
+            error: res?.error || res?.output?.slice(-400) || "hermes update failed",
+            finishedAt: res?.finishedAt ?? Date.now(),
+          };
+        }
+      } catch (err) {
+        if (!this._running) return;
+        this._hermes = {
+          ...this._hermes,
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+          finishedAt: Date.now(),
+        };
+      }
+      this._notifyHermesChange();
+    })();
+    return { started: true };
+  }
+
+  _notifyHermesChange() {
+    if (typeof this._onHermesChange !== "function") return;
+    try {
+      this._onHermesChange(this.spark.id);
+    } catch (err) {
+      console.error(`[SparkMonitor] ${this.spark.id} hermes change error:`, err.message);
     }
   }
 
