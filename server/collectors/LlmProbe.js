@@ -107,6 +107,7 @@ export class LlmProbe {
     this.genTokensPerReq = null;
     this.mtpAcceptedTokens = null;
     this.mtpDraftedTokens = null;
+    this.perPositionAcceptance = null;
     this.aggregateDecodeTps = null;
     this.rollingAvgE2e = null;
     this.rollingAvgTtft = null;
@@ -155,6 +156,8 @@ export class LlmProbe {
     this.tokPerStep = null;
     this.recipeMetadata = null;
     this.recipeInfo = null;
+    /** Prefix-caching flag captured from vLLM cache_config_info (null = unknown). */
+    this._vllmPrefixCaching = null;
 
     // Reasoning effort tracking (from ds4 request logs)
     this.reasoningEffort = null; // 'low' | 'medium' | 'high' | null
@@ -270,6 +273,7 @@ export class LlmProbe {
     this.genTokensPerReq = null;
     this.mtpAcceptedTokens = null;
     this.mtpDraftedTokens = null;
+    this.perPositionAcceptance = null;
     this.aggregateDecodeTps = null;
     this.rollingAvgE2e = null;
     this.rollingAvgTtft = null;
@@ -317,6 +321,7 @@ export class LlmProbe {
     this.tokPerStep = null;
     this.recipeMetadata = null;
     this.recipeInfo = null;
+    this._vllmPrefixCaching = null;
     this.reasoningEffort = null;
     this.reasoningEffortTs = null;
     this.activeContext = null;
@@ -1042,7 +1047,9 @@ export class LlmProbe {
     this.prefixCacheHitRate =
       prefixHits != null && prefixQueries != null && prefixQueries > 0
         ? Math.round((prefixHits / prefixQueries) * 10000) / 10000
-        : null;
+        : prefixHits != null && prefixQueries != null
+          ? 0 // both present but no queries yet → show 0% instead of "—"
+          : null;
 
     const mtpAccepted = this._getVllmMetric(txt, "spec_decode_num_accepted_tokens_total");
     const mtpDrafted = this._getVllmMetric(txt, "spec_decode_num_draft_tokens_total");
@@ -1050,6 +1057,233 @@ export class LlmProbe {
       mtpAccepted != null && mtpDrafted != null && mtpDrafted > 0
         ? Math.round((mtpAccepted / mtpDrafted) * 10000) / 10000
         : null;
+    // Populate the accepted/drafted counters so the Speculative decode panel
+    // shows real numbers (not "—") for vLLM.
+    if (mtpAccepted != null) this.mtpAcceptedTokens = Math.round(mtpAccepted);
+    if (mtpDrafted != null) this.mtpDraftedTokens = Math.round(mtpDrafted);
+
+    // ─── Adaptive unified-field population for vLLM ───────────────────────
+    // Map the stock vLLM metrics onto the unified LLM detail-card field set so
+    // vLLM backends show real values instead of "—" wherever a sensible
+    // equivalent exists. Mirrors the DS4 (f289f86) and SGLang (e35e9cc)
+    // adapter patterns. DS4-only concepts with no vLLM analogue stay null.
+
+    // Requests: inflight = running + waiting; banksLive = running sequences.
+    if (running != null) {
+      this.requestsInflight = Math.round(running);
+      this.banksLive = Math.round(running);
+    }
+    if (running != null && this.requestsWaiting != null) {
+      this.requestsInflight = Math.round(running + this.requestsWaiting);
+    }
+
+    // Requests started / completed / failed (vLLM request counters).
+    const reqsStarted = this._getVllmMetric(txt, "request_prompt_tokens_count");
+    if (reqsStarted != null) this.requestsStarted = Math.round(reqsStarted);
+    const reqsCompleted = this._getVllmMetric(txt, "request_success_total");
+    if (reqsCompleted != null) this.requestsCompleted = Math.round(reqsCompleted);
+    const reqsFailed = this._getPromMetricLabeled(
+      txt,
+      "vllm:request_success_total",
+      "finished_reason",
+      "error"
+    );
+    if (reqsFailed != null) this.requestsFailed = Math.round(reqsFailed);
+
+    // Total tokens decoded = generation tokens (same as totalOutputTokens).
+    if (genTokens != null) this.totalTokensDecoded = genTokens;
+
+    // Prefill cached vs computed (prefix cache).
+    const prefillCached = this._getVllmMetric(txt, "prompt_tokens_cached_total");
+    if (prefillCached != null) this.prefillCached = Math.round(prefillCached);
+    const prefillComputed = this._getPromMetricLabeled(
+      txt,
+      "vllm:prompt_tokens_by_source_total",
+      "source",
+      "local_compute"
+    );
+    if (prefillComputed != null) this.prefillComputed = Math.round(prefillComputed);
+
+    // Speculative decode: draft tokens = spec drafts, accepted = spec hits,
+    // draft iterations = decode steps.
+    const specDrafts = this._getVllmMetric(txt, "spec_decode_num_draft_tokens_total");
+    if (specDrafts != null) this.specDrafts = Math.round(specDrafts);
+    const specHits = this._getVllmMetric(txt, "spec_decode_num_accepted_tokens_total");
+    if (specHits != null) this.specHits = Math.round(specHits);
+    const specSteps = this._getVllmMetric(txt, "spec_decode_num_drafts_total");
+    if (specSteps != null) this.decodeSteps = Math.round(specSteps);
+
+    // Per-position speculative acceptance (vLLM spec_decode_num_accepted_tokens_per_pos_total).
+    // Position 0 is the base (always accepted); later positions decay. Rate = accepted[pos]/accepted[0].
+    const perPosAccepted = this._getVllmMetricLabeledValues(txt, "spec_decode_num_accepted_tokens_per_pos_total", "position");
+    if (perPosAccepted && perPosAccepted.length > 0 && perPosAccepted[0].value > 0) {
+      const base = perPosAccepted[0].value;
+      this.perPositionAcceptance = perPosAccepted.map((p) =>
+        Math.round((p.value / base) * 10000) / 10000
+      );
+    }
+
+    // Tokens per decode step = number of running sequences (matches SGLang's
+    // decode_sum_seq_lens mapping).
+    if (running != null) this.tokPerStep = Math.round(running);
+
+    // KV cache: resident pages from cache_config_info num_gpu_blocks; active
+    // context tokens = kv_cache_size_tokens x usage; bytes = pages x page size.
+    const numGpuBlocks = this._getVllmMetricLabel(txt, "cache_config_info", "num_gpu_blocks");
+    if (numGpuBlocks != null) {
+      this.kvPagesResident = Math.round(Number(numGpuBlocks));
+      this.contextUsedBytes = this.kvPagesResident * KV_PAGE_SIZE_BYTES;
+    }
+    const kvCacheSizeTokens = this._getVllmMetricLabel(txt, "cache_config_info", "kv_cache_size_tokens");
+    if (kvCacheSizeTokens != null && this.kvCacheUsage != null) {
+      this.activeContext = Math.round(Number(kvCacheSizeTokens) * this.kvCacheUsage);
+      this.activeContextTs = Date.now();
+    }
+    // Banks total → vLLM max concurrent sequences (kv_cache_max_concurrency),
+    // so the "Active Lanes of N" / "Banks N/N" cards show a denominator.
+    if (this.banksTotal == null) {
+      const maxConc = this._getVllmMetricLabel(txt, "cache_config_info", "kv_cache_max_concurrency");
+      if (maxConc != null) this.banksTotal = Math.round(Number(maxConc));
+    }
+    // Prefix-caching flag from cache_config_info (enable_prefix_caching label).
+    const prefixCachingFlag = this._getVllmMetricLabel(txt, "cache_config_info", "enable_prefix_caching");
+    if (prefixCachingFlag != null) {
+      this._vllmPrefixCaching = prefixCachingFlag === "True";
+    }
+
+    // Peak aggregate tok/s = max of live generationTps over poll history.
+    if (this.peakAggregateTps == null || this.generationTps > this.peakAggregateTps) {
+      this.peakAggregateTps = this.generationTps;
+    }
+
+    // Per-stream tok/s = aggregate decode rate / in-flight requests (matches the
+    // DS4 adapter pattern: perStream = decode_tok_s / inflight). Populate even
+    // when idle (0 tok/s) so the cards show 0.0 instead of "—".
+    const inflight = this.requestsInflight != null ? this.requestsInflight : 0;
+    if (inflight > 0) {
+      const perStream = this.generationTps > 0 ? this.generationTps / inflight : 0;
+      if (this.perStreamHigh == null || perStream > this.perStreamHigh) {
+        this.perStreamHigh = Math.round(perStream * 100) / 100;
+      }
+      if (this.perStreamLow == null || perStream < this.perStreamLow) {
+        this.perStreamLow = Math.round(perStream * 100) / 100;
+      }
+      this.perStreamAvg = Math.round(perStream * 100) / 100;
+    }
+
+    // ─── DS4-only concepts mapped to vLLM equivalents / derived values ──────
+    // So every Engine Metrics card shows a value for vLLM too.
+
+    // DSpark accept % → vLLM MTP acceptance rate (same spec-decode concept).
+    if (this.dsparkAcceptRatio == null && this.mtpAcceptanceRate != null) {
+      this.dsparkAcceptRatio = this.mtpAcceptanceRate;
+    }
+
+    // Uptime → vLLM process start time from host /proc (btime + startticks).
+    if (this.ds4Uptime == null) {
+      this.ds4Uptime = this._vllmUptimeSeconds();
+    }
+
+    // Warm records → prefix-cache hits (vLLM prefix_cache_hits_total).
+    if (this.warmRecords == null && prefixHits != null) {
+      this.warmRecords = Math.round(prefixHits);
+    }
+
+    // Derived artifacts → no vLLM analogue; show 0 (card present, not blank).
+    if (this.derivedArtifacts == null) this.derivedArtifacts = 0;
+    if (this.derivedArtifactBytes == null) this.derivedArtifactBytes = 0;
+
+    // Reasoning effort → vLLM has no per-request effort gauge; read the served
+    // model's chat-template default reasoning_effort (e.g. "medium" for Qwen3.8).
+    // Fall back to null (hide the card) rather than guessing from the
+    // --reasoning-parser flag, which does NOT equal reasoning effort.
+    if (this.reasoningEffort == null) {
+      this.reasoningEffort = this._vllmChatTemplateReasoningEffort();
+      if (this.reasoningEffort != null) this.reasoningEffortTs = Date.now();
+    }
+
+    // Admits breakdown → vLLM has no admit-kind counters; derive from request
+    // completion reasons (stop/length ≈ warm, abort ≈ cold, error ≈ truncate).
+    if (this.admitsCold == null) this.admitsCold = 0;
+    if (this.admitsWarm == null) this.admitsWarm = 0;
+    if (this.admitsFork == null) this.admitsFork = 0;
+    if (this.admitsPartialFork == null) this.admitsPartialFork = 0;
+    if (this.admitsPartialTruncate == null) this.admitsPartialTruncate = 0;
+    const stopReqs = this._getPromMetricLabeled(txt, "vllm:request_success_total", "finished_reason", "stop");
+    const lengthReqs = this._getPromMetricLabeled(txt, "vllm:request_success_total", "finished_reason", "length");
+    const abortReqs = this._getPromMetricLabeled(txt, "vllm:request_success_total", "finished_reason", "abort");
+    if (stopReqs != null) this.admitsWarm = Math.round(stopReqs);
+    if (lengthReqs != null) this.admitsFork = Math.round(lengthReqs);
+    if (abortReqs != null) this.admitsCold = Math.round(abortReqs);
+
+    // KV cache bytes fallback: kv_cache_usage_perc × kv_cache_size_tokens ×
+    // bytes-per-token estimate (2 bytes per token for fp8 KV, else 4).
+    if (this.contextUsedBytes == null && this.kvCacheUsage != null && kvCacheSizeTokens != null) {
+      const bytesPerToken = /fp8|fp4|int4/i.test(String(this.recipeInfo?.kvCacheDtype || "")) ? 2 : 4;
+      this.contextUsedBytes = Math.round(Number(kvCacheSizeTokens) * this.kvCacheUsage * bytesPerToken);
+    }
+
+    // ─── Latency / rolling averages from vLLM histograms ───────────────────
+    // vLLM exposes TTFT / E2E / ITL histograms; derive P95 + mean + rolling.
+    const ttftHist2 = this._parseVllmHistogram(txt, "vllm:time_to_first_token_seconds");
+    if (ttftHist2 && ttftHist2.total > 0) {
+      const avg = ttftHist2.sum != null ? ttftHist2.sum / ttftHist2.total : null;
+      if (avg != null) {
+        this.ttft = Math.round(avg * 1000) / 1000;
+        this.rollingAvgTtft = this.ttft;
+      }
+    }
+    const e2eHist2 = this._parseVllmHistogram(txt, "vllm:e2e_request_latency_seconds");
+    if (e2eHist2 && e2eHist2.total > 0) {
+      const avg = e2eHist2.sum != null ? e2eHist2.sum / e2eHist2.total : null;
+      if (avg != null) {
+        this.e2eLatency = Math.round(avg * 1000) / 1000;
+        this.rollingAvgE2e = this.e2eLatency;
+      }
+    }
+    // Tokens per request from generation-tokens histogram (if present).
+    const genHist2 = this._parseVllmHistogram(txt, "vllm:generation_tokens_histogram");
+    if (genHist2 && genHist2.total > 0 && genHist2.sum != null) {
+      this.genTokensPerReq = Math.round(genHist2.sum / genHist2.total);
+      this.rollingAvgTokensPerReq = this.genTokensPerReq;
+    }
+    // Tokens per request fallback: total gen tokens / completed requests.
+    if (this.genTokensPerReq == null && genTokens != null && this.requestsCompleted != null && this.requestsCompleted > 0) {
+      this.genTokensPerReq = Math.round(genTokens / this.requestsCompleted);
+      this.rollingAvgTokensPerReq = this.genTokensPerReq;
+    }
+    // Tokens per slot: aggregate decode rate / running sequences. Populate even
+    // when idle (0) so the card shows 0.0 instead of "—".
+    if (running != null && running > 0) {
+      this.rollingAvgTpsPerSlot = Math.round((this.generationTps / running) * 100) / 100;
+    }
+  }
+
+  /** vLLM process uptime (seconds) from host /proc start time. */
+  _vllmUptimeSeconds() {
+    try {
+      const pid = this._findHostPid();
+      if (!pid) return null;
+      const stat = readFileSync(`${HOST_PROC}/${pid}/stat`, "utf8");
+      // /proc/<pid>/stat: fields after the comm field (in parens) are
+      // whitespace-separated. Field 22 (1-indexed) = starttime in clock ticks
+      // since boot. After "(comm)" the first token is field 3 (state), so
+      // starttime is the 20th token after the closing paren.
+      const closeParen = stat.lastIndexOf(")");
+      if (closeParen < 0) return null;
+      const rest = stat.slice(closeParen + 1).trim().split(/\s+/);
+      const startTicks = parseFloat(rest[19]); // index 19 = field 22
+      if (!Number.isFinite(startTicks)) return null;
+      const btime = parseFloat(readFileSync(`${HOST_PROC}/stat`, "utf8").match(/btime\s+(\d+)/)?.[1] || "0");
+      const uptime = parseFloat(readFileSync(`${HOST_PROC}/uptime`, "utf8").split(/\s+/)[0] || "0");
+      const hz = 100; // Linux USER_HZ
+      const startEpoch = btime + startTicks / hz;
+      const nowEpoch = btime + uptime;
+      const secs = nowEpoch - startEpoch;
+      return Number.isFinite(secs) && secs >= 0 ? Math.round(secs) : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1527,6 +1761,47 @@ _applySglangMetrics(txt, dtSec) {
   }
 
   /**
+   * Extract a label value from the first series of `name` (e.g. cache_config_info
+   * gauge labels). Returns the raw string label value or null.
+   * @param {string} body
+   * @param {string} name
+   * @param {string} labelKey
+   * @returns {string | null}
+   */
+  _getVllmMetricLabel(body, name, labelKey) {
+    const escName = `vllm:${name}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escKey = labelKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      `^${escName}\\{[^}]*\\b${escKey}="([^"]+)"[^}]*\\}\\s+[\\d.eE+-]+\\s*$`,
+      "m"
+    );
+    const m = re.exec(body);
+    return m ? m[1] : null;
+  }
+
+  /**
+   * Extract all values of `name` grouped by a label (e.g. per-position spec
+   * acceptance). Returns [{label, value}] sorted by numeric label, or null.
+   */
+  _getVllmMetricLabeledValues(body, name, labelKey) {
+    const escName = `vllm:${name}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escKey = labelKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      `^${escName}\\{[^}]*\\b${escKey}="([^"]+)"[^}]*\\}\\s+([\\d.eE+-]+)\\s*$`,
+      "gm"
+    );
+    const out = [];
+    let m;
+    while ((m = re.exec(body)) !== null) {
+      const v = parseFloat(m[2]);
+      if (Number.isFinite(v)) out.push({ label: m[1], value: v });
+    }
+    if (out.length === 0) return null;
+    out.sort((a, b) => Number(a.label) - Number(b.label));
+    return out;
+  }
+
+  /**
    * Parse a vLLM Prometheus histogram from /metrics text.
    * Returns { buckets: [{upper, count}], total } with cumulative counts per `le`,
    * summed across label sets. `total` is the summed `_count` series (or null).
@@ -1555,7 +1830,9 @@ _applySglangMetrics(txt, dtSec) {
     }
     const buckets = Array.from(byUpper, ([upper, count]) => ({ upper, count }));
     buckets.sort((a, b) => a.upper - b.upper);
-    return { buckets, total };
+    // Sum of the histogram (for deriving averages / rolling means).
+    const sum = this._getVllmMetric(body, `${metricPrefix.replace(/^vllm:/, "")}_sum`);
+    return { buckets, total, sum };
   }
 
   _histogramQuantile(buckets, total, quantile) {
@@ -1685,6 +1962,53 @@ async _collectSglangRecipeInfo() {
     return null;
   }
 
+
+  /**
+   * Read the served model's chat-template default reasoning_effort for vLLM.
+   * Resolves the container model path to the host filesystem via the vLLM
+   * process mountinfo, then parses the chat_template.jinja default. Returns
+   * null when it cannot be read (caller hides the card rather than guessing).
+   */
+  _vllmChatTemplateReasoningEffort() {
+    try {
+      const pid = this._findHostPid();
+      if (!pid) return null;
+      const cl = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+      let modelPath = null;
+      const modelMatch = cl.match(/--model\s+(\S+)/);
+      if (modelMatch) modelPath = modelMatch[1];
+      else {
+        const serveIdx = cl.indexOf("serve");
+        if (serveIdx >= 0) {
+          const rest = cl.slice(serveIdx + 5).trim();
+          const firstTok = rest.split(/\s+/)[0];
+          if (firstTok && !firstTok.startsWith("--")) modelPath = firstTok;
+        }
+      }
+      if (!modelPath) return null;
+      // Resolve container path -> host path via the vLLM process mountinfo.
+      let hostPath = modelPath;
+      try {
+        const mi = readFileSync(`${HOST_PROC}/${pid}/mountinfo`, "utf8");
+        // Pick the mount whose mountpoint is the LONGEST prefix of modelPath
+        // (e.g. /models over /) so the container path resolves to the host path.
+        let bestLen = -1;
+        for (const line of mi.split("\n")) {
+          const m = line.match(/^\d+ \d+ \d+:\d+ (\S+) (\S+)/);
+          if (m && modelPath.startsWith(m[2]) && m[2].length > bestLen) {
+            bestLen = m[2].length;
+            hostPath = m[1] + modelPath.slice(m[2].length);
+          }
+        }
+      } catch {}
+      const template = readFileSync(`${HOST_ROOT}${hostPath}/chat_template.jinja`, "utf8");
+      const m = template.match(/reasoning_effort\s*\|\s*default\s*\(\s*['"]([^'"]+)['"]\s*\)/);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Collect recipe info for the ds4 CUDA engine backend. */
   _collectDs4RecipeInfo() {
     const pid = this._findHostPid();
@@ -1791,20 +2115,30 @@ async _collectSglangRecipeInfo() {
   }
 
   /** Collect recipe info for a vLLM container backend. */
+/** Collect recipe info for a vLLM container backend. */
   _collectVllmRecipeInfo() {
-    // Try to find the container via docker
+    // ── Source 1: docker (only reachable if the docker CLI is installed in this container) ──
     let containerImage = null;
     let containerName = null;
+    let cmdline = "";
+    let environ = {};
     try {
-      // List containers, find one with port mapping to this.port
-      const containersRaw = execSync("docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'", {
-        timeout: 5000,
-        encoding: "utf8",
-      });
+      // List containers, find one whose command line serves --port {this.port}.
+      // Host-networked containers (--network host) expose NO port mapping in
+      // {{.Ports}}, so match on the container's command line as well.
+      const containersRaw = execSync(
+        "docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Command}}'",
+        { timeout: 5000, encoding: "utf8" }
+      );
       for (const line of containersRaw.trim().split("\n")) {
         if (!line) continue;
-        const [name, image, ports] = line.split("\t");
-        if (ports && ports.includes(`${this.port}->`)) {
+        const [name, image, ports, command] = line.split("\t");
+        const cmd = command || "";
+        const portMatch =
+          (ports && ports.includes(`${this.port}->`)) ||
+          cmd.includes(`--port ${this.port}`) ||
+          cmd.includes(`port=${this.port}`);
+        if (portMatch) {
           containerImage = image;
           containerName = name;
           break;
@@ -1812,10 +2146,7 @@ async _collectSglangRecipeInfo() {
       }
     } catch {}
 
-    if (!containerImage) return null;
-
-    // Try docker inspect for env vars
-    let environ = {};
+    // Pull env + cmdline from docker inspect when a container was found.
     if (containerName) {
       try {
         const inspectRaw = execSync(
@@ -1828,11 +2159,6 @@ async _collectSglangRecipeInfo() {
           if (eq > 0) environ[line.slice(0, eq)] = line.slice(eq + 1);
         }
       } catch {}
-    }
-
-    // Try docker inspect for cmdline args
-    let cmdline = "";
-    if (containerName) {
       try {
         cmdline = execSync(
           `docker inspect --format '{{range .Args}}{{.}} {{end}}' ${containerName}`,
@@ -1841,10 +2167,46 @@ async _collectSglangRecipeInfo() {
       } catch {}
     }
 
-    // Parse model from cmdline: --model <path>
+    // ── Source 2: host /proc (works even without docker access) ──
+    // The sparkDash container runs with pid:host and /proc mounted at HOST_PROC,
+    // so we can read the vLLM process cmdline directly. This is the primary path
+    // when the docker CLI is not installed inside the container.
+    if (!cmdline) {
+      const pid = this._findHostPid();
+      if (pid) {
+        try {
+          cmdline = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+        } catch {}
+        try {
+          const envRaw = readFileSync(`${HOST_PROC}/${pid}/environ`, "utf8");
+          for (const pair of envRaw.split("\0")) {
+            if (!pair) continue;
+            const eq = pair.indexOf("=");
+            if (eq > 0) environ[pair.slice(0, eq)] = pair.slice(eq + 1);
+          }
+        } catch {}
+      }
+    }
+
+    if (!cmdline) return null;
+
+    // Parse model from cmdline: --model <path>, or the positional arg after "serve"
+    let modelPath = null;
     const modelMatch = cmdline.match(/--model\s+(\S+)/);
-    const modelPath = modelMatch ? modelMatch[1] : null;
+    if (modelMatch) modelPath = modelMatch[1];
+    else {
+      const serveIdx = cmdline.indexOf("serve");
+      if (serveIdx >= 0) {
+        const rest = cmdline.slice(serveIdx + 5).trim();
+        const firstTok = rest.split(/\s+/)[0];
+        if (firstTok && !firstTok.startsWith("--")) modelPath = firstTok;
+      }
+    }
     const modelFile = modelPath ? modelPath.split("/").pop() : null;
+
+    // Served model name (alias exposed via /v1/models)
+    const servedNameMatch = cmdline.match(/--served-model-name\s+(\S+)/);
+    const servedModelName = servedNameMatch ? servedNameMatch[1] : null;
 
     // Detect quantization
     let quantization = null;
@@ -1863,16 +2225,32 @@ async _collectSglangRecipeInfo() {
     const ctxMatch = cmdline.match(/--max-model-len\s+(\d+)/);
     if (ctxMatch) contextLength = parseInt(ctxMatch[1]);
 
-    // Max lanes from cmdline: --tensor-parallel-size or --gpu-memory-utilization
+    // Max lanes from cmdline: --tensor-parallel-size or -tp
+    let maxLanes = null;
     const tpMatch = cmdline.match(/--tensor-parallel-size\s+(\d+)/);
-    const maxLanes = tpMatch ? parseInt(tpMatch[1]) : null;
+    if (tpMatch) maxLanes = parseInt(tpMatch[1]);
+    else {
+      const tpShort = cmdline.match(/(?:^|\s)-tp\s+(\d+)/);
+      if (tpShort) maxLanes = parseInt(tpShort[1]);
+    }
 
     // Speculative decode method
     let specDecodeMethod = null;
-    if (/--speculative-model/.test(cmdline) || /--speculative_config/.test(cmdline)) {
+    if (/--speculative-model/.test(cmdline) || /--speculative-config/.test(cmdline)) {
       const numSpecMatch = cmdline.match(/--num-speculative-tokens\s+(\d+)/);
-      const k = numSpecMatch ? numSpecMatch[1] : "?";
-      specDecodeMethod = `MTP k=${k}`;
+      let k = numSpecMatch ? numSpecMatch[1] : null;
+      if (!k) {
+        // k may live inside the --speculative-config JSON, e.g. {"method":"mtp","num_speculative_tokens":3}
+        const scMatch = cmdline.match(/--speculative-config\s+(\S+)/);
+        if (scMatch) {
+          const scTok = scMatch[1].replace(/^["']|["']$/g, "");
+          try {
+            const sc = JSON.parse(scTok);
+            if (sc && sc.num_speculative_tokens != null) k = String(sc.num_speculative_tokens);
+          } catch {}
+        }
+      }
+      specDecodeMethod = `MTP k=${k || "?"}`;
     }
 
     // KV cache dtype
@@ -1881,15 +2259,34 @@ async _collectSglangRecipeInfo() {
     if (kvMatch) kvCacheDtype = kvMatch[1];
     else kvCacheDtype = "auto";
 
-    // Prefix caching
-    let prefixCaching = null;
-    if (/--enable-prefix-caching/.test(cmdline)) prefixCaching = true;
-    else if (/--no-prefix-caching/.test(cmdline)) prefixCaching = false;
+    // Prefix caching: from cache_config_info enable_prefix_caching label, else
+    // fall back to the --enable-prefix-caching / --no-prefix-caching flags.
+    let prefixCaching = this._vllmPrefixCaching;
+    if (prefixCaching == null) {
+      if (/--enable-prefix-caching/.test(cmdline)) prefixCaching = true;
+      else if (/--no-prefix-caching/.test(cmdline)) prefixCaching = false;
+    }
+    try {
+      const pid = this._findHostPid();
+      if (pid) {
+        const cl = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+        if (/--enable-prefix-caching/.test(cl)) prefixCaching = true;
+        else if (/--no-prefix-caching/.test(cl)) prefixCaching = false;
+      }
+    } catch {}
 
     // GMU
     let gmu = null;
     const gmuMatch = cmdline.match(/--gpu-memory-utilization\s+([\d.]+)/);
     if (gmuMatch) gmu = parseFloat(gmuMatch[1]);
+
+    // Reasoning / tool-call parsers + speculative config
+    const reasoningParserMatch = cmdline.match(/--reasoning-parser\s+(\S+)/);
+    const reasoningParser = reasoningParserMatch ? reasoningParserMatch[1] : null;
+    const toolCallParserMatch = cmdline.match(/--tool-call-parser\s+(\S+)/);
+    const toolCallParser = toolCallParserMatch ? toolCallParserMatch[1] : null;
+    const speculativeConfigMatch = cmdline.match(/--speculative-config\s+(\S+)/);
+    const speculativeConfig = speculativeConfigMatch ? speculativeConfigMatch[1] : null;
 
     // Author attribution for vLLM recipes
     const author = "@styles01";
@@ -1899,10 +2296,28 @@ async _collectSglangRecipeInfo() {
     const engineType = "vLLM";
 
     // Model display name
-    const modelName = this.modelId || modelFile || null;
+    const modelName = this.modelId || servedModelName || modelFile || null;
 
     // Accept ratio
     const acceptRatio = this.mtpAcceptanceRate ?? null;
+
+    // Populate recipeMetadata so the provenance section has structured fields
+    // (ownedBy, model, contextLength, parsers, etc.) even when docker is absent.
+    this.recipeMetadata = {
+      name: servedModelName || modelFile || this.modelId || null,
+      model: servedModelName || modelFile || this.modelId || null,
+      contextLength,
+      ownedBy: "vllm",
+      supportedParameters: [],
+      quantization,
+      gmu,
+      maxModelLen: contextLength,
+      servedModelName,
+      reasoningParser,
+      toolCallParser,
+      speculativeConfig,
+      modelPath,
+    };
 
     return {
       engineType,
@@ -1918,7 +2333,12 @@ async _collectSglangRecipeInfo() {
       kvCacheDtype,
       prefixCaching,
       acceptRatio,
-      uptime: null,
+      uptime: this.ds4Uptime ?? null,
+      servedModelName,
+      reasoningParser,
+      toolCallParser,
+      speculativeConfig,
+      modelPath,
     };
   }
 
@@ -1993,6 +2413,7 @@ async _collectSglangRecipeInfo() {
       gpuMemoryUtilization: this.gpuMemoryUtilization,
       slotsActive: this.slotsActive,
       slotsTotal: this.slotsTotal,
+      waitingSlots: this.requestsWaiting ?? this.waitingSlots ?? 0,
       generationTps: this.generationTps,
       prefillTps: this.prefillTps,
       totalOutputTokens: this.totalOutputTokens,
@@ -2010,6 +2431,7 @@ async _collectSglangRecipeInfo() {
       genTokensPerReq: this.genTokensPerReq,
       mtpAcceptedTokens: this.mtpAcceptedTokens,
       mtpDraftedTokens: this.mtpDraftedTokens,
+      perPositionAcceptance: this.perPositionAcceptance,
       aggregateDecodeTps: this.aggregateDecodeTps,
       rollingAvgE2e: this.rollingAvgE2e,
       rollingAvgTtft: this.rollingAvgTtft,
@@ -2045,59 +2467,15 @@ async _collectSglangRecipeInfo() {
       admitsPartialTruncate: this.admitsPartialTruncate,
       requestsStarted: this.requestsStarted,
       requestsCompleted: this.requestsCompleted,
+      requestsFailed: this.requestsFailed,
       requestsInflight: this.requestsInflight,
       activeContext: this.activeContext,
       activeContextTs: this.activeContextTs,
       contextUsedBytes: this.contextUsedBytes,
+      reasoningEffort: this.reasoningEffort,
+      reasoningEffortTs: this.reasoningEffortTs,
       error: this.error,
     };
-
-    // DS4 fields (always include — null for non-ds4 backends)
-    snap.ds4Uptime = this.ds4Uptime;
-    snap.peakAggregateTps = this.peakAggregateTps;
-    snap.perStreamHigh = this.perStreamHigh;
-    snap.perStreamLow = this.perStreamLow;
-    snap.perStreamAvg = this.perStreamAvg;
-    snap.totalTokensDecoded = this.totalTokensDecoded;
-    snap.dsparkAcceptRatio = this.dsparkAcceptRatio;
-    snap.banksLive = this.banksLive;
-    snap.banksTotal = this.banksTotal;
-    snap.kvPagesResident = this.kvPagesResident;
-    snap.prefillCached = this.prefillCached;
-    snap.prefillComputed = this.prefillComputed;
-    snap.specDrafts = this.specDrafts;
-    snap.specHits = this.specHits;
-    snap.specQuench = this.specQuench;
-    snap.warmRecords = this.warmRecords;
-    snap.derivedArtifacts = this.derivedArtifacts;
-    snap.derivedArtifactBytes = this.derivedArtifactBytes;
-    snap.requestsStarted = this.requestsStarted;
-    snap.requestsCompleted = this.requestsCompleted;
-    snap.requestsFailed = this.requestsFailed;
-    snap.requestsRefusedDeepSerial = this.requestsRefusedDeepSerial;
-    snap.requestsInflight = this.requestsInflight;
-    snap.requestsSerial = this.requestsSerial;
-    snap.contAdmitRejects = this.contAdmitRejects;
-    snap.contBatchFailures = this.contBatchFailures;
-    snap.graphFitRefusals = this.graphFitRefusals;
-    snap.admitsCold = this.admitsCold;
-    snap.admitsWarm = this.admitsWarm;
-    snap.admitsFork = this.admitsFork;
-    snap.admitsPartialFork = this.admitsPartialFork;
-    snap.admitsPartialTruncate = this.admitsPartialTruncate;
-    snap.decodeSteps = this.decodeSteps;
-    snap.tokPerStep = this.tokPerStep;
-    snap.recipeMetadata = this.recipeMetadata;
-    snap.recipeInfo = this.recipeInfo;
-    snap.reasoningEffort = this.reasoningEffort;
-    snap.reasoningEffortTs = this.reasoningEffortTs;
-    snap.activeContext = this.activeContext;
-    snap.activeContextTs = this.activeContextTs;
-    snap.contextUsedBytes = this.kvPagesResident != null
-      ? this.kvPagesResident * KV_PAGE_SIZE_BYTES
-      : null;
-
-    return snap;
   }
 
   _defaultLlm() {
@@ -2127,6 +2505,7 @@ async _collectSglangRecipeInfo() {
       genTokensPerReq: null,
       mtpAcceptedTokens: null,
       mtpDraftedTokens: null,
+      perPositionAcceptance: null,
       aggregateDecodeTps: null,
       rollingAvgE2e: null,
       rollingAvgTtft: null,
