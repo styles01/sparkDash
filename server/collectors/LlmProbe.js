@@ -2497,7 +2497,9 @@ export class LlmProbe {
     }
     const buckets = Array.from(byUpper, ([upper, count]) => ({ upper, count }));
     buckets.sort((a, b) => a.upper - b.upper);
-    return { buckets, total };
+    // Sum of the histogram (for deriving averages / rolling means).
+    const sum = this._getVllmMetric(body, `${metricPrefix.replace(/^vllm:/, "")}_sum`);
+    return { buckets, total, sum };
   }
 
   /**
@@ -3204,6 +3206,53 @@ async _collectSglangRecipeInfo() {
     return null;
   }
 
+
+  /**
+   * Read the served model's chat-template default reasoning_effort for vLLM.
+   * Resolves the container model path to the host filesystem via the vLLM
+   * process mountinfo, then parses the chat_template.jinja default. Returns
+   * null when it cannot be read (caller hides the card rather than guessing).
+   */
+  _vllmChatTemplateReasoningEffort() {
+    try {
+      const pid = this._findHostPid();
+      if (!pid) return null;
+      const cl = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+      let modelPath = null;
+      const modelMatch = cl.match(/--model\s+(\S+)/);
+      if (modelMatch) modelPath = modelMatch[1];
+      else {
+        const serveIdx = cl.indexOf("serve");
+        if (serveIdx >= 0) {
+          const rest = cl.slice(serveIdx + 5).trim();
+          const firstTok = rest.split(/\s+/)[0];
+          if (firstTok && !firstTok.startsWith("--")) modelPath = firstTok;
+        }
+      }
+      if (!modelPath) return null;
+      // Resolve container path -> host path via the vLLM process mountinfo.
+      let hostPath = modelPath;
+      try {
+        const mi = readFileSync(`${HOST_PROC}/${pid}/mountinfo`, "utf8");
+        // Pick the mount whose mountpoint is the LONGEST prefix of modelPath
+        // (e.g. /models over /) so the container path resolves to the host path.
+        let bestLen = -1;
+        for (const line of mi.split("\n")) {
+          const m = line.match(/^\d+ \d+ \d+:\d+ (\S+) (\S+)/);
+          if (m && modelPath.startsWith(m[2]) && m[2].length > bestLen) {
+            bestLen = m[2].length;
+            hostPath = m[1] + modelPath.slice(m[2].length);
+          }
+        }
+      } catch {}
+      const template = readFileSync(`${HOST_ROOT}${hostPath}/chat_template.jinja`, "utf8");
+      const m = template.match(/reasoning_effort\s*\|\s*default\s*\(\s*['"]([^'"]+)['"]\s*\)/);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Collect recipe info for the ds4 CUDA engine backend. */
   _collectDs4RecipeInfo() {
     const pid = this._findHostPid();
@@ -3310,20 +3359,30 @@ async _collectSglangRecipeInfo() {
   }
 
   /** Collect recipe info for a vLLM container backend. */
+/** Collect recipe info for a vLLM container backend. */
   _collectVllmRecipeInfo() {
-    // Try to find the container via docker
+    // ── Source 1: docker (only reachable if the docker CLI is installed in this container) ──
     let containerImage = null;
     let containerName = null;
+    let cmdline = "";
+    let environ = {};
     try {
-      // List containers, find one with port mapping to this.port
-      const containersRaw = execSync("docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'", {
-        timeout: 5000,
-        encoding: "utf8",
-      });
+      // List containers, find one whose command line serves --port {this.port}.
+      // Host-networked containers (--network host) expose NO port mapping in
+      // {{.Ports}}, so match on the container's command line as well.
+      const containersRaw = execSync(
+        "docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Command}}'",
+        { timeout: 5000, encoding: "utf8" }
+      );
       for (const line of containersRaw.trim().split("\n")) {
         if (!line) continue;
-        const [name, image, ports] = line.split("\t");
-        if (ports && ports.includes(`${this.port}->`)) {
+        const [name, image, ports, command] = line.split("\t");
+        const cmd = command || "";
+        const portMatch =
+          (ports && ports.includes(`${this.port}->`)) ||
+          cmd.includes(`--port ${this.port}`) ||
+          cmd.includes(`port=${this.port}`);
+        if (portMatch) {
           containerImage = image;
           containerName = name;
           break;
@@ -3331,10 +3390,7 @@ async _collectSglangRecipeInfo() {
       }
     } catch {}
 
-    if (!containerImage) return null;
-
-    // Try docker inspect for env vars
-    let environ = {};
+    // Pull env + cmdline from docker inspect when a container was found.
     if (containerName) {
       try {
         const inspectRaw = execSync(
@@ -3347,11 +3403,6 @@ async _collectSglangRecipeInfo() {
           if (eq > 0) environ[line.slice(0, eq)] = line.slice(eq + 1);
         }
       } catch {}
-    }
-
-    // Try docker inspect for cmdline args
-    let cmdline = "";
-    if (containerName) {
       try {
         cmdline = execSync(
           `docker inspect --format '{{range .Args}}{{.}} {{end}}' ${containerName}`,
@@ -3360,10 +3411,46 @@ async _collectSglangRecipeInfo() {
       } catch {}
     }
 
-    // Parse model from cmdline: --model <path>
+    // ── Source 2: host /proc (works even without docker access) ──
+    // The sparkDash container runs with pid:host and /proc mounted at HOST_PROC,
+    // so we can read the vLLM process cmdline directly. This is the primary path
+    // when the docker CLI is not installed inside the container.
+    if (!cmdline) {
+      const pid = this._findHostPid();
+      if (pid) {
+        try {
+          cmdline = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+        } catch {}
+        try {
+          const envRaw = readFileSync(`${HOST_PROC}/${pid}/environ`, "utf8");
+          for (const pair of envRaw.split("\0")) {
+            if (!pair) continue;
+            const eq = pair.indexOf("=");
+            if (eq > 0) environ[pair.slice(0, eq)] = pair.slice(eq + 1);
+          }
+        } catch {}
+      }
+    }
+
+    if (!cmdline) return null;
+
+    // Parse model from cmdline: --model <path>, or the positional arg after "serve"
+    let modelPath = null;
     const modelMatch = cmdline.match(/--model\s+(\S+)/);
-    const modelPath = modelMatch ? modelMatch[1] : null;
+    if (modelMatch) modelPath = modelMatch[1];
+    else {
+      const serveIdx = cmdline.indexOf("serve");
+      if (serveIdx >= 0) {
+        const rest = cmdline.slice(serveIdx + 5).trim();
+        const firstTok = rest.split(/\s+/)[0];
+        if (firstTok && !firstTok.startsWith("--")) modelPath = firstTok;
+      }
+    }
     const modelFile = modelPath ? modelPath.split("/").pop() : null;
+
+    // Served model name (alias exposed via /v1/models)
+    const servedNameMatch = cmdline.match(/--served-model-name\s+(\S+)/);
+    const servedModelName = servedNameMatch ? servedNameMatch[1] : null;
 
     // Detect quantization
     let quantization = null;
@@ -3382,16 +3469,32 @@ async _collectSglangRecipeInfo() {
     const ctxMatch = cmdline.match(/--max-model-len\s+(\d+)/);
     if (ctxMatch) contextLength = parseInt(ctxMatch[1]);
 
-    // Max lanes from cmdline: --tensor-parallel-size or --gpu-memory-utilization
+    // Max lanes from cmdline: --tensor-parallel-size or -tp
+    let maxLanes = null;
     const tpMatch = cmdline.match(/--tensor-parallel-size\s+(\d+)/);
-    const maxLanes = tpMatch ? parseInt(tpMatch[1]) : null;
+    if (tpMatch) maxLanes = parseInt(tpMatch[1]);
+    else {
+      const tpShort = cmdline.match(/(?:^|\s)-tp\s+(\d+)/);
+      if (tpShort) maxLanes = parseInt(tpShort[1]);
+    }
 
     // Speculative decode method
     let specDecodeMethod = null;
-    if (/--speculative-model/.test(cmdline) || /--speculative_config/.test(cmdline)) {
+    if (/--speculative-model/.test(cmdline) || /--speculative-config/.test(cmdline)) {
       const numSpecMatch = cmdline.match(/--num-speculative-tokens\s+(\d+)/);
-      const k = numSpecMatch ? numSpecMatch[1] : "?";
-      specDecodeMethod = `MTP k=${k}`;
+      let k = numSpecMatch ? numSpecMatch[1] : null;
+      if (!k) {
+        // k may live inside the --speculative-config JSON, e.g. {"method":"mtp","num_speculative_tokens":3}
+        const scMatch = cmdline.match(/--speculative-config\s+(\S+)/);
+        if (scMatch) {
+          const scTok = scMatch[1].replace(/^["']|["']$/g, "");
+          try {
+            const sc = JSON.parse(scTok);
+            if (sc && sc.num_speculative_tokens != null) k = String(sc.num_speculative_tokens);
+          } catch {}
+        }
+      }
+      specDecodeMethod = `MTP k=${k || "?"}`;
     }
 
     // KV cache dtype
@@ -3400,15 +3503,34 @@ async _collectSglangRecipeInfo() {
     if (kvMatch) kvCacheDtype = kvMatch[1];
     else kvCacheDtype = "auto";
 
-    // Prefix caching
-    let prefixCaching = null;
-    if (/--enable-prefix-caching/.test(cmdline)) prefixCaching = true;
-    else if (/--no-prefix-caching/.test(cmdline)) prefixCaching = false;
+    // Prefix caching: from cache_config_info enable_prefix_caching label, else
+    // fall back to the --enable-prefix-caching / --no-prefix-caching flags.
+    let prefixCaching = this._vllmPrefixCaching;
+    if (prefixCaching == null) {
+      if (/--enable-prefix-caching/.test(cmdline)) prefixCaching = true;
+      else if (/--no-prefix-caching/.test(cmdline)) prefixCaching = false;
+    }
+    try {
+      const pid = this._findHostPid();
+      if (pid) {
+        const cl = readFileSync(`${HOST_PROC}/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+        if (/--enable-prefix-caching/.test(cl)) prefixCaching = true;
+        else if (/--no-prefix-caching/.test(cl)) prefixCaching = false;
+      }
+    } catch {}
 
     // GMU
     let gmu = null;
     const gmuMatch = cmdline.match(/--gpu-memory-utilization\s+([\d.]+)/);
     if (gmuMatch) gmu = parseFloat(gmuMatch[1]);
+
+    // Reasoning / tool-call parsers + speculative config
+    const reasoningParserMatch = cmdline.match(/--reasoning-parser\s+(\S+)/);
+    const reasoningParser = reasoningParserMatch ? reasoningParserMatch[1] : null;
+    const toolCallParserMatch = cmdline.match(/--tool-call-parser\s+(\S+)/);
+    const toolCallParser = toolCallParserMatch ? toolCallParserMatch[1] : null;
+    const speculativeConfigMatch = cmdline.match(/--speculative-config\s+(\S+)/);
+    const speculativeConfig = speculativeConfigMatch ? speculativeConfigMatch[1] : null;
 
     // Author attribution for vLLM recipes
     const author = "@styles01";
@@ -3418,10 +3540,28 @@ async _collectSglangRecipeInfo() {
     const engineType = "vLLM";
 
     // Model display name
-    const modelName = this.modelId || modelFile || null;
+    const modelName = this.modelId || servedModelName || modelFile || null;
 
     // Accept ratio
     const acceptRatio = this.mtpAcceptanceRate ?? null;
+
+    // Populate recipeMetadata so the provenance section has structured fields
+    // (ownedBy, model, contextLength, parsers, etc.) even when docker is absent.
+    this.recipeMetadata = {
+      name: servedModelName || modelFile || this.modelId || null,
+      model: servedModelName || modelFile || this.modelId || null,
+      contextLength,
+      ownedBy: "vllm",
+      supportedParameters: [],
+      quantization,
+      gmu,
+      maxModelLen: contextLength,
+      servedModelName,
+      reasoningParser,
+      toolCallParser,
+      speculativeConfig,
+      modelPath,
+    };
 
     return {
       engineType,
@@ -3437,7 +3577,12 @@ async _collectSglangRecipeInfo() {
       kvCacheDtype,
       prefixCaching,
       acceptRatio,
-      uptime: null,
+      uptime: this.ds4Uptime ?? null,
+      servedModelName,
+      reasoningParser,
+      toolCallParser,
+      speculativeConfig,
+      modelPath,
     };
   }
 

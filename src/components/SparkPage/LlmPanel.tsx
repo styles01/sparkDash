@@ -375,6 +375,15 @@ function RecipeSection({
 
   const acceptPct = info?.acceptRatio != null ? `${Math.round(info.acceptRatio * 100)}%` : "\u2014";
   const acceptAccent = info?.acceptRatio != null && info.acceptRatio > 0.7 ? "success" : info?.acceptRatio != null && info.acceptRatio >= 0.5 ? "warning" : "danger";
+  // Spec-decoder label derived from the backend's actual specDecodeMethod.
+  const specDecodeMethod = info?.specDecodeMethod ?? null;
+  const specDecodeLabel = specDecodeMethod
+    ? specDecodeMethod.replace(/\s*k=\d+$/, "").trim()
+    : llm?.backend === "ds4"
+      ? "DSpark"
+      : llm?.backend === "sglang"
+        ? "DFlash"
+        : "MTP";
 
   // Params from metadata
   const params = metadata?.supportedParameters ?? [];
@@ -407,7 +416,7 @@ function RecipeSection({
   if (llm) {
     // Spec decode acceptance → relates to specDecodeMethod
     if (llm.dsparkAcceptRatio != null) {
-      liveStats.push({ label: "DSpark accept", value: pct(llm.dsparkAcceptRatio, 1), accent: llm.dsparkAcceptRatio > 0.7 ? "success" : llm.dsparkAcceptRatio >= 0.5 ? "warning" : "danger" });
+      liveStats.push({ label: `${specDecodeLabel} accept`, value: pct(llm.dsparkAcceptRatio, 1), accent: llm.dsparkAcceptRatio > 0.7 ? "success" : llm.dsparkAcceptRatio >= 0.5 ? "warning" : "danger" });
     } else if (info?.acceptRatio != null) {
       liveStats.push({ label: "Accept ratio", value: acceptPct, accent: acceptAccent });
     }
@@ -688,7 +697,17 @@ export function LlmPanel({
   const slots: SlotTelemetry[] = llm?.slots ?? [];
   const mtpAccepted = llm?.mtpAcceptedTokens ?? null;
   const mtpDrafted = llm?.mtpDraftedTokens ?? null;
-  const isDs4 = llm?.backend === "ds4";
+  // Spec-decoder label derived from the backend's actual specDecodeMethod
+  // (server computes "MTP k=3" for vLLM, "DSpark k=4" for ds4, "DFlash" for
+  // sglang). Fall back to the backend name when recipeInfo is unavailable.
+  const specDecodeMethod = llm?.recipeInfo?.specDecodeMethod ?? null;
+  const specDecodeLabel = specDecodeMethod
+    ? specDecodeMethod.replace(/\s*k=\d+$/, "").trim()
+    : llm?.backend === "ds4"
+      ? "DSpark"
+      : llm?.backend === "sglang"
+        ? "DFlash"
+        : "MTP";
 
   return (
     <Panel
@@ -920,8 +939,51 @@ export function LlmPanel({
                 <StatCard label="Requests" value={fmtInt(llm?.requestsStarted)} sub={llm?.requestsCompleted != null ? `${llm.requestsCompleted} done` : undefined} valueColor="var(--color-text)" />
               </div>
 
+            {/* Throughput + tokens */}
+            <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+              <StatCardIf show={llm?.generationTps != null} label="Decode tok/s" value={fmtNum(llm?.generationTps, 1)} valueColor={tpsColor(llm?.generationTps ?? 0)} />
+              <StatCardIf show={llm?.prefillTps != null} label="Prefill Speed" value={fmtNum(llm?.prefillTps, 1)} valueColor={tpsColor(llm?.prefillTps ?? 0)} />
+              <StatCardIf show={llm?.peakAggregateTps != null && llm.peakAggregateTps > 0} label="Peak Aggregate tok/s" value={fmtNum(llm?.peakAggregateTps, 1)} valueColor={tpsColor(llm?.peakAggregateTps ?? 0)} />
+              <StatCardIf show={llm?.perStreamHigh != null} label="Per-Stream High" value={fmtNum(llm?.perStreamHigh, 1)} valueColor={tpsColor(llm?.perStreamHigh ?? 0)} />
+              <StatCardIf show={llm?.perStreamLow != null} label="Per-Stream Low" value={fmtNum(llm?.perStreamLow, 1)} valueColor={tpsColor(llm?.perStreamLow ?? 0)} />
+              <StatCardIf show={llm?.perStreamAvg != null} label="Per-Stream Avg" value={fmtNum(llm?.perStreamAvg, 1)} valueColor={tpsColor(llm?.perStreamAvg ?? 0)} />
+              <StatCardIf show={llm?.totalOutputTokens != null || llm?.totalTokensDecoded != null} label="Total Tokens" value={fmtInt(llm?.totalTokensDecoded ?? llm?.totalOutputTokens)} valueColor="var(--color-accent)" />
+              <StatCardIf show={llm?.dsparkAcceptRatio != null} label={`${specDecodeLabel} Accept %`} value={pct(llm?.dsparkAcceptRatio, 1)} valueColor={mtpColor(llm?.dsparkAcceptRatio)} bar={llm?.dsparkAcceptRatio != null ? { pct: llm.dsparkAcceptRatio * 100, color: mtpColor(llm.dsparkAcceptRatio) } : undefined} />
             </div>
-          )}
+
+            {/* Concurrency + cache + uptime */}
+            <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+              <StatCardIf show={llm?.banksLive != null} label="Active Lanes" value={fmtInt(llm?.banksLive)} sub={llm?.banksTotal != null ? `of ${llm.banksTotal}` : undefined} valueColor={(llm?.banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} bar={llm?.banksTotal != null && llm.banksTotal > 0 ? { pct: ((llm?.banksLive ?? 0) / llm.banksTotal) * 100, color: "var(--color-accent)" } : undefined} />
+              <StatCardIf show={llm?.kvCacheUsage != null} label="KV Cache" value={pct(llm?.kvCacheUsage, 1)} valueColor={llm?.kvCacheUsage != null && llm.kvCacheUsage >= 0.8 ? "var(--color-danger)" : llm?.kvCacheUsage != null && llm.kvCacheUsage >= 0.5 ? "var(--color-warning)" : "var(--color-success)"} bar={llm?.kvCacheUsage != null ? { pct: llm.kvCacheUsage * 100, color: llm.kvCacheUsage >= 0.8 ? "var(--color-danger)" : llm.kvCacheUsage >= 0.5 ? "var(--color-warning)" : "var(--color-success)" } : undefined} />
+              <StatCardIf show={llm?.contextUsedBytes != null} label="KV Cache Bytes" value={fmtBytes(llm?.contextUsedBytes)} sub={llm?.kvPagesResident != null ? `${fmtInt(llm.kvPagesResident)} pages` : undefined} valueColor="var(--color-accent)" />
+              <StatCardIf show={llm?.requestsInflight != null} label="In Flight" value={fmtInt(llm?.requestsInflight)} valueColor={(llm?.requestsInflight ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} />
+              <StatCardIf show={llm?.requestsRunning != null} label="Running" value={fmtInt(llm?.requestsRunning)} valueColor={(llm?.requestsRunning ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)"} />
+              <StatCardIf show={llm?.requestsWaiting != null} label="Waiting" value={fmtInt(llm?.requestsWaiting)} valueColor={(llm?.requestsWaiting ?? 0) > 0 ? "var(--color-warning)" : "var(--color-muted)"} />
+              <StatCardIf show={llm?.ds4Uptime != null} label="Uptime" value={fmtUptime(llm?.ds4Uptime)} valueColor="var(--color-muted)" />
+            </div>
+
+            {/* Additional counters (DS4 / SGLang) */}
+            <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+              <StatCardIf show={llm?.warmRecords != null} label="Warm records" value={fmtInt(llm?.warmRecords)} valueColor="var(--color-accent)" />
+              <StatCardIf show={llm?.tokPerStep != null} label="Tok/step" value={fmtNum(llm?.tokPerStep, 3)} valueColor="var(--color-text)" />
+              <StatCardIf show={llm?.decodeSteps != null} label="Decode steps" value={fmtInt(llm?.decodeSteps)} valueColor="var(--color-text)" />
+              <StatCardIf show={llm?.derivedArtifacts != null} label="Derived artifacts" value={fmtInt(llm?.derivedArtifacts)} sub={fmtBytes(llm?.derivedArtifactBytes)} valueColor="var(--color-text)" />
+              <StatCardIf show={llm?.prefillCached != null} label="Prefill cached" value={fmtInt(llm?.prefillCached)} valueColor="var(--color-success)" />
+              <StatCardIf show={llm?.reasoningEffort != null} label="Reasoning" value={llm?.reasoningEffort ?? "\u2014"} sub={llm?.reasoningEffortTs != null ? new Date(llm.reasoningEffortTs).toLocaleTimeString() : undefined} valueColor={llm?.reasoningEffort === "high" ? "var(--color-danger)" : llm?.reasoningEffort === "medium" ? "var(--color-warning)" : llm?.reasoningEffort === "low" ? "var(--color-success)" : "var(--color-muted)"} />
+              <StatCardIf show={llm?.activeContext != null} label="Active Context" value={fmtK(llm?.activeContext)} sub={llm?.activeContextTs != null ? new Date(llm.activeContextTs).toLocaleTimeString() : undefined} valueColor="var(--color-accent)" />
+            </div>
+
+            {/* Admits breakdown (DS4 only) */}
+            <div className="llm-stat-grid" style={{ marginBottom: "0.75rem" }}>
+              <StatCardIf show={llm?.admitsCold != null} label="Admits: cold" value={fmtInt(llm?.admitsCold)} valueColor="var(--color-danger)" />
+              <StatCardIf show={llm?.admitsWarm != null} label="Admits: warm" value={fmtInt(llm?.admitsWarm)} valueColor="var(--color-success)" />
+              <StatCardIf show={llm?.admitsFork != null} label="Admits: fork" value={fmtInt(llm?.admitsFork)} valueColor="var(--color-accent)" />
+              <StatCardIf show={llm?.admitsPartialFork != null} label="Admits: p.fork" value={fmtInt(llm?.admitsPartialFork)} valueColor="var(--color-warning)" />
+              <StatCardIf show={llm?.admitsPartialTruncate != null} label="Admits: p.trunc" value={fmtInt(llm?.admitsPartialTruncate)} valueColor="var(--color-warning)" />
+              <StatCardIf show={llm?.requestsStarted != null} label="Requests" value={fmtInt(llm?.requestsStarted)} sub={llm?.requestsCompleted != null ? `${llm.requestsCompleted} done` : undefined} valueColor="var(--color-text)" />
+            </div>
+
+          </div>
 
           {/* ── vLLM-specific metric tiles (unchanged) ─────── */}
           {(llm?.backend === "vllm" || llm?.backend === "sglang") && (
