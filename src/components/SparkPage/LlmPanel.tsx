@@ -867,6 +867,7 @@ export function LlmPanel({
             <CompactCard label="Banks Total" value={fmtInt(banksTotal)} />
             <CompactCard label="KV Pages" value={fmtInt(llm?.kvPagesResident)} />
             <CompactCard label="Warm Records" value={fmtInt(llm?.warmRecords)} />
+            <CompactCard label="GPU Mem" value={pct(llm?.gpuMemoryUtilization, 1)} color={llm?.gpuMemoryUtilization != null && llm.gpuMemoryUtilization >= 0.9 ? "var(--color-danger)" : llm?.gpuMemoryUtilization != null && llm.gpuMemoryUtilization >= 0.7 ? "var(--color-accent)" : "var(--color-success)"} />
             {/* Context metrics */}
             <CompactCard label="Active Context" value={fmtInt(llm?.activeContext)} />
             <CompactCard label="Context Used" value={llm?.contextUsedBytes != null ? `${(llm.contextUsedBytes / 1e9).toFixed(1)}GB` : "\u2014"} />

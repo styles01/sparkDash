@@ -47,6 +47,16 @@ sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)
 
 ## Latest version changelog
 
+### Version 1.7.0 — DS4 CUDA telemetry, synthwave theme, 42-card grid
+- **DS4 CUDA Engine support** — full telemetry for Entrpi/ds4-on-spark v0.6.2: DSpark acceptance, banks/lanes, memory census, reasoning effort, active context, provenance ("Built by @bleysg")
+- **Synthwave theme** — purple/magenta/green temperature scale color spectrum for LLM panel
+- **Radial odometers** — Avg & Peak tok/s as car-speedometer gauges (max=100)
+- **42-card advanced grid** — all available metrics in dense 8-column layout
+- **Config & provenance at top** — engine type, model, author accreditation, config badges, collapsible params
+- **Per-position spec decode** — always visible, synthesized for DS4 from overall ratio
+- **Backend-adaptive panel** — cards populate from data availability, not hardcoded backend names
+- **Graph yMax=100** — throughput scale capped at 100 tok/s
+
 ### Version 1.6.0 — ComfyUI monitoring & compact default
 - **ComfyUI** — opt-in per Spark (port 8188): live jobs, progress, last run, cancel, queue ETA, Open on LAN IP, model inventory
 - **Overview** — Comfy status chip (`idle` / `run` / `Nq`)
@@ -64,7 +74,7 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Multi-unit** | Any number of Sparks; each has a tabbed detail page plus a shared Overview |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, or ds4-server; live tok/s per server |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, or ds4-server; 40+ live telemetry metrics, per-position spec decode, radial odometers, provenance/accreditation |
 | **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
 | **Decode benchmark** | Multi-concurrency streaming decode tok/s (server + per-stream), persisted last run |
 | **Prompt Showcase** | Full-page multi-terminal LLM streaming demo (up to 32 prompts) with live tok/s and copy-out |
@@ -75,7 +85,7 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Power controls** | Graceful shutdown (SSH host script) and Wake-on-LAN; batch actions on Overview |
 | **Spark roles** | **Head** / **Worker** / **Standalone** — worker label + head link; standalone can disable LLM monitoring |
 | **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s), GPU/CPU split, bandwidth via `nvidia-smi dmon` |
-| **Themes** | Dark, light, cool white, OLED — neutral palettes, persisted in `localStorage` |
+| **Themes** | Dark, light, cool white, OLED, **Synthwave** (purple/magenta/green temperature scale) — persisted in `localStorage` |
 | **Secrets** | SSH passwords AES-256-GCM encrypted; never in `sparks.json` or API responses |
 | **Docker-first** | Single privileged container for host metrics; prod and dev Compose files |
 | **Hot config** | Add / edit / remove / reorder Sparks from the UI with no process restart |
@@ -326,6 +336,9 @@ Header theme control cycles:
 | **Light** | Warm paper whites |
 | **White** | Cool neutral whites |
 | **OLED** | True black for OLED panels |
+| **Synthwave** | Purple/magenta/green temperature scale — no red/orange/yellow. Brightness conveys intensity. Neon green = fast, hot pink = medium, purple = slow. Cyan = latency/cool metrics. |
+
+> **Synthwave theme** — a custom color spectrum designed for at-a-glance LLM telemetry. Instead of red/green/yellow, it uses a temperature scale: purple/blue (cold/slow) → magenta/pink (warm/medium) → neon green (hot/fast). Cyan represents latency and cool metrics. The entire LLM panel — stat cards, gauges, charts, sparklines — follows this spectrum so you can read performance by color alone.
 
 Choice is stored in `localStorage`.
 
@@ -382,10 +395,46 @@ Name, IP, SSH credentials, LLM port, and device/interface filters update the run
 Each configured LLM port gets its own `LlmProbe` instance running in parallel. Probes auto-detect backends:
 
 - **llama.cpp** — `/slots` for live decode rates; model from `/props`
-- **ds4-server** (Entrpi/ds4-on-spark) — `/v1/models` (`owned_by: ds4.c`) + Prometheus `ds4_*` token counters for live tok/s
-- **vLLM / sglang** — `/v1/models`; sglang via `/get_server_info` (`last_gen_throughput` when metrics off), vLLM via Prometheus `/metrics` counters (scientific notation supported)
+- **DS4 CUDA Engine** (Entrpi/ds4-on-spark, v0.6.2) — `/v1/models` (`owned_by: ds4.c`) + Prometheus `ds4_*` counters; DSpark spec decode, memory census, bank/lane tracking, log-tailing for reasoning effort + active context
+- **vLLM** — `/v1/models` + Prometheus `/metrics` counters (scientific notation supported); TTFT/E2E/ITL p95 from histograms, per-position spec decode acceptance, KV cache, prefix cache, preemptions
+- **SGLang** — `/v1/models` + `/get_server_info` (`last_gen_throughput` when metrics off) or Prometheus `/metrics`; DFlash acceptance, prefill cached/computed, active context, peak aggregate
 
 Rates are derived from per-probe cumulative counter diffs (or SGLang sticky throughput while it moves). Multiple ports can be added or removed at runtime without restarting the monitor.
+
+### LLM Telemetry Panel
+
+The LLM panel provides a dense, Grafana-style telemetry view with 40+ live metrics. A redesigned layout (top to bottom):
+
+<img src="./assets/telemetry-screenshot.jpg" alt="SparkDash LLM telemetry panel showing DS4 CUDA engine metrics — config/provenance, radial odometers, gauge arcs, throughput/latency/spec decode charts, 42 compact stat cards">
+
+1. **Header bar** — backend badge (vLLM / SGLang / DS4), model name, port, thinking indicator
+2. **Config & Provenance** — engine type, model name, author accreditation ("Built by @bleysg"), container/build image, config badges (context, lanes, spec decode method, quantization, prefix caching), collapsible params section
+3. **Hero stats** — Decode tok/s (sparkline card), Aggregate tok/s (sparkline card), Avg tok/s (radial odometer, max=100), Peak tok/s (radial odometer, max=100)
+4. **Gauge arcs** — Spec Accept %, Active Lanes (live/total), KV Cache %, Reasoning effort
+5. **Chart row** — Throughput (decode + prefill, yMax=100), Latency (TTFT + E2E), Speculative Decode (per-position acceptance bars — Pos 0, Pos 1, Pos 2)
+6. **Advanced stats** — 42 compact cards in an 8-column grid: TTFT, E2E, ITL p95, TTFT p95, E2E p95, Running, Waiting, Prefix Hit, Preempts, Uptime, Total Tokens, Spec Accept, GPU Mem, KV Cache, Active Context, Decode Steps, Tok/Step, Spec Drafts, Spec Hits, Spec Quench, Warm Records, KV Pages, Derived Artifacts, Prefill Cached, Prefill Computed, Admits Cold/Warm/Fork, Requests Started/Completed/Failed/Inflight, and more
+7. **Actions** — Run decode benchmark, Open showcase
+
+#### Three supported backends
+
+The probe auto-detects which inference engine is running and adapts the telemetry accordingly. All three backends share the same panel — cards populate from whatever data is available.
+
+| Backend | Detection | Metrics source | Key metrics |
+|---------|-----------|----------------|-------------|
+| **vLLM** | `/v1/models` → `owned_by` not ds4/sglang; falls back to Prometheus `/metrics` counters | Prometheus `/metrics` (vLLM native counters + histograms) | Generation tok/s, prefill tok/s, KV cache %, TTFT/E2E/ITL p95 (from histograms), prefix cache hit rate, preemptions, MTP acceptance, per-position spec decode acceptance (`spec_decode_num_accepted_tokens_per_pos_total`), GPU memory utilization, recipe info from `/proc` cmdline + chat template |
+| **SGLang** | `/v1/models` → `/get_server_info` (`last_gen_throughput`); or Prometheus `/metrics` | SGLang `/metrics` or `/get_server_info` | Generation tok/s, prefill tok/s, DFlash acceptance, total tokens, tok/step, decode steps, prefill cached/computed, requests, active context, peak aggregate, TTFT/E2E/ITL p95 (from SGLang histograms) |
+| **DS4 CUDA Engine** | `/v1/models` → `owned_by: "ds4.c"`; fallback: `/metrics` regex `ds4_tokens_decoded_total` | DS4 Prometheus `/metrics` (`ds4_*` prefix) + `/v1/models` for model info | Generation tok/s, prefill tok/s, DSpark acceptance ratio, spec drafts/hits/quench, banks live/total (lanes), KV cache usage (from memory census `ds4_memory_bytes`), GPU memory utilization (from memory census), prefix cache hit rate (prefillCached / total), TTFT (estimated from prefill rate), ITL p95 (1/perStreamAvg), E2E latency, reasoning effort (from log tailing), active context (from log tailing), uptime, admits (cold/warm/fork/partial), warm records, KV pages resident, derived artifacts, tok/step, per-position spec decode (synthesized from overall ratio via geometric decay) |
+
+**Backend-adaptive design:** The panel renders cards based on data availability, not hardcoded backend names. If a metric is null for one backend but available for another, the card shows "—" (em dash) — no panels are deleted or gated per-backend. This means switching from vLLM to DS4 to SGLang doesn't break the panel; it just populates different cards.
+
+**DS4-specific derivations:** Since the DS4 CUDA engine doesn't expose vLLM-style histograms or per-position spec decode breakdowns, several metrics are derived:
+- **TTFT** — estimated from prompt tokens / prefill rate (with rolling window fallback)
+- **ITL p95** — approximated as 1 / perStreamAvg (inter-token latency)
+- **kvCacheUsage** — from `ds4_memory_bytes{class="kv_primary"}` / 121GB
+- **gpuMemoryUtilization** — from total `ds4_memory_bytes{domain="unified_device"}` / 121GB
+- **prefixCacheHitRate** — `prefillCached / (prefillCached + prefillComputed)`
+- **perPositionAcceptance** — synthesized from overall DSpark accept ratio using geometric decay (Pos 0 = 100%, Pos N = ratio^N)
+- **reasoningEffort + activeContext** — from DS4 log file tailing (`/tmp/ds4-serve.log`)
 
 ---
 
