@@ -726,13 +726,30 @@ export class LlmProbe {
         // Approximate TTFT: prefill time for the average request.
         // Use counter-based prefill rate (deltaPrefillComputed / dt) instead of
         // the instantaneous prefillTps gauge, which is near-zero between bursts.
+        // When prefillTps is very low or zero (idle), fall back to the rolling
+        // average prefill rate from the DS4 rolling window.
         const prefillRate = dt > 0 && deltaPrefillComputed > 0
             ? deltaPrefillComputed / dt
-            : this.prefillTps;
+            : this.prefillTps > 0
+                ? this.prefillTps
+                : (this._ds4Rolling.length > 0
+                    ? (() => {
+                        // Estimate prefill rate from rolling window tokens and e2e
+                        const last = this._ds4Rolling[this._ds4Rolling.length - 1];
+                        return last && last.e2e > 0 ? last.tokens / last.e2e : 0;
+                      })()
+                    : 0);
+        // Also compute average prompt tokens from cumulative counters as fallback
+        // (used by the rolling-window prefill rate estimation above)
         if (deltaCompleted > 0 && deltaPrefillComputed > 0 && prefillRate > 0) {
           const avgPromptTokens = deltaPrefillComputed / deltaCompleted;
           this.ttft = Math.round((avgPromptTokens / prefillRate) * 1000) / 1000;
           this.ttftP95Seconds = this.ttft; // best estimate (no histogram)
+        } else if (this.rollingAvgTtft != null && this.rollingAvgTtft > 0) {
+          // Use rolling average TTFT from prior cycles — more reliable than
+          // a cumulative estimate when prefill rate is very low or zero.
+          this.ttft = this.rollingAvgTtft;
+          this.ttftP95Seconds = this.rollingAvgTtft;
         }
 
         // Approximate E2E: TTFT + decode time for avg request.
@@ -784,6 +801,47 @@ export class LlmProbe {
           this.rollingAvgTtft = Math.round((sumTtft / n) * 1000) / 1000;
           this.rollingAvgTokensPerReq = Math.round((sumTokens / n) * 100) / 100;
           this.rollingAvgTpsPerSlot = Math.round((sumTps / n) * 100) / 100;
+        }
+
+        // ── Derive prefixCacheHitRate from prefill counters ──
+        // hit rate = prefillCached / (prefillCached + prefillComputed)
+        if (this.prefillCached != null && this.prefillComputed != null) {
+          const total = this.prefillCached + this.prefillComputed;
+          this.prefixCacheHitRate =
+            total > 0 ? Math.round((this.prefillCached / total) * 10000) / 10000 : null;
+        }
+
+        // ── Derive itlP95Seconds ≈ 1 / perStreamAvg (inter-token latency) ──
+        if (this.perStreamAvg != null && this.perStreamAvg > 0) {
+          this.itlP95Seconds = Math.round((1 / this.perStreamAvg) * 1000) / 1000;
+        } else if (this.generationTps > 0) {
+          // Fallback: use aggregate generation rate
+          this.itlP95Seconds = Math.round((1 / this.generationTps) * 1000) / 1000;
+        }
+
+        // ── Derive kvCacheUsage and gpuMemoryUtilization from DS4 memory census ──
+        // ds4_memory_bytes{domain="unified_device",class="kv_primary",state="allocated"}
+        // = KV cache live bytes on device.
+        // gpuMemoryUtilization = total unified_device allocated / 121GB
+        const kvBytes = this._getDs4MultiLabeledMetric(txt,
+            "ds4_memory_bytes",
+            { domain: "unified_device", class: "kv_primary", state: "allocated" });
+        if (kvBytes != null && kvBytes > 0) {
+          this.kvCacheUsage = Math.round((kvBytes / DS4_DEVICE_MEMORY_BYTES) * 10000) / 10000;
+        }
+        // gpuMemoryUtilization: sum all unified_device allocated bytes / 121GB
+        const totalDeviceAllocated = this._getDs4MemoryDomainTotal(txt, "unified_device", "allocated");
+        if (totalDeviceAllocated != null && totalDeviceAllocated > 0) {
+          this.gpuMemoryUtilization = Math.round((totalDeviceAllocated / DS4_DEVICE_MEMORY_BYTES) * 10000) / 10000;
+        }
+
+        // ── Derive perPositionAcceptance as single-element array from overall ratio ──
+        // DS4 doesn't break down spec acceptance by position, so we provide a
+        // single-element array so the spec decode graph always has data.
+        if (this.dsparkAcceptRatio != null) {
+          this.perPositionAcceptance = [Math.round(this.dsparkAcceptRatio * 10000) / 10000];
+        } else if (this.specHits != null && this.specDrafts != null && this.specDrafts > 0) {
+          this.perPositionAcceptance = [Math.round((this.specHits / this.specDrafts) * 10000) / 10000];
         }
 
         // Aggregate decode TPS alias
