@@ -760,12 +760,16 @@ export function LlmPanel({
             {llm?.posture && <span className={`llm-posture llm-posture--${llm.posture.level}`}><span className="llm-posture__dot" />{llm.posture.label}</span>}
             {llm?.modelId && <span className="min-w-0 flex-1 truncate text-[11px] text-text" title={llm.modelId}>{llm.modelId}</span>}
             <span className="shrink-0 font-tabular text-[10px] text-muted">:{llmPort}</span>
-            {(isThinking || isPrefilling) && (
-              <span className={`llm-thinking-badge llm-thinking-badge--active ${isPrefilling ? "llm-thinking-badge--prefill" : ""}`}>
-                <span className="llm-thinking-pulse" />
-                <span className="llm-thinking-label">{isPrefilling ? "PREFILL" : "THINKING"}</span>
-              </span>
-            )}
+            {(() => {
+              const active = isThinking || isPrefilling;
+              const label = isPrefilling ? "PREFILLING" : "ACTIVELY THINKING";
+              return (
+                <span className={`llm-thinking-badge ${active ? "llm-thinking-badge--active" : "llm-thinking-badge--idle"} ${isPrefilling ? "llm-thinking-badge--prefill" : ""}`}>
+                  <span className="llm-thinking-pulse" />
+                  <span className="llm-thinking-label">{label}</span>
+                </span>
+              );
+            })()}
           </div>
 
           {/* ═══ ROW 2 — CONFIG / PROVENANCE SECTION (moved to top) ═══ */}

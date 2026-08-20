@@ -3579,3 +3579,20 @@ html {
 }
 
 
+
+/* ── Thinking badge idle state ── */
+.llm-thinking-badge--idle {
+  opacity: 0.25;
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--color-muted, #888);
+  box-shadow: none;
+}
+.llm-thinking-badge--idle .llm-thinking-pulse {
+  animation: none;
+  background: var(--color-muted, #888);
+  opacity: 0.4;
+}
+.llm-thinking-badge--idle .llm-thinking-label {
+  letter-spacing: 0.5px;
+}
