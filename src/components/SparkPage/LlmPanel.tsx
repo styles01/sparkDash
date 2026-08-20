@@ -646,13 +646,13 @@ export function LlmPanel({
   const specDecodeBars: { label: string; value: number }[] = (() => {
     // vLLM path: use actual per-position data
     if (perPos.length > 0) {
-      return perPos.slice(0, 4).map((p, i) => ({ label: `Pos ${i}`, value: p }));
+      return perPos.map((p, i) => ({ label: `Pos ${i}`, value: p }));
     }
     // DS4 path: synthesize per-position from overall acceptance ratio
     // Determine k (number of draft positions) from spec decode method or default to 2
     const specMethod = llm?.recipeInfo?.specDecodeMethod ?? "";
     const kMatch = specMethod.match(/k=(\d+)/);
-    const k = kMatch ? Math.min(parseInt(kMatch[1]), 4) : 2; // default k=2 for DSpark
+    const k = kMatch ? parseInt(kMatch[1]) : 2; // default k=2 for DSpark, no cap (supports up to 15+)
     // Get overall acceptance ratio
     let overallRate: number | null = null;
     if (specHits != null && specDrafts != null && specDrafts > 0) {
@@ -811,7 +811,7 @@ export function LlmPanel({
             </div>
             <div className="llm-chart-block llm-specdecode-block">
               <div className="llm-chart-title">Speculative Decode <span className="llm-chart-sub">{specDecodeLabel} · acceptance</span></div>
-              <div className="llm-hbar-grid">
+              <div className={specDecodeBars.length > 6 ? "llm-hbar-grid llm-hbar-grid-multi" : "llm-hbar-grid"}>
                 {specDecodeBars.map((bar, i) => (
                   <HorizontalBar key={i} label={bar.label} value={pct(bar.value, 0)} pct={bar.value * 100} color={mtpColor(bar.value)} />
                 ))}

@@ -3510,3 +3510,15 @@ html {
     grid-template-columns: repeat(4, 1fr) !important;
   }
 }
+
+/* ── Multi-column spec decode bars (k>6) ── */
+.llm-hbar-grid-multi {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 2px 8px;
+}
+@media (min-width: 900px) {
+  .llm-hbar-grid-multi {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
