@@ -141,6 +141,14 @@ export function MoonStarIcon({ className = "" }: { className?: string }) {
   );
 }
 
+export function ZapIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg {...baseProps(className)}>
+      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10" />
+    </svg>
+  );
+}
+
 export function EditIcon({ className = "" }: { className?: string }) {
   return (
     <svg {...baseProps(className)}>
