@@ -514,6 +514,10 @@ export function LlmPanel({
   const isThinking = available &&
     ((llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0) &&
     (llm?.generationTps ?? 0) < 1;
+  const isPrefilling = available &&
+    ((llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0) &&
+    (llm?.generationTps ?? 0) < 1 &&
+    ((llm?.prefillTps ?? 0) > 0 || (llm?.activeContext ?? 0) > 0);
 
   useEffect(() => {
     if (!showSettings) {
@@ -756,7 +760,12 @@ export function LlmPanel({
             {llm?.posture && <span className={`llm-posture llm-posture--${llm.posture.level}`}><span className="llm-posture__dot" />{llm.posture.label}</span>}
             {llm?.modelId && <span className="min-w-0 flex-1 truncate text-[11px] text-text" title={llm.modelId}>{llm.modelId}</span>}
             <span className="shrink-0 font-tabular text-[10px] text-muted">:{llmPort}</span>
-            {isThinking && <span className="llm-thinking-badge"><span className="llm-thinking-pulse" />THINKING</span>}
+            {(isThinking || isPrefilling) && (
+              <span className={`llm-thinking-badge llm-thinking-badge--active ${isPrefilling ? "llm-thinking-badge--prefill" : ""}`}>
+                <span className="llm-thinking-pulse" />
+                <span className="llm-thinking-label">{isPrefilling ? "PREFILL" : "THINKING"}</span>
+              </span>
+            )}
           </div>
 
           {/* ═══ ROW 2 — CONFIG / PROVENANCE SECTION (moved to top) ═══ */}
@@ -765,7 +774,7 @@ export function LlmPanel({
           {/* ═══ ROW 3 — HERO STATS (4 cards: 2 spark + 2 odometer) ═══ */}
           <div className="llm-hero-grid">
             <StatSparkCard label="Decode tok/s" value={fmtNum(displayGenTps, 1)} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
-            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayAggTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)}`} color={tpsColor(displayAggTps)} sparkData={sparkAgg} />
+            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayGenTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)}`} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
             <OdometerCard label="Avg tok/s" value={displaySingleTps} max={100} displayValue={fmtNum(displaySingleTps, 1)} color={tpsColor(displaySingleTps)} sparkData={sparkSingle} />
             <OdometerCard label="Peak tok/s" value={displayPeak} max={100} displayValue={fmtNum(displayPeak, 1)} color={tpsColor(displayPeak)} sparkData={sparkPeak} />
           </div>
@@ -803,7 +812,7 @@ export function LlmPanel({
           <div className="llm-chart-row">
             <div className="llm-chart-block">
               <div className="llm-chart-title">Throughput <span className="llm-chart-sub">decode + prefill · last 60</span></div>
-              <TelemetryChart series={[genSeries, preSeries]} maxPoints={HISTORY} height={110} yUnit="" yUnitRight="" yMin={0} yMax={100} yMaxRight={100} />
+              <TelemetryChart series={[genSeries, preSeries]} maxPoints={HISTORY} height={110} yUnit="" yUnitRight="" yMin={0} yMax={100} yMaxRight={2000} />
             </div>
             <div className="llm-chart-block">
               <div className="llm-chart-title">Latency <span className="llm-chart-sub">TTFT + E2E · seconds</span></div>
@@ -819,6 +828,11 @@ export function LlmPanel({
               {specHits != null && specDrafts != null && (
                 <div className="llm-specdecode-counters font-tabular">
                   <span className="text-muted text-[10px]">{fmtInt(specHits)} hits / {fmtInt(specDrafts)} drafts</span>
+                </div>
+              )}
+              {perPos.length === 0 && (
+                <div className="llm-specdecode-note">
+                  <span className="text-muted text-[9px]">⚠️ {llm?.backend === "ds4" ? "DS4 reports aggregate acceptance only — per-position bars are estimated from overall ratio (geometric decay)" : "No per-position breakdown available — bars estimated from overall ratio"}</span>
                 </div>
               )}
             </div>

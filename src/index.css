@@ -3385,7 +3385,7 @@ html {
   text-align: right;
 }
 
-/* Thinking badge */
+/* Thinking badge — prominent in-header indicator */
 .llm-thinking-badge {
   display: inline-flex;
   align-items: center;
@@ -3399,12 +3399,43 @@ html {
   background: color-mix(in srgb, var(--color-accent) 15%, transparent);
   color: var(--color-accent);
 }
+/* Active state: right-aligned, bigger, with pulsing background glow */
+.llm-thinking-badge--active {
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+  animation: llm-thinking-glow 1.8s ease-in-out infinite;
+}
 .llm-thinking-pulse {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: currentColor;
   animation: llm-pulse 1.2s ease-in-out infinite;
+}
+.llm-thinking-badge--active .llm-thinking-pulse {
+  width: 8px;
+  height: 8px;
+  animation: llm-thinking-dot 1.2s ease-in-out infinite;
+}
+.llm-thinking-label {
+  white-space: nowrap;
+}
+@keyframes llm-thinking-glow {
+  0%, 100% {
+    box-shadow: 0 0 6px 0 color-mix(in srgb, currentColor 20%, transparent);
+    background: color-mix(in srgb, currentColor 6%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 14px 2px color-mix(in srgb, currentColor 45%, transparent);
+    background: color-mix(in srgb, currentColor 16%, transparent);
+  }
+}
+@keyframes llm-thinking-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.7); }
 }
 
 /* Actions */
@@ -3522,3 +3553,29 @@ html {
     grid-template-columns: repeat(3, 1fr);
   }
 }
+
+/* ── Prefill variant — pink/magenta (synthwave warm) ── */
+.llm-thinking-badge--prefill {
+  color: #f472b6;
+}
+.llm-thinking-badge--prefill .llm-thinking-pulse {
+  background: #f472b6;
+}
+/* ── Thinking (non-prefill) — purple (synthwave cold/slow) ── */
+.llm-thinking-badge--active:not(.llm-thinking-badge--prefill) {
+  color: #c084fc;
+}
+.llm-thinking-badge--active:not(.llm-thinking-badge--prefill) .llm-thinking-pulse {
+  background: #c084fc;
+}
+
+/* ── Spec decode note ── */
+.llm-specdecode-note {
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--color-surface-elevated, rgba(255,255,255,0.04));
+  border: 1px solid var(--color-border, rgba(255,255,255,0.08));
+}
+
+
