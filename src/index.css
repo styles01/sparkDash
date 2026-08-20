@@ -153,6 +153,42 @@
   --shell-gradient: linear-gradient(180deg, #000000 0%, #0a0a0a 100%);
 }
 
+/* ─── Synthwave theme (neon) ──────────────────────────── */
+[data-theme="synthwave"] {
+  --color-base: #050505;
+  --color-surface: #0a0a0a;
+  --color-surface-elevated: #111111;
+  --color-surface-hover: #1a1a1a;
+  --color-border: #222222;
+  --color-border-strong: #333333;
+  --color-text: #e0e0e0;
+  --color-text-strong: #ffffff;
+  --color-muted: #8a8a8a;
+  --color-muted-strong: #b0b0b0;
+  --color-accent: #00d4ff;
+  --color-accent-hover: #33ddff;
+  --color-accent-soft: rgba(0, 212, 255, 0.15);
+  --color-danger: #ff007f;
+  --color-warning: #00d4ff;
+  --color-success: #39ff14;
+  --color-info: #00d4ff;
+  --color-grid: rgba(0, 212, 255, 0.04);
+
+  --toggle-track-off: #2a2a2a;
+  --toggle-track-on: var(--color-accent);
+  --toggle-dot: #e4e4e4;
+
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--color-border);
+  --shadow-card-hover: 0 6px 20px rgba(0, 0, 0, 0.55), 0 0 0 1px var(--color-border-strong);
+  --shadow-shell: 0 30px 80px rgba(0, 0, 0, 0.6);
+
+  --color-surface-glass: color-mix(in srgb, var(--color-surface) 72%, transparent);
+  --color-card-glass: color-mix(in srgb, var(--color-surface-elevated) 60%, transparent);
+
+  --body-gradient: linear-gradient(160deg, #050505 0%, #08080a 40%, #101010 100%);
+  --shell-gradient: linear-gradient(180deg, #0a0a0a 0%, #121212 100%);
+}
+
 /* ─── Density tokens (layout spacing) ───────────────────── */
 /* Compact is the default (matches server settings DEFAULTS.density).
    Comfortable is the roomier override. Both density attribute blocks sit
@@ -234,6 +270,10 @@ html {
 }
 
 [data-theme="oled"] {
+  color-scheme: dark;
+}
+
+[data-theme="synthwave"] {
   color-scheme: dark;
 }
 
@@ -346,35 +386,42 @@ input:disabled {
 
 /* In dark themes the pill reads better without the warm tint */
 [data-theme="dark"] .pill-nav,
-[data-theme="oled"] .pill-nav {
+[data-theme="oled"] .pill-nav,
+[data-theme="synthwave"] .pill-nav {
   background: var(--color-surface-elevated);
 }
 
 /* In dark themes the active tab & logo pill should use a subtle dark bg */
 [data-theme="dark"] .pill-item.is-active,
-[data-theme="oled"] .pill-item.is-active {
+[data-theme="oled"] .pill-item.is-active,
+[data-theme="synthwave"] .pill-item.is-active {
   background: var(--color-surface-hover);
   color: var(--color-text);
 }
 [data-theme="dark"] .pill-item-with-handle.is-active,
-[data-theme="oled"] .pill-item-with-handle.is-active {
+[data-theme="oled"] .pill-item-with-handle.is-active,
+[data-theme="synthwave"] .pill-item-with-handle.is-active {
   background: var(--color-surface-hover);
 }
 [data-theme="dark"] .pill-item-with-handle.is-active .pill-label,
-[data-theme="oled"] .pill-item-with-handle.is-active .pill-label {
+[data-theme="oled"] .pill-item-with-handle.is-active .pill-label,
+[data-theme="synthwave"] .pill-item-with-handle.is-active .pill-label {
   color: var(--color-text);
 }
 [data-theme="dark"] .pill-item-with-handle.is-active .pill-handle,
-[data-theme="oled"] .pill-item-with-handle.is-active .pill-handle {
+[data-theme="oled"] .pill-item-with-handle.is-active .pill-handle,
+[data-theme="synthwave"] .pill-item-with-handle.is-active .pill-handle {
   color: var(--color-text);
 }
 [data-theme="dark"] .logo-pill,
-[data-theme="oled"] .logo-pill {
+[data-theme="oled"] .logo-pill,
+[data-theme="synthwave"] .logo-pill {
   background: var(--color-surface-hover);
   color: var(--color-text);
 }
 [data-theme="dark"] .logo-pill-dash,
-[data-theme="oled"] .logo-pill-dash {
+[data-theme="oled"] .logo-pill-dash,
+[data-theme="synthwave"] .logo-pill-dash {
   color: var(--color-text);
 }
 
@@ -909,6 +956,9 @@ input[type="checkbox"] {
 [data-theme="oled"] .settings-panel {
   background: #0a0a0a;
 }
+[data-theme="synthwave"] .settings-panel {
+  background: #1a1a1a;
+}
 .settings-overlay.is-open .settings-panel {
   transform: translateY(0) scale(1);
   opacity: 1;
@@ -968,6 +1018,10 @@ input[type="checkbox"] {
 }
 [data-theme="oled"] .modal-sheet {
   background: #0a0a0a;
+}
+[data-theme="synthwave"] .modal-sheet {
+  background: #0a0a0a;
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.55);
 }
 @media (min-width: 640px) {
   .modal-sheet {
@@ -1080,6 +1134,10 @@ input[type="checkbox"] {
 [data-theme="oled"] .bench-sheet {
   background: #0a0a0a;
   box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.8);
+}
+[data-theme="synthwave"] .bench-sheet {
+  background: #0a0a0a;
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.55);
 }
 @media (min-width: 640px) {
   .bench-sheet {
@@ -1209,7 +1267,8 @@ input[type="checkbox"] {
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
 [data-theme="dark"] .bench-conc-btn,
-[data-theme="oled"] .bench-conc-btn {
+[data-theme="oled"] .bench-conc-btn,
+[data-theme="synthwave"] .bench-conc-btn {
   background: var(--color-surface-elevated);
 }
 .bench-conc-btn:hover:not(:disabled):not(.is-on) {
@@ -1243,7 +1302,8 @@ input[type="checkbox"] {
   outline: none;
 }
 [data-theme="dark"] .bench-input,
-[data-theme="oled"] .bench-input {
+[data-theme="oled"] .bench-input,
+[data-theme="synthwave"] .bench-input {
   background: var(--color-surface-elevated);
 }
 .bench-input:focus {
@@ -1263,7 +1323,8 @@ input[type="checkbox"] {
   background: #ffffff;
 }
 [data-theme="dark"] .bench-progress,
-[data-theme="oled"] .bench-progress {
+[data-theme="oled"] .bench-progress,
+[data-theme="synthwave"] .bench-progress {
   background: var(--color-surface-elevated);
 }
 .bench-progress__row {
@@ -1342,7 +1403,8 @@ input[type="checkbox"] {
   background: #ffffff;
 }
 [data-theme="dark"] .bench-results,
-[data-theme="oled"] .bench-results {
+[data-theme="oled"] .bench-results,
+[data-theme="synthwave"] .bench-results {
   background: var(--color-surface-elevated);
 }
 .bench-results__caption {
@@ -2675,7 +2737,7 @@ html {
 /* Moving averages */
 .llm-ma-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 8px;
 }
 .llm-ma-card {
@@ -3117,4 +3179,334 @@ html {
 .recipe-param-badge-stat--danger {
   background: color-mix(in srgb, var(--color-danger) 15%, var(--color-surface));
   color: var(--color-danger);
+}/* ─── LLM PANEL GRID LAYOUT ───────────────────────────────── */
+.llm-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px;
+}
+.llm-gauge-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 2px;
+}
+.llm-chart-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+}
+.llm-hbar-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.llm-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 2px;
+}
+@media (max-width: 640px) {
+  .llm-hero-grid { grid-template-columns: repeat(3, 1fr); }
+  .llm-gauge-row { grid-template-columns: repeat(3, 1fr); }
+  .llm-chart-row { grid-template-columns: 1fr; }
+  .llm-advanced-grid { grid-template-columns: repeat(3, 1fr); }
+}
+/* ─── LLM PANEL: COMPONENT STYLES (previously undefined) ─── */
+
+/* Sparkline */
+.llm-sparkline {
+  display: block;
+}
+
+/* Arc gauge container */
+.llm-arc-gauge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.llm-arc-gauge-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
+  margin-top: 2px;
+  text-align: center;
+}
+
+/* Gauge card wrapper */
+.llm-gauge-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  min-height: 0;
+}
+.llm-gauge-card-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-muted-strong);
+  text-align: center;
+}
+.llm-gauge-card-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Stat spark card */
+.llm-stat-spark-card {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  min-height: 0;
+}
+.llm-stat-spark-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
+  margin-bottom: 2px;
+}
+.llm-stat-spark-value {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--color-text);
+  transition: color 0.3s ease;
+}
+.llm-stat-spark-sub {
+  font-size: 10px;
+  color: var(--color-muted);
+  margin-top: 1px;
+}
+.llm-stat-sparkline-wrap {
+  margin-top: 4px;
+}
+
+/* Odometer card (radial gauge for tok/s) */
+.llm-odometer-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  min-height: 0;
+}
+.llm-odometer-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
+  margin-bottom: 2px;
+}
+.llm-odometer-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+}
+.llm-odometer-spark {
+  width: 100%;
+  margin-top: 2px;
+}
+
+/* Advanced stat compact cards */
+.llm-adv-card {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  min-height: 0;
+  overflow: hidden;
+}
+.llm-adv-label {
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.llm-adv-val {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Horizontal bar */
+.llm-hbar {
+  display: grid;
+  grid-template-columns: 50px 1fr 40px;
+  align-items: center;
+  gap: 6px;
+}
+.llm-hbar-label {
+  font-size: 10px;
+  color: var(--color-muted);
+  text-align: right;
+}
+.llm-hbar-track {
+  height: 8px;
+  border-radius: 9999px;
+  background: var(--color-border);
+  overflow: hidden;
+}
+.llm-hbar-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width 0.4s ease, background 0.3s ease;
+}
+.llm-hbar-val {
+  font-size: 10px;
+  color: var(--color-text);
+  text-align: right;
+}
+
+/* Thinking badge */
+.llm-thinking-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: color-mix(in srgb, var(--color-accent) 15%, transparent);
+  color: var(--color-accent);
+}
+.llm-thinking-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: llm-pulse 1.2s ease-in-out infinite;
+}
+
+/* Actions */
+.llm-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.llm-action-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text);
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.llm-action-btn:hover {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+/* Spec decode block counters */
+.llm-specdecode-counters {
+  margin-top: 6px;
+  text-align: center;
+}
+
+/* ─── CONFIG / PROVENANCE SECTION (top of LLM panel) ─── */
+.llm-config-section {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.llm-provenance-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.llm-config-model {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-text);
+  line-height: 1.2;
+}
+.llm-provenance-author {
+  font-size: 11px;
+  color: var(--color-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.llm-provenance-container {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+
+/* Params toggle */
+.llm-config-params-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.llm-config-params-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-muted-strong);
+  width: fit-content;
+}
+.llm-config-params-toggle:hover {
+  color: var(--color-accent);
+}
+.llm-config-params-toggle-icon {
+  font-size: 9px;
+}
+
+/* ─── DENSE ADVANCED GRID: more columns for 30+ cards ─── */
+.llm-advanced-grid {
+  grid-template-columns: repeat(8, 1fr) !important;
+}
+@media (max-width: 640px) {
+  .llm-advanced-grid {
+    grid-template-columns: repeat(4, 1fr) !important;
+  }
 }

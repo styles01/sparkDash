@@ -1,9 +1,9 @@
 import { useState, useEffect } from "react";
-import { SunIcon, SunDimIcon, MoonIcon, MoonStarIcon } from "./ui/icons";
+import { SunIcon, SunDimIcon, MoonIcon, MoonStarIcon, ZapIcon } from "./ui/icons";
 
-type Theme = "white" | "light" | "dark" | "oled";
+type Theme = "white" | "light" | "dark" | "oled" | "synthwave";
 
-const THEME_CYCLE: Theme[] = ["white", "light", "dark", "oled"];
+const THEME_CYCLE: Theme[] = ["white", "light", "dark", "oled", "synthwave"];
 
 const STORAGE_KEY = "sparkdash-theme";
 
@@ -35,7 +35,9 @@ export function ThemeSwitch() {
         ? SunDimIcon
         : theme === "dark"
           ? MoonIcon
-          : MoonStarIcon;
+          : theme === "oled"
+            ? MoonStarIcon
+            : ZapIcon;
 
   return (
     <button
