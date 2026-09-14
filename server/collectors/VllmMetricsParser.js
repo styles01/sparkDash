@@ -32,6 +32,9 @@ export class VllmMetricsParser {
       prefixQueries: null,
       promptTokensTotal: null,
       genTokensTotal: null,
+      // KV gauge + pool size (for the prefill-rate derivative)
+      kvCacheUsage: null,
+      kvPoolTokens: null,
       // Timestamp of previous poll
       time: 0,
     };
@@ -67,6 +70,13 @@ export class VllmMetricsParser {
     const e2eHist = this._extractHistogram(body, "e2e_request_latency_seconds");
     const promptTokHist = this._extractHistogram(body, "request_prompt_tokens");
     const genTokHist = this._extractHistogram(body, "request_generation_tokens");
+
+    // ─── KV pool size (for the prefill-rate derivative) ────
+    // vLLM exposes the pool size as a LABEL on cache_config_info
+    // (kv_cache_size_tokens="627733"), not as a standalone gauge.
+    const kvPoolTokensGauge = this._extractGauge(body, "gpu_kv_cache_size_tokens") ??
+      this._extractGauge(body, "kv_cache_size_tokens") ??
+      this._extractLabelValue(body, "cache_config_info", "kv_cache_size_tokens");
 
     // ─── Counters (deltas) ────────────────────────────────
     const specAccepted = this._extractCounter(body, "spec_decode_num_accepted_tokens_total");
@@ -120,6 +130,37 @@ export class VllmMetricsParser {
       ? promptTokensDelta / dt
       : 0;
 
+    // ─── Prefill-rate estimate from the KV gauge derivative ──
+    // vLLM increments prompt_tokens_total only when a prompt FULLY
+    // finishes prefilling, so counter deltas measure batch-completion
+    // rate, not prefill rate: a 60K-token prompt shows ~0 for its
+    // whole duration, then one 2-second spike of prompt_size/dt
+    // (~30K tok/s observed). While prefill is actually running, KV
+    // usage climbs every poll — d(kv_usage * pool_tokens)/dt is the
+    // true instantaneous prefill rate. Gate on data availability:
+    // (a) pool size known, (b) requests running, (c) counter flat
+    // (i.e. no prompt completed this cycle). Falls back to the
+    // counter delta otherwise (accurate for small prompts).
+    let prefillRateEstimate = null;
+    if (this._prev.kvPoolTokens == null && kvPoolTokensGauge != null) {
+      this._prev.kvPoolTokens = kvPoolTokensGauge;
+    }
+    const poolTokens = kvPoolTokensGauge ?? this._prev.kvPoolTokens;
+    if (
+      poolTokens != null && poolTokens > 0 &&
+      kvCacheUsage != null && this._prev.kvCacheUsage != null &&
+      dt > 0 &&
+      (runningSlots ?? 0) > 0 &&
+      promptTokensDelta === 0
+    ) {
+      const kvTokensNow = kvCacheUsage * poolTokens;
+      const kvTokensPrev = this._prev.kvCacheUsage * poolTokens;
+      const kvTokenDelta = kvTokensNow - kvTokensPrev;
+      if (kvTokenDelta > 0) {
+        prefillRateEstimate = kvTokenDelta / dt;
+      }
+    }
+
     // ─── Rolling window (last 10 completed requests) ──────
     // Each histogram count delta tells us how many requests completed.
     // We record one observation per completed request batch using the average.
@@ -160,6 +201,7 @@ export class VllmMetricsParser {
       prefixQueries,
       promptTokensTotal,
       genTokensTotal,
+      kvCacheUsage,
       time: now,
     };
 
@@ -195,6 +237,10 @@ export class VllmMetricsParser {
       // Throughput (from counter deltas)
       generationTpsFromCounters: this._round(generationTpsFromCounters, 2),
       promptTpsFromCounters: this._round(promptTpsFromCounters, 2),
+
+      // Prefill-rate estimate from the KV gauge derivative (see note above);
+      // null when not derivable this cycle.
+      prefillRateEstimate: prefillRateEstimate != null ? this._round(prefillRateEstimate, 2) : null,
 
       // Rolling averages (last 10 completed request batches)
       rolling: {
@@ -232,6 +278,20 @@ export class VllmMetricsParser {
    * Extract a gauge value (sum across all label permutations).
    * @returns {number|null}
    */
+
+  /**
+   * Extract a label value from the first metric line whose name matches.
+   * e.g. _extractLabelValue(body, "cache_config_info", "kv_cache_size_tokens")
+   * returns 627733 for vllm:cache_config_info{...,kv_cache_size_tokens="627733"} 1.0
+   */
+  _extractLabelValue(body, metricName, labelName) {
+    const re = new RegExp("^[^#\\n]*" + metricName + "\\{[^}]*" + labelName + '="([^"]+)"', "m");
+    const m = body.match(re);
+    if (!m) return null;
+    const v = parseFloat(m[1]);
+    return Number.isFinite(v) ? v : null;
+  }
+
   _extractGauge(body, name) {
     return this._extractCounter(body, name);
   }

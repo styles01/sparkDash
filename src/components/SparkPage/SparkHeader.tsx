@@ -24,6 +24,14 @@ export function SparkHeader({ spark, onEdit }: SparkHeaderProps) {
   const online = spark.online;
   const hermes = spark.hermes;
 
+  // Model identity from whichever LLM backend is live on this Spark.
+  const primaryLlm = spark.metrics.llm.find((llm) => llm.available) ?? spark.metrics.llm[0];
+  const liveModel = primaryLlm?.recipeInfo?.modelName ?? primaryLlm?.modelId ?? null;
+  const liveQuant = primaryLlm?.recipeInfo?.quantization ?? null;
+  const liveModelLabel = liveModel
+    ? `${liveModel}${liveQuant ? ` · ${liveQuant}` : ""}`
+    : null;
+
   return (
     <div
       className="spark-header panel flex flex-wrap items-center gap-x-4 gap-y-2"
@@ -73,6 +81,14 @@ export function SparkHeader({ spark, onEdit }: SparkHeaderProps) {
                 </>
               );
             })()}
+            {liveModelLabel && (
+              <span
+                className="max-w-[30rem] shrink min-w-0 truncate rounded bg-success/15 px-1.5 py-0.5 text-[10px] font-medium text-success"
+                title={`Live checkpoint: ${liveModel}${liveQuant ? ` · Quantization: ${liveQuant}` : ""}`}
+              >
+                Model: {liveModelLabel}
+              </span>
+            )}
             {online && spark.uptime != null && (
               <span
                 className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 font-tabular text-[10px] font-medium text-accent"

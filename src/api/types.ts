@@ -360,25 +360,184 @@ export interface LlmMetrics {
   requestsRunning?: number | null;
   /** vLLM waiting request count. null when unavailable. */
   requestsWaiting?: number | null;
-  /** vLLM time-to-first-token p95 in seconds. null when unavailable. */
-  ttftP95Seconds?: number | null;
   /** Live recent-window mean TTFT (seconds) from vLLM histogram sum/count deltas. null when unavailable. */
   ttftSeconds?: number | null;
   /** vLLM cumulative preemption count. null when unavailable. */
   preemptionsTotal?: number | null;
   /** vLLM prefix-cache hit rate (hits/queries, 0–1). null when unavailable. */
   prefixCacheHitRate?: number | null;
-  /** vLLM end-to-end request latency p95 in seconds. null when unavailable. */
-  e2eP95Seconds?: number | null;
-  /** vLLM inter-token latency p95 in seconds. null when unavailable. */
-  itlP95Seconds?: number | null;
   /** vLLM speculative/MTP acceptance rate (accepted/drafted, 0–1). null when unavailable. */
   mtpAcceptanceRate?: number | null;
+  /** Structured runtime recipe metadata from the collector. */
+  recipeMetadata?: RecipeMetadata | null;
+  /** Rich runtime identity/configuration for the current model. */
+  recipeInfo?: RecipeInfo | null;
   /**
    * Observational exposure hint from unauthenticated probe reachability +
    * configured target host scope. null when auth status is unknown.
    * Does not claim process bind address.
    */
+/** Last known reasoning effort from request logs (low/medium/high) */
+  reasoningEffort?: string | null;
+  /** Timestamp (ms epoch) when reasoning_effort was last seen */
+  reasoningEffortTs?: number | null;
+  /** Most recent active context size in tokens (from ds4 ctx=0..N:N log lines) */
+  activeContext?: number | null;
+  /** Timestamp (ms epoch) when active context was last seen */
+  activeContextTs?: number | null;
+  /** Aggregate context used in bytes (kvPagesResident × 2048 KiB) */
+  contextUsedBytes?: number | null;
+  // ── llama.cpp expanded /slots surface ───────────────────
+  /** n_prompt_tokens — total prompt tokens in the current slot. */
+  promptTokens?: number | null;
+  /** n_prompt_tokens_processed — prompt tokens recomputed this request. */
+  promptTokensProcessed?: number | null;
+  /** n_prompt_tokens_cache — prompt tokens served from the prefix cache. */
+  promptTokensCache?: number | null;
+  /** Cache hit ratio (0–1) = cache / (cache + processed). null when unavailable. */
+  cacheHitRatio?: number | null;
+  /** n_ctx — context window size in tokens. */
+  nCtx?: number | null;
+  /** Whether any slot is currently processing. */
+  isProcessing?: boolean;
+  /** next_token.n_remain — tokens remaining to generate in the current request. */
+  nRemain?: number | null;
+  /** next_token.n_decoded — tokens decoded so far in the current request. */
+  nDecoded?: number | null;
+  /** Sampling params from /slots params (temperature, top_k, top_p, min_p, ...). */
+  samplingParams?: Record<string, number | boolean | null> | null;
+  /** params["speculative.types"] e.g. "none,ngram-mod". */
+  speculativeTypes?: string | null;
+  /** params.reasoning_format e.g. "deepseek". */
+  reasoningFormat?: string | null;
+  /** params.chat_format e.g. "peg-native". */
+  chatFormat?: string | null;
+  /** params.samplers[] — active sampler chain. */
+  samplers?: string[] | null;
+  /** Speculative-decode acceptance rate (0–1) from the llama-server log. */
+  specAcceptanceRate?: number | null;
+  /** Spec-decode accepted tokens (latest request, from log). */
+  specAcceptedTokens?: number | null;
+  /** Spec-decode generated/drafted tokens (latest request, from log). */
+  specGeneratedTokens?: number | null;
+  /** Spec-decode mean draft length (latest request, from log). */
+  specMeanLen?: number | null;
+  /** Estimated ms until queue idle (running remainder + pending × avg). */
+  queueEtaMs?: number | null;
+  /** Browser-openable ComfyUI base URL (probe host + port). */
+  openUrl?: string | null;
+  // ── Expanded telemetry (all optional — populated when the backend exposes it) ──
+  /** Running (decoding) slots — vLLM num_requests_running. */
+  runningSlots?: number;
+  /** Waiting (queued) slots — vLLM num_requests_waiting. */
+  waitingSlots?: number;
+  /** Average time-to-first-token over the last sampling window (seconds). */
+  ttft?: number;
+  /** Histogram of TTFT samples (seconds), oldest→newest. */
+  ttftHistogram?: number[];
+  /** Inter-token latency (ms/token) for the last sampling window. */
+  interTokenLatency?: number;
+  /** Average prompt tokens per request. */
+  promptTokensPerReq?: number;
+  /** Average generated tokens per request. */
+  genTokensPerReq?: number;
+  /** Tokens accepted by the verifier. */
+  mtpAcceptedTokens?: number;
+  /** Tokens drafted by the proposer. */
+  mtpDraftedTokens?: number;
+  /** Aggregate generation tok/s (alias of generationTps for clarity). */
+  generationTpsAgg?: number;
+  /** Aggregate prefill tok/s (alias of prefillTps for clarity). */
+  prefillTpsAgg?: number;
+  /** Rolling average TTFT over the last 10 inferences (seconds). */
+  rollingAvgTtft?: number;
+  /** Rolling average tokens per request over the last 10 inferences. */
+  rollingAvgTokensPerReq?: number;
+  /** Rolling average tok/s per slot over the last 10 inferences. */
+  rollingAvgTpsPerSlot?: number;
+  /** Per-position speculative-decode acceptance (pos0, pos1, pos2, ...), 0–1 each. */
+  perPositionAcceptance?: number[];
+  /** Per-slot telemetry rows for the table view. */
+  slots?: SlotTelemetry[];
+  /** Peak aggregate decode tok/s tracked over session */
+  peakAggregateTps?: number;
+  /** Per-stream throughput high (tok/s) */
+  perStreamHigh?: number;
+  /** Per-stream throughput low (tok/s) */
+  perStreamLow?: number;
+  /** Per-stream throughput avg (tok/s) */
+  perStreamAvg?: number;
+  /** Total decoded tokens (cumulative, ds4_tokens_decoded_total) */
+  totalTokensDecoded?: number;
+  /** DSpark speculative acceptance ratio (0-1, ds4_spec_accept_ratio) */
+  dsparkAcceptRatio?: number | null;
+  /** Active context banks / lanes in use (ds4_banks_live) */
+  banksLive?: number;
+  /** Total configured banks / max lanes (ds4_banks_total) */
+  banksTotal?: number;
+  /** KV cache pages resident in memory (ds4_kv_pages_resident) */
+  kvPagesResident?: number;
+  /** Prefill tokens from cache (cumulative, ds4_tokens_prefilled_total{kind=cached}) */
+  prefillCached?: number;
+  /** Prefill tokens computed (cumulative, ds4_tokens_prefilled_total{kind=computed}) */
+  prefillComputed?: number;
+  /** Spec decode drafts total (ds4_spec_drafts_total) — legacy, may be null */
+  specDrafts?: number;
+  /** Spec decode hits total (ds4_spec_hits_total) — legacy, may be null */
+  specHits?: number;
+  /** Spec decode quench total (ds4_spec_quench_total) — legacy, may be null */
+  specQuench?: number;
+  /** Prefix cache warm records (ds4_warm_records) */
+  warmRecords?: number;
+  /** Derived artifacts count (ds4_derived_artifacts) */
+  derivedArtifacts?: number;
+  /** Derived artifact bytes (ds4_derived_artifact_bytes) */
+  derivedArtifactBytes?: number;
+  /** Requests started total (ds4_requests_started_total) */
+  requestsStarted?: number;
+  /** Requests completed (ds4_requests_total{outcome=completed}) */
+  requestsCompleted?: number;
+  /** Requests failed (ds4_requests_total{outcome=failed}) */
+  requestsFailed?: number;
+  /** Requests refused deep serial (ds4_requests_total{outcome=refused_deep_serial}) */
+  requestsRefusedDeepSerial?: number;
+  /** Requests currently inflight (ds4_requests_inflight) */
+  requestsInflight?: number;
+  /** Requests serial total (ds4_requests_serial_total) */
+  requestsSerial?: number;
+  /** Continuity admit rejects total (ds4_cont_admit_rejects_total) */
+  contAdmitRejects?: number;
+  /** Continuity batch failures total (ds4_cont_batch_failures_total) */
+  contBatchFailures?: number;
+  /** Graph fit refusals total (ds4_graph_fit_refusals_total) */
+  graphFitRefusals?: number;
+  /** Admits: cold (ds4_admits_total{kind=cold}) */
+  admitsCold?: number;
+  /** Admits: warm (ds4_admits_total{kind=warm}) */
+  admitsWarm?: number;
+  /** Admits: fork (ds4_admits_total{kind=fork}) */
+  admitsFork?: number;
+  /** Admits: partial_fork (ds4_admits_total{kind=partial_fork}) */
+  admitsPartialFork?: number;
+  /** Admits: partial_truncate (ds4_admits_total{kind=partial_truncate}) */
+  admitsPartialTruncate?: number;
+  /** Decode steps total (ds4_decode_steps_total) */
+  decodeSteps?: number;
+  /** Tokens per step (speculative efficiency, ds4_tok_per_step) */
+  tokPerStep?: number;
+
+  /** Approximate end-to-end latency of the latest request (seconds). */
+  e2eLatency?: number | null;
+  /** Rolling average E2E latency over the last 10 inferences (seconds). */
+  rollingAvgE2e?: number | null;
+  /** DS4 engine uptime in seconds. */
+  ds4Uptime?: number | null;
+  /** vLLM inter-token latency p95 in seconds. */
+  itlP95Seconds?: number | null;
+  /** vLLM time-to-first-token p95 in seconds. */
+  ttftP95Seconds?: number | null;
+  /** vLLM end-to-end request latency p95 in seconds. */
+  e2eP95Seconds?: number | null;
   posture?: LlmPosture | null;
   error: string | null;
 }
@@ -549,79 +708,6 @@ export interface TailscaleMetrics {
   /** Per-slot telemetry rows for the table view. */
   slots?: SlotTelemetry[];
 
-  // ── DS4 engine metrics ────────────────────────────────
-  /** DS4 engine uptime in seconds */
-  ds4Uptime?: number | null;
-  /** Peak aggregate decode tok/s tracked over session */
-  peakAggregateTps?: number;
-  /** Per-stream throughput high (tok/s) */
-  perStreamHigh?: number;
-  /** Per-stream throughput low (tok/s) */
-  perStreamLow?: number;
-  /** Per-stream throughput avg (tok/s) */
-  perStreamAvg?: number;
-  /** Total decoded tokens (cumulative, ds4_tokens_decoded_total) */
-  totalTokensDecoded?: number;
-  /** DSpark speculative acceptance ratio (0-1, ds4_spec_accept_ratio) */
-  dsparkAcceptRatio?: number | null;
-  /** Active context banks / lanes in use (ds4_banks_live) */
-  banksLive?: number;
-  /** Total configured banks / max lanes (ds4_banks_total) */
-  banksTotal?: number;
-  /** KV cache pages resident in memory (ds4_kv_pages_resident) */
-  kvPagesResident?: number;
-  /** Prefill tokens from cache (cumulative, ds4_tokens_prefilled_total{kind=cached}) */
-  prefillCached?: number;
-  /** Prefill tokens computed (cumulative, ds4_tokens_prefilled_total{kind=computed}) */
-  prefillComputed?: number;
-  /** Spec decode drafts total (ds4_spec_drafts_total) */
-  specDrafts?: number;
-  /** Spec decode hits total (ds4_spec_hits_total) */
-  specHits?: number;
-  /** Spec decode quench total (ds4_spec_quench_total) */
-  specQuench?: number;
-  /** Prefix cache warm records (ds4_warm_records) */
-  warmRecords?: number;
-  /** Derived artifacts count (ds4_derived_artifacts) */
-  derivedArtifacts?: number;
-  /** Derived artifact bytes (ds4_derived_artifact_bytes) */
-  derivedArtifactBytes?: number;
-  /** Requests started total (ds4_requests_started_total) */
-  requestsStarted?: number;
-  /** Requests completed (ds4_requests_total{outcome=completed}) */
-  requestsCompleted?: number;
-  /** Requests failed (ds4_requests_total{outcome=failed}) */
-  requestsFailed?: number;
-  /** Requests refused deep serial (ds4_requests_total{outcome=refused_deep_serial}) */
-  requestsRefusedDeepSerial?: number;
-  /** Requests currently inflight (ds4_requests_inflight) */
-  requestsInflight?: number;
-  /** Requests serial total (ds4_requests_serial_total) */
-  requestsSerial?: number;
-  /** Continuity admit rejects total (ds4_cont_admit_rejects_total) */
-  contAdmitRejects?: number;
-  /** Continuity batch failures total (ds4_cont_batch_failures_total) */
-  contBatchFailures?: number;
-  /** Graph fit refusals total (ds4_graph_fit_refusals_total) */
-  graphFitRefusals?: number;
-  /** Admits: cold (ds4_admits_total{kind=cold}) */
-  admitsCold?: number;
-  /** Admits: warm (ds4_admits_total{kind=warm}) */
-  admitsWarm?: number;
-  /** Admits: fork (ds4_admits_total{kind=fork}) */
-  admitsFork?: number;
-  /** Admits: partial_fork (ds4_admits_total{kind=partial_fork}) */
-  admitsPartialFork?: number;
-  /** Admits: partial_truncate (ds4_admits_total{kind=partial_truncate}) */
-  admitsPartialTruncate?: number;
-  /** Decode steps total (ds4_decode_steps_total) */
-  decodeSteps?: number;
-  /** Tokens per step (speculative efficiency, ds4_tok_per_step) */
-  tokPerStep?: number;
-  /** Recipe metadata from /v1/models */
-  recipeMetadata?: RecipeMetadata | null;
-  /** Rich recipe info / attribution for the Recipe Info card */
-  recipeInfo?: RecipeInfo | null;
 }
 
 // ─── Full metrics snapshot ────────────────────────────────

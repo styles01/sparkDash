@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { LlmMetrics, LlmBenchTarget } from "../../api/types";
 import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
 import { Panel } from "../ui/Panel";
+import { TelemetryChart, type ChartSeries } from "../ui/TelemetryChart";
 import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
 import {
   useMetricsHistory,
@@ -320,6 +321,22 @@ function fmtUptime(seconds: number | null | undefined): string {
   return `${sec}s`;
 }
 
+const HISTORY = 60;
+
+interface History {
+  genTps: number[];
+  prefillTps: number[];
+  ttft: number[];
+  e2e: number[];
+  specAccept: number[];
+}
+
+function pushSample(arr: number[], v: number, max = HISTORY): number[] {
+  const next = arr.length >= max ? arr.slice(arr.length - max + 1) : arr.slice();
+  next.push(Number.isFinite(v) ? v : 0);
+  return next;
+}
+
 /* ── SPARKLINE ── */
 function Sparkline({ data, color, height = 24 }: { data: number[]; color: string; height?: number }) {
   const valid = data.filter((v) => Number.isFinite(v));
@@ -590,11 +607,18 @@ function ConfigProvenanceSection({
   const specDecodeMethod = info?.specDecodeMethod ?? null;
   const specDecodeLabel = specDecodeMethod
     ? specDecodeMethod.replace(/\s*k=\d+$/, "").trim()
-    : llm?.backend === "ds4"
-      ? "DSpark"
-      : llm?.backend === "sglang"
-        ? "DFlash"
-        : "MTP";
+    : llm?.speculativeTypes && llm.speculativeTypes !== "none"
+      ? llm.speculativeTypes
+      : "MTP";
+
+  const author = info?.author ?? null;
+  const authorName = info?.authorName ?? null;
+  const containerImage = info?.containerImage ?? null;
+  const engineType = info?.engineType ?? null;
+  const modelName = info?.modelName ?? metadata?.model ?? null;
+  const acceptPct = info?.acceptRatio != null ? `${Math.round(info.acceptRatio * 100)}%` : "—";
+  const acceptAccent = info?.acceptRatio != null ? (info.acceptRatio > 0.7 ? "success" : info.acceptRatio >= 0.5 ? "warning" : "danger") : undefined;
+  const [paramsExpanded, setParamsExpanded] = useState(false);
 
   const paramStats: Record<string, { label: string; value: string; accent?: string } | null> = {};
   if (llm) {
@@ -749,6 +773,9 @@ export function LlmPanel({
   const prefillAvg = useMemo(() => avgPositive(prefillFull), [prefillFull]);
   const cachedPrefillAvg = useMemo(() => avgPositive(cachedFull), [cachedFull]);
   const uncachedPrefillAvg = useMemo(() => avgPositive(uncachedFull), [uncachedFull]);
+  const [history, setHistory] = useState<History>({
+    genTps: [], prefillTps: [], ttft: [], e2e: [], specAccept: [],
+  });
   const [showSettings, setShowSettings] = useState(false);
   const [portDraft, setPortDraft] = useState(String(llmPort));
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -801,6 +828,7 @@ export function LlmPanel({
     const peak = llm.peakAggregateTps ?? 0;
     if (gen > 0) stickyGenTps.current = gen;
     if (pre > 0) stickyPrefillTps.current = pre;
+    else if ((llm.requestsRunning ?? llm.slotsActive ?? 0) === 0) stickyPrefillTps.current = 0;
     if (agg > 0) stickyAggTps.current = agg;
     if (single > 0) stickySingleTps.current = single;
     if (peak > 0) stickyPeak.current = peak;
@@ -832,12 +860,20 @@ export function LlmPanel({
   useEffect(() => {
     if (!llm || !available) return;
     const gen = llm.generationTps ?? 0;
-    const pre = llm.prefillTps ?? 0;
+    const rawPre = llm.prefillTps ?? 0;
+    // Prefill bursts: vLLM only reports a non-zero prefill rate on the sample where a
+    // chunked-prefill step ran; the in-flight request still owns the engine between
+    // samples. Hold the last observed prefill rate while requests are running so the
+    // prefill line renders as a continuous band across the burst window instead of
+    // single-sample spikes; release it when no requests remain.
+    const running = (llm.requestsRunning ?? llm.slotsActive ?? 0) > 0;
+    const pre = rawPre > 0
+      ? rawPre
+      : (running ? stickyPrefillTps.current : 0);
     const ttft = llm.ttft ?? NaN;
     const e2e = llm.e2eLatency ?? NaN;
-    const specRate = llm.backend === "ds4"
-      ? (llm.dsparkAcceptRatio ?? llm.mtpAcceptanceRate ?? NaN)
-      : (llm.mtpAcceptanceRate ?? llm.dsparkAcceptRatio ?? NaN);
+    // Data-availability chain: prefer the most specific spec-decode source present.
+    const specRate = llm.specAcceptanceRate ?? llm.dsparkAcceptRatio ?? llm.mtpAcceptanceRate ?? NaN;
     setHistory((prev) => ({
       genTps: pushSample(prev.genTps, gen),
       prefillTps: pushSample(prev.prefillTps, pre),
@@ -900,44 +936,66 @@ export function LlmPanel({
     }
   };
 
-  const runningSlots = llm?.runningSlots ?? llm?.slotsActive ?? 0;
-  const waitingSlots = llm?.waitingSlots ?? 0;
-  const kvUsage = llm?.kvCacheUsage ?? null;
-  const genTps = llm?.generationTps ?? 0;
-  const mtpRate = llm?.mtpAcceptanceRate ?? null;
-  const prefixHit = llm?.prefixCacheHitRate ?? null;
-  const slots: SlotTelemetry[] = llm?.slots ?? [];
   const genSeries: ChartSeries = { label: "decode", color: "var(--color-success)", data: history.genTps, area: true, yAxis: "left" };
-  const preSeries: ChartSeries = { label: "prefill", color: "var(--color-accent)", data: history.prefillTps, area: false, yAxis: "right" };
+  const preSeries: ChartSeries = { label: "prefill", color: "var(--color-accent)", data: history.prefillTps, area: false, yAxis: "right", logScale: true };
   const ttftSeries: ChartSeries = { label: "TTFT", color: "var(--color-danger)", data: history.ttft, area: false };
   const e2eSeries: ChartSeries = { label: "E2E", color: "var(--color-info)", data: history.e2e, area: false };
 
-  const currentSpecAccept = llm?.backend === "ds4"
-    ? (llm.dsparkAcceptRatio ?? llm.mtpAcceptanceRate ?? null)
-    : (llm.mtpAcceptanceRate ?? llm.dsparkAcceptRatio ?? null);
+  const currentSpecAccept = llm?.specAcceptanceRate ?? llm?.dsparkAcceptRatio ?? llm?.mtpAcceptanceRate ?? null;
   const avgSpecAccept = arrMean(history.specAccept);
   const mtpRate = currentSpecAccept;
-  const mtpAccepted = llm?.mtpAcceptedTokens ?? null;
-  const mtpDrafted = llm?.mtpDraftedTokens ?? null;
-  const specHits = llm?.specHits ?? null;
-  const specDrafts = llm?.specDrafts ?? null;
+  // Spec-decode counters: prefer the most specific source present. llama.cpp
+  // exposes specAcceptedTokens/specGeneratedTokens (from the server log); the
+  // MTP/DSpark fields are vLLM/ds4-native. Data-availability gated, not backend.
+  const specAccepted = llm?.specAcceptedTokens ?? llm?.mtpAcceptedTokens ?? null;
+  const specGenerated = llm?.specGeneratedTokens ?? llm?.mtpDraftedTokens ?? null;
+  const mtpAccepted = specAccepted;
+  const mtpDrafted = specGenerated;
+  const specHits = llm?.specHits ?? specAccepted;
+  const specDrafts = llm?.specDrafts ?? specGenerated;
   const perPos: number[] = llm?.perPositionAcceptance ?? [];
-  const kvUsage = llm?.kvCacheUsage ?? null;
   const banksLive = llm?.banksLive ?? null;
   const banksTotal = llm?.banksTotal ?? null;
-  const prefixHit = llm?.prefixCacheHitRate ?? null;
+  const prefixHit = llm?.prefixCacheHitRate ?? llm?.cacheHitRatio ?? null;
   const slots = llm?.slots ?? [];
   const runningSlots = llm?.runningSlots ?? llm?.slotsActive ?? 0;
   const waitingSlots = llm?.waitingSlots ?? 0;
 
+  // ── llama.cpp expanded /slots surface (data-availability gated) ──
+  const promptTokens = llm?.promptTokens ?? null;
+  const promptTokensProcessed = llm?.promptTokensProcessed ?? null;
+  const promptTokensCache = llm?.promptTokensCache ?? null;
+  const cacheHitRatio = llm?.cacheHitRatio ?? null;
+  const nCtx = llm?.nCtx ?? null;
+  const isProcessing = llm?.isProcessing ?? false;
+  const nRemain = llm?.nRemain ?? null;
+  const nDecoded = llm?.nDecoded ?? null;
+  const samplingParams = llm?.samplingParams ?? null;
+  const speculativeTypes = llm?.speculativeTypes ?? null;
+  const reasoningFormat = llm?.reasoningFormat ?? null;
+  const chatFormat = llm?.chatFormat ?? null;
+  const samplers = llm?.samplers ?? null;
+  const specAcceptanceRate = llm?.specAcceptanceRate ?? null;
+  const specAcceptedTokens = llm?.specAcceptedTokens ?? null;
+  const specGeneratedTokens = llm?.specGeneratedTokens ?? null;
+  const specMeanLen = llm?.specMeanLen ?? null;
+  // Context used = prompt tokens + decoded so far (llama.cpp /slots).
+  const contextUsedTokens = (promptTokens != null ? promptTokens : 0) + (nDecoded != null ? nDecoded : 0);
+  const contextUsedPct = nCtx != null && nCtx > 0 ? contextUsedTokens / nCtx : null;
+  // KV cache usage: prefer the backend-native field; for llama.cpp derive it
+  // from the /slots context counters (contextUsedTokens / nCtx). Data-availability
+  // gated — only non-null when we have the underlying data.
+  const kvUsage = llm?.kvCacheUsage ?? (nCtx != null && nCtx > 0 ? contextUsedTokens / nCtx : null);
+
   const specDecodeMethod = llm?.recipeInfo?.specDecodeMethod ?? null;
+  // Spec-decode label: prefer the explicit recipe method, then the live
+  // speculative.types from the server (llama.cpp exposes "none,ngram-mod").
+  // Data-availability gated — no backend conditionals.
   const specDecodeLabel = specDecodeMethod
     ? specDecodeMethod.replace(/\s*k=\d+$/, "").trim()
-    : llm?.backend === "ds4"
-      ? "DSpark"
-      : llm?.backend === "sglang"
-        ? "DFlash"
-        : "MTP";
+    : speculativeTypes && speculativeTypes !== "none"
+      ? speculativeTypes
+      : "MTP";
 
   const kvColor = kvUsage != null && kvUsage >= 0.8 ? "var(--color-danger)" : kvUsage != null && kvUsage >= 0.5 ? "var(--color-accent)" : "var(--color-success)";
   const lanesColor = (banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)";
@@ -1128,6 +1186,16 @@ export function LlmPanel({
                 <ArcGauge value={effortIndex} max={4} label="" displayValue={reasoningEffort} color="var(--color-accent)" size={90} />
               </GaugeCard>
             )}
+            {nCtx != null && (
+              <GaugeCard label="Context Used">
+                <ArcGauge value={contextUsedTokens} max={nCtx} label="" displayValue={fmtInt(contextUsedTokens)} sub={contextUsedPct != null ? pct(contextUsedPct, 1) : undefined} color={contextUsedPct != null && contextUsedPct >= 0.8 ? "var(--color-danger)" : contextUsedPct != null && contextUsedPct >= 0.5 ? "var(--color-accent)" : "var(--color-success)"} size={100} />
+              </GaugeCard>
+            )}
+            {cacheHitRatio != null && (
+              <GaugeCard label="Cache Hit">
+                <FullCircleGauge value={cacheHitRatio} max={1} displayValue={pct(cacheHitRatio, 0)} color={cacheHitRatio >= 0.7 ? "var(--color-success)" : cacheHitRatio >= 0.4 ? "var(--color-accent)" : "var(--color-warning)"} size={100} />
+              </GaugeCard>
+            )}
           </div>
 
           {/* ═══ ROW 5 — CHART ROW: Throughput + Latency + Spec Decode (ALL THREE ALWAYS VISIBLE) ═══ */}
@@ -1150,6 +1218,11 @@ export function LlmPanel({
               {specHits != null && specDrafts != null && (
                 <div className="llm-specdecode-counters font-tabular">
                   <span className="text-muted text-[10px]">{fmtInt(specHits)} hits / {fmtInt(specDrafts)} drafts</span>
+                </div>
+              )}
+              {specAcceptedTokens != null && specGeneratedTokens != null && (
+                <div className="llm-specdecode-counters font-tabular">
+                  <span className="text-muted text-[10px]">{fmtInt(specAcceptedTokens)} accepted / {fmtInt(specGeneratedTokens)} generated{specMeanLen != null ? ` · mean len ${fmtNum(specMeanLen, 1)}` : ""}</span>
                 </div>
               )}
               {perPos.length === 0 && (
@@ -1176,7 +1249,7 @@ export function LlmPanel({
             <CompactCard label="Slots Total" value={fmtInt(llm?.slotsTotal)} />
             {/* Token metrics */}
             <CompactCard label="Total Tokens" value={fmtInt(llm?.totalTokensDecoded ?? llm?.totalOutputTokens)} />
-            <CompactCard label="Tokens Decoded" value={fmtInt(llm?.totalTokensDecoded)} />
+            <CompactCard label="Tokens Decoded" value={fmtInt(llm?.totalTokensDecoded ?? llm?.totalOutputTokens)} />
             <CompactCard label="Tokens Output" value={fmtInt(llm?.totalOutputTokens)} />
             <CompactCard label="Prefill Cached" value={fmtInt(llm?.prefillCached)} />
             <CompactCard label="Prefill Computed" value={fmtInt(llm?.prefillComputed)} />
@@ -1206,7 +1279,31 @@ export function LlmPanel({
             <CompactCard label="GPU Mem" value={pct(llm?.gpuMemoryUtilization, 1)} color={llm?.gpuMemoryUtilization != null && llm.gpuMemoryUtilization >= 0.9 ? "var(--color-danger)" : llm?.gpuMemoryUtilization != null && llm.gpuMemoryUtilization >= 0.7 ? "var(--color-accent)" : "var(--color-success)"} />
             {/* Context metrics */}
             <CompactCard label="Active Context" value={fmtInt(llm?.activeContext)} />
-            <CompactCard label="Context Used" value={llm?.contextUsedBytes != null ? `${(llm.contextUsedBytes / 1e9).toFixed(1)}GB` : "\u2014"} />
+            <CompactCard label="Context Used" value={llm?.contextUsedBytes != null ? `${(llm.contextUsedBytes / 1e9).toFixed(1)}GB` : nCtx != null ? `${fmtInt(contextUsedTokens)} tok` : "\u2014"} />
+            {/* llama.cpp /slots metrics (data-availability gated) */}
+            <CompactCard label="Prompt Tokens" value={fmtInt(promptTokens)} />
+            <CompactCard label="Prompt Processed" value={fmtInt(promptTokensProcessed)} />
+            <CompactCard label="Prompt Cached" value={fmtInt(promptTokensCache)} />
+            <CompactCard label="Cache Hit" value={pct(cacheHitRatio, 1)} color={cacheHitRatio != null ? (cacheHitRatio >= 0.7 ? "var(--color-success)" : cacheHitRatio >= 0.4 ? "var(--color-accent)" : "var(--color-warning)") : "var(--color-muted)"} />
+            <CompactCard label="n_ctx" value={fmtInt(nCtx)} />
+            <CompactCard label="Remaining" value={fmtInt(nRemain)} />
+            <CompactCard label="Decoded" value={fmtInt(nDecoded)} />
+            <CompactCard label="Processing" value={isProcessing ? "yes" : "no"} color={isProcessing ? "var(--color-success)" : "var(--color-muted)"} />
+            <CompactCard label="Spec Types" value={speculativeTypes ?? "\u2014"} />
+            <CompactCard label="Reasoning Fmt" value={reasoningFormat ?? "\u2014"} />
+            <CompactCard label="Chat Fmt" value={chatFormat ?? "\u2014"} />
+            <CompactCard label="Samplers" value={samplers && samplers.length > 0 ? samplers.join(",") : "\u2014"} />
+            {/* llama.cpp spec-decode (from server log) */}
+            <CompactCard label="Spec Accept Rate" value={pct(specAcceptanceRate, 1)} color={mtpColor(specAcceptanceRate)} />
+            <CompactCard label="Spec Accepted" value={fmtInt(specAcceptedTokens)} />
+            <CompactCard label="Spec Generated" value={fmtInt(specGeneratedTokens)} />
+            <CompactCard label="Spec Mean Len" value={fmtNum(specMeanLen, 1)} />
+            {/* Sampling params */}
+            <CompactCard label="Temp" value={samplingParams?.temperature != null ? fmtNum(Number(samplingParams.temperature), 2) : "\u2014"} />
+            <CompactCard label="Top-K" value={samplingParams?.top_k != null ? fmtInt(Number(samplingParams.top_k)) : "\u2014"} />
+            <CompactCard label="Top-P" value={samplingParams?.top_p != null ? fmtNum(Number(samplingParams.top_p), 2) : "\u2014"} />
+            <CompactCard label="Min-P" value={samplingParams?.min_p != null ? fmtNum(Number(samplingParams.min_p), 2) : "\u2014"} />
+            <CompactCard label="Max Tokens" value={samplingParams?.max_tokens != null ? fmtInt(Number(samplingParams.max_tokens)) : "\u2014"} />
             {/* Engine metrics */}
             <CompactCard label="Uptime" value={fmtUptime(llm?.ds4Uptime ?? llm?.recipeInfo?.uptime)} />
             <CompactCard label="Reasoning" value={reasoningEffort ?? "\u2014"} color={effortIndex > 0 ? "var(--color-accent)" : "var(--color-muted)"} />

@@ -128,6 +128,27 @@ export class LlmProbe {
     this.lastIterSum = null;
     this.lastProbeTime = 0;
 
+    // ── llama.cpp /slots expanded data surface ──
+    this.promptTokens = null;          // n_prompt_tokens (total prompt tokens in current slot)
+    this.promptTokensProcessed = null; // n_prompt_tokens_processed
+    this.promptTokensCache = null;     // n_prompt_tokens_cache (tokens served from cache)
+    this.cacheHitRatio = null;         // computed: cache / (cache + processed)
+    this.nCtx = null;                  // n_ctx (context window size)
+    this.isProcessing = false;         // any slot currently processing
+    this.nRemain = null;               // next_token.n_remain (tokens remaining to generate)
+    this.nDecoded = null;              // next_token.n_decoded (tokens decoded this request)
+    this.samplingParams = null;        // params: temperature, top_k, top_p, min_p, etc.
+    this.speculativeTypes = null;      // params["speculative.types"] e.g. "none,ngram-mod"
+    this.reasoningFormat = null;        // params.reasoning_format
+    this.chatFormat = null;            // params.chat_format
+    this.samplers = null;              // params.samplers[]
+    // ── llama.cpp speculative-decode (from server log) ──
+    this.specAcceptanceRate = null;    // latest "draft acceptance = X"
+    this.specAcceptedTokens = null;    // latest accepted count
+    this.specGeneratedTokens = null;   // latest generated (drafted) count
+    this.specMeanLen = null;           // latest mean draft length
+    this._llamaLogSize = 0;            // last read position in llama log
+
     // Cumulative total output tokens (generation) as reported by the LLM server
     this.totalOutputTokens = 0;
 
@@ -604,6 +625,22 @@ export class LlmProbe {
     if (!modelsOk) {
       throw new Error("ds4 /v1/models unreachable");
     }
+
+    // Real reasoning effort from the engine itself (/v1/stats carries
+    // server.reasoning_effort). Beats the log-tail guess.
+    try {
+      const statsRes = await this._fetch(`${this.baseUrl}/v1/stats`, {
+        headers: { Accept: "application/json" },
+      });
+      if (statsRes.ok) {
+        const stats = await statsRes.json();
+        const effort = stats?.server?.reasoning_effort;
+        if (effort) {
+          this.reasoningEffort = effort;
+          this.reasoningEffortTs = Date.now();
+        }
+      }
+    } catch {}
 
     // Parse /metrics
     try {
@@ -2415,6 +2452,41 @@ export class LlmProbe {
               totalGen += dDecoded / dtSec;
               totalPrefill += dPrompted / dtSec;
             }
+
+            // Capture expanded fields from the first slot that has them.
+            if (promptTokens == null && slot.n_prompt_tokens != null) promptTokens = slot.n_prompt_tokens;
+            if (promptTokensProcessed == null && slot.n_prompt_tokens_processed != null) promptTokensProcessed = slot.n_prompt_tokens_processed;
+            if (promptTokensCache == null && slot.n_prompt_tokens_cache != null) promptTokensCache = slot.n_prompt_tokens_cache;
+            if (nCtx == null && slot.n_ctx != null) nCtx = slot.n_ctx;
+            if (slot.is_processing) isProcessing = true;
+            const nt = Array.isArray(slot.next_token) ? slot.next_token[0] : slot.next_token;
+            if (nt) {
+              if (nRemain == null && nt.n_remain != null) nRemain = nt.n_remain;
+              if (nDecoded == null && nt.n_decoded != null) nDecoded = nt.n_decoded;
+            }
+            const p = slot.params;
+            if (p) {
+              if (samplingParams == null) {
+                samplingParams = {
+                  temperature: p.temperature ?? null,
+                  top_k: p.top_k ?? null,
+                  top_p: p.top_p ?? null,
+                  min_p: p.min_p ?? null,
+                  max_tokens: p.max_tokens ?? p.n_predict ?? null,
+                  n_predict: p.n_predict ?? null,
+                  n_keep: p.n_keep ?? null,
+                  n_discard: p.n_discard ?? null,
+                  stream: p.stream ?? null,
+                  repeat_penalty: p.repeat_penalty ?? null,
+                  presence_penalty: p.presence_penalty ?? null,
+                  frequency_penalty: p.frequency_penalty ?? null,
+                };
+              }
+              if (speculativeTypes == null && p["speculative.types"] != null) speculativeTypes = p["speculative.types"];
+              if (reasoningFormat == null && p.reasoning_format != null) reasoningFormat = p.reasoning_format;
+              if (chatFormat == null && p.chat_format != null) chatFormat = p.chat_format;
+              if (samplers == null && Array.isArray(p.samplers)) samplers = p.samplers;
+            }
           }
 
           this.totalOutputTokens = totalDecoded;
@@ -3505,6 +3577,9 @@ async _collectSglangRecipeInfo() {
       }
     }
     const modelFile = modelPath ? modelPath.split("/").pop() : null;
+    // Normalize HF cache snapshots into their actual repository identity so the
+    // dashboard shows the checkpoint/quant rather than only the served alias.
+    const canonicalModel = normalizeModelId(modelPath);
 
     // Served model name (alias exposed via /v1/models)
     const servedNameMatch = cmdline.match(/--served-model-name\s+(\S+)/);
@@ -3515,11 +3590,13 @@ async _collectSglangRecipeInfo() {
     const quantArg = cmdline.match(/--quantization\s+(\S+)/);
     if (quantArg) {
       quantization = quantArg[1].toUpperCase();
-    } else if (modelFile) {
-      if (/FP8/i.test(modelFile)) quantization = "FP8";
-      else if (/NVFP4/i.test(modelFile)) quantization = "NVFP4";
-      else if (/AWQ/i.test(modelFile)) quantization = "AWQ";
-      else if (/GPTQ/i.test(modelFile)) quantization = "GPTQ";
+    } else {
+      // A snapshot basename is only a hash; the canonical HF repo carries the quant.
+      const quantSource = canonicalModel || modelFile || "";
+      if (/NVFP4/i.test(quantSource)) quantization = "NVFP4";
+      else if (/FP8/i.test(quantSource)) quantization = "FP8";
+      else if (/AWQ/i.test(quantSource)) quantization = "AWQ";
+      else if (/GPTQ/i.test(quantSource)) quantization = "GPTQ";
     }
 
     // Context length from cmdline: --max-model-len <num>
@@ -3597,8 +3674,8 @@ async _collectSglangRecipeInfo() {
     // Engine type
     const engineType = "vLLM";
 
-    // Model display name
-    const modelName = this.modelId || servedModelName || modelFile || null;
+    // Prefer the canonical checkpoint identity to its user-facing API alias.
+    const modelName = canonicalModel || this.modelId || servedModelName || modelFile || null;
 
     // Accept ratio
     const acceptRatio = this.mtpAcceptanceRate ?? null;

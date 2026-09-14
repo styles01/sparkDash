@@ -22,6 +22,8 @@ export interface ChartSeries {
   area?: boolean;
   /** Which y-axis to scale against. Default 'left'. */
   yAxis?: "left" | "right";
+  /** Logarithmic scaling for this series axis (series spanning orders of magnitude, e.g. prefill tok/s). */
+  logScale?: boolean;
 }
 
 export interface TelemetryChartProps {
@@ -175,9 +177,15 @@ export function TelemetryChart({
       }
       if (!Number.isFinite(rightDataMax)) rightDataMax = 1;
       if (!Number.isFinite(rightDataMin)) rightDataMin = 0;
+      const rightLog = ss.some((s) => s.yAxis === "right" && s.logScale);
       const yTopRight = fixedMaxRight != null ? fixedMaxRight : niceMax(Math.max(rightDataMax, 1));
-      const yBotRight = lo;
-      const ySpanRight = yTopRight - yBotRight || 1;
+      const yBotRight = rightLog ? 1 : lo;
+      // Log right axis: map via log10 so series spanning orders of magnitude stay readable.
+      const yLogMin = Math.log10(Math.max(yBotRight, 1));
+      const yLogMax = Math.log10(Math.max(yTopRight, 10));
+      const ySpanRight = rightLog
+        ? (yLogMax - yLogMin) || 1
+        : (yTopRight - yBotRight) || 1;
 
       const plotX0 = pad.left;
       const plotX1 = cssW - pad.right;
@@ -211,7 +219,10 @@ export function TelemetryChart({
         for (let i = 0; i <= ticks; i++) {
           const frac = i / ticks;
           const y = plotY1 - frac * plotH;
-          const val = yBotRight + frac * ySpanRight;
+          // Log right axis: tick values follow the log10 mapping used by the series.
+          const val = rightLog
+            ? Math.pow(10, Math.log10(Math.max(yBotRight, 1)) + frac * ySpanRight)
+            : yBotRight + frac * ySpanRight;
           // No grid lines for right axis (avoid clutter), just labels
           ctx.fillStyle = colors.muted;
           ctx.fillText(formatTick(val, unitRight || unit), plotX1 + 6, y);
@@ -243,13 +254,21 @@ export function TelemetryChart({
         if (data.length < 1) continue;
         const n = data.length;
         const isRight = s.yAxis === "right";
+        const useLog = isRight && !!s.logScale;
         const yTop = isRight ? yTopRight : yTopLeft;
         const yBot = isRight ? yBotRight : yBotLeft;
-        const ySpan = yTop - yBot || 1;
+        // Per-series mapping: log scale maps log10(v) into the same plot height.
+        const ySpan = useLog ? (Math.log10(Math.max(yTop, 10)) - Math.log10(Math.max(yBot, 1))) || 1 : (yTop - yBot) || 1;
 
         // Map data[i] -> x position within the window. Latest sample at right edge.
         const xFor = (i: number) => plotX0 + (mp <= 1 ? plotW : (i / (mp - 1)) * plotW);
-        const yFor = (v: number) => plotY1 - ((Math.min(yTop, Math.max(yBot, v)) - yBot) / ySpan) * plotH;
+        const yFor = useLog
+          ? (v: number) => {
+              const lv = Math.log10(Math.max(v, yBot, 1));
+              const frac = (lv - Math.log10(Math.max(yBot, 1))) / ySpan;
+              return plotY1 - frac * plotH;
+            }
+          : (v: number) => plotY1 - ((Math.min(yTop, Math.max(yBot, v)) - yBot) / ySpan) * plotH;
 
         // Area fill
         if (s.area) {
