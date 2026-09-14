@@ -17,6 +17,44 @@ It also supports **non-Spark units**: any Linux machine with an NVIDIA GPU (e.g.
 
 <img src="./assets/screenshot.jpg" alt="sparkDash Overview page with multiple DGX Spark units, GPU metrics, and LLM status">
 
+---
+
+## ⭐ Why this fork exists (styles01 fork)
+
+**This is not a cosmetic fork — it is the production-monitoring branch for a real GB10 serving stack.**
+Upstream sparkDash monitors Spark hardware; this fork extends it into a **full LLM-serving cockpit** for the
+Qwen3.8-Flash-Next lanes documented in [`styles01/sparkrun-recipes`](https://github.com/styles01/sparkrun-recipes)
+(daily driver: Mia-AiLab NVFP4 + MTP3 + custom 47k draft vocab, 262K ctx; alternate lane: the DwarfStar ds4 C engine).
+
+**What this fork adds on top of upstream:**
+
+- **ds4 / DwarfStar engine support** — native probe for the `ds4.c` C-engine HTTP server:
+  backend auto-detection (`owned_by: ds4.c`), `GET /metrics` + `/v1/stats` parsing
+  (`ds4_decode_tok_s`, `ds4_prefill_tok_s`, `ds4_spec_accept_ratio`, `ds4_banks_*`, `ds4_kv_pages_resident`),
+  plus engine-side upgrades we ported back into the engine so the dashboard has something to read:
+  a self-contained Prometheus metrics emitter and a `/v1/stats` JSON endpoint with
+  `reasoning_effort` / `thinking_enabled`.
+- **Real reasoning-effort display** — reads the engine's actual effort from `/v1/stats`
+  instead of guessing `"high"` from log patterns; per-engine effort semantics (ds4: none/high/max).
+- **LLM panel upgrades** — per-position MTP acceptance bars, spec-accept totals + ratio,
+  prefix-cache hit rate, KV cache %, active lanes, prefill cached/computed split,
+  TTFT+E2E latency chart, decode/prefill throughput chart with fixed scales,
+  thinking badge ("ACTIVELY THINKING"), data-availability-gated cards (missing backends render `—`, never blank).
+- **VllmMetricsParser.js** — a dedicated vLLM Prometheus parser (`vllm:*` series) with
+  prefix-cache, spec-decode, and per-stream rate derivation; upstream now absorbs parts of
+  our earlier inline parsers back into helpers.
+- **Multi-backend, one panel** — vLLM, SGLang, llama.cpp, and ds4 backends detected by probe,
+  all rendered through the same card set keyed on data presence (no per-backend panels).
+
+**Screenshot of the fork in production** (Qwen3.8-Flash-Next on vLLM, live agent traffic):
+
+![sparkDash fork — Qwen3.8-Flash-Next vLLM lane, MTP3 + draft vocab](./assets/screenshot-styles01-qwen38-vllm.jpg)
+
+Upstream's features are all retained (multi-Spark, ComfyUI, Hermes, Tailnet monitoring, bench tools).
+This fork rebases onto upstream `main` regularly; the rebase workflow lives in
+`docs/` if you want to maintain a similar fork.
+
+
 ### LLM Prompt Showcase
 
 <a href="https://github.com/MiaAI-Lab/sparkDash/releases/download/media-showcase/llm-showcase.mp4">
