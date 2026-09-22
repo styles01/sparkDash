@@ -453,6 +453,17 @@ export class LlmProbe {
     this.lastTtftCount = null;
     this.lastIterSum = null;
     this._sglangStickyTps = null;
+    // EXL3 (red-team m1): probe state must not leak across failovers
+    this._exl3Seeded = false;
+    this._exl3StreamSamples = 0;
+    this.lastExl3TtftSum = null;
+    this.lastExl3TtftCount = null;
+    this.lastExl3E2eSum = null;
+    this.lastExl3E2eCount = null;
+    this.lastExl3ItlSum = null;
+    this.lastExl3ItlCount = null;
+    this.lastExl3Completed = null;
+    this.lastExl3CompletedTokens = null;
     this.recipeInfo = null;
     this._vllmPrefixCaching = null;
     this.reasoningEffort = null; // 'low' | 'medium' | 'high' | null
@@ -1334,8 +1345,10 @@ export class LlmProbe {
   }
 
   /**
-   * Apply EXL3 tools/serve_openai.py GET /health.
-   * Live tok/s from cumulative counter diffs so idle → 0.
+   * Apply EXL3 serve_openai.py GET /health (v2 contract, audit 2026-09-21).
+   * Live tok/s from cumulative counter diffs so idle → 0. Latency/acceptance
+   * stats are engine-measured cumulative sums — the probe derives mean values
+   * from sum/count deltas per poll window (same shape as vLLM histograms).
    * @param {Record<string, unknown>} data
    * @param {number} dtSec
    */
@@ -1349,17 +1362,152 @@ export class LlmProbe {
     this.requestsRunning = busy ? 1 : 0;
     this.slotsActive = busy ? 1 : 0;
     this.slotsTotal = 1;
-    this.kvCacheUsage = null;
-    this.requestsWaiting = null;
-    this.ttftP95Seconds = null;
-    this.ttftSeconds = null;
-    this.preemptionsTotal = null;
-    this.prefixCacheHitRate = null;
-    this.e2eP95Seconds = null;
-    this.itlP95Seconds = null;
-    this.mtpAcceptanceRate = null;
+    this.preemptionsTotal = null; // engine has no preemption concept (m2: clear, don't leak)
+    // Single-stream engine: prefill and decode never overlap → no cached/uncached split.
     this.cachedPrefillTps = null;
     this.uncachedPrefillTps = null;
+
+    // ── Live cache stats (GEN.get_cache_stats(), fail-open nulls) ──
+    this.kvCacheUsage =
+      data?.kv_cache_usage != null && Number.isFinite(Number(data.kv_cache_usage)) && Number(data.kv_cache_usage) >= 0
+        ? Number(data.kv_cache_usage) : null;
+    this.prefixCacheHitRate =
+      data?.prefix_cache_hit_rate != null && Number.isFinite(Number(data.prefix_cache_hit_rate)) && Number(data.prefix_cache_hit_rate) >= 0
+        ? Number(data.prefix_cache_hit_rate) : null;
+    const waiting = Number(data?.requests_waiting);
+    this.requestsWaiting = Number.isFinite(waiting) ? Math.round(waiting) : 0;
+
+    // ── Request counters ──
+    const completed = Number(data?.requests_completed_total);
+    if (Number.isFinite(completed)) {
+      this.requestsStarted = Math.round(completed + (Number(data?.requests_failed_total) || 0));
+      this.requestsCompleted = Math.round(completed);
+      this.requestsFailed = Math.round(Number(data?.requests_failed_total) || 0);
+    }
+    const ctxLast = Number(data?.context_last);
+    if (Number.isFinite(ctxLast) && ctxLast > 0) {
+      this.activeContext = Math.round(ctxLast);
+      this.activeContextTs = Date.now();
+    }
+
+    // ── MTP / speculative acceptance (cumulative counters → rate + deltas) ──
+    const mtpAcc = Number(data?.mtp_accepted_tokens_total);
+    const mtpDrf = Number(data?.mtp_drafted_tokens_total);
+    if (Number.isFinite(mtpAcc) && Number.isFinite(mtpDrf)) {
+      this.mtpAcceptedTokens = Math.round(mtpAcc);
+      this.mtpDraftedTokens = Math.round(mtpDrf);
+      this.mtpAcceptanceRate =
+        mtpDrf > 0 ? Math.round((mtpAcc / mtpDrf) * 10000) / 10000 : null;
+      if (this.mtpAcceptanceRate != null) {
+        this.perPositionAcceptance = [this.mtpAcceptanceRate];
+      }
+    } else {
+      this.mtpAcceptanceRate = null;
+      this.mtpAcceptedTokens = null;
+      this.mtpDraftedTokens = null;
+      this.perPositionAcceptance = null;
+    }
+
+    // ── Latency stats: mean over the poll window from sum/count deltas ──
+    // (vLLM parity: histogram sum/count → mean TTFT; p95s stay null because the
+    // engine reports no latency distribution — honest absence.)
+    const ttftSum = Number(data?.ttft_seconds_sum);
+    const ttftCnt = Number(data?.ttft_seconds_count);
+    if (
+      Number.isFinite(ttftSum) && Number.isFinite(ttftCnt) &&
+      this.lastExl3TtftSum != null && this.lastExl3TtftCount != null &&
+      ttftCnt > this.lastExl3TtftCount && ttftSum >= this.lastExl3TtftSum
+    ) {
+      const dT = ttftSum - this.lastExl3TtftSum;
+      const dC = ttftCnt - this.lastExl3TtftCount;
+      if (dC > 0 && dT >= 0) {
+        this.ttftSeconds = Math.round((dT / dC) * 1000) / 1000;
+        this.ttftP95Seconds = this.ttftSeconds; // single-request window: mean == observed
+      }
+    }
+    if (Number.isFinite(ttftSum) && Number.isFinite(ttftCnt)) {
+      if (ttftSum < (this.lastExl3TtftSum ?? 0) || ttftCnt < (this.lastExl3TtftCount ?? 0)) {
+        // server restart wiped counters: don't derive from a negative delta
+        this.ttftSeconds = null;
+        this.ttftP95Seconds = null;
+      }
+      this.lastExl3TtftSum = ttftSum;
+      this.lastExl3TtftCount = ttftCnt;
+      // vLLM parity: rollingAvgTtft mirrors the observed mean (shim is
+      // single-stream — each window is one request, so window mean == rolling)
+      if (this.ttftSeconds != null) this.rollingAvgTtft = this.ttftSeconds;
+    } else {
+      this.ttftSeconds = null;
+      this.ttftP95Seconds = null;
+    }
+    const e2eSum = Number(data?.e2e_seconds_sum);
+    const e2eCnt = Number(data?.e2e_seconds_count);
+    if (
+      Number.isFinite(e2eSum) && Number.isFinite(e2eCnt) &&
+      this.lastExl3E2eSum != null && this.lastExl3E2eCount != null &&
+      e2eCnt > this.lastExl3E2eCount && e2eSum >= this.lastExl3E2eSum
+    ) {
+      const dE = e2eSum - this.lastExl3E2eSum;
+      const dC = e2eCnt - this.lastExl3E2eCount;
+      if (dC > 0 && dE >= 0) {
+        this.e2eLatency = Math.round((dE / dC) * 1000) / 1000;
+        this.e2eP95Seconds = this.e2eLatency;
+        this.rollingAvgE2e = this.e2eLatency;
+      }
+    }
+    if (Number.isFinite(e2eSum) && Number.isFinite(e2eCnt)) {
+      this.lastExl3E2eSum = e2eSum;
+      this.lastExl3E2eCount = e2eCnt;
+    } else {
+      this.e2eLatency = null;
+      this.e2eP95Seconds = null;
+    }
+    const itlSum = Number(data?.itl_seconds_sum);
+    const itlCnt = Number(data?.itl_seconds_count);
+    if (
+      Number.isFinite(itlSum) && Number.isFinite(itlCnt) &&
+      this.lastExl3ItlSum != null && this.lastExl3ItlCount != null &&
+      itlCnt > this.lastExl3ItlCount && itlSum >= this.lastExl3ItlSum
+    ) {
+      const dI = itlSum - this.lastExl3ItlSum;
+      const dC = itlCnt - this.lastExl3ItlCount;
+      if (dC > 0 && dI >= 0) {
+        this.itlP95Seconds = Math.round((dI / dC) * 1000) / 1000;
+      }
+    }
+    if (Number.isFinite(itlSum) && Number.isFinite(itlCnt)) {
+      this.lastExl3ItlSum = itlSum;
+      this.lastExl3ItlCount = itlCnt;
+    } else {
+      this.itlP95Seconds = null;
+    }
+
+    // ── GPU memory utilization (vLLM/DS4 parity: fraction of device memory
+    //    in use — shim reports torch.cuda.mem_get_info census). ──
+    if (this.gpuMemoryUtilization == null) {
+      const gmu = Number(data?.gpu_memory_utilization);
+      if (Number.isFinite(gmu) && gmu >= 0 && gmu <= 1) {
+        this.gpuMemoryUtilization = gmu;
+      }
+    }
+
+    // ── genTokensPerReq from completed-request deltas ──
+    if (Number.isFinite(completed) && Number.isFinite(completion)) {
+      if (
+        this.lastExl3Completed != null &&
+        completed > this.lastExl3Completed &&
+        completion >= (this.lastExl3CompletedTokens ?? 0)
+      ) {
+        const dReq = completed - this.lastExl3Completed;
+        const dTok = completion - (this.lastExl3CompletedTokens ?? 0);
+        if (dReq > 0 && dTok >= 0) {
+          this.genTokensPerReq = Math.round((dTok / dReq) * 100) / 100;
+          this.rollingAvgTokensPerReq = this.genTokensPerReq;
+        }
+      }
+      this.lastExl3Completed = completed;
+      this.lastExl3CompletedTokens = completion;
+    }
 
     if (!Number.isFinite(completion)) {
       this.generationTps = busy ? this.generationTps : 0;
@@ -1369,12 +1517,23 @@ export class LlmProbe {
 
     if (dtSec > 0 && dtSec < 10) {
       const deltaOut = completion - this.lastTokenCounts.output;
-      this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-      if (Number.isFinite(prompt)) {
-        const deltaIn = prompt - this.lastTokenCounts.input;
-        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
-      } else if (!busy && this.generationTps <= 0) {
-        this.prefillTps = 0;
+      const deltaIn = prompt - this.lastTokenCounts.input;
+      // Red-team M1: after a probe-failure reset (or first contact), the
+      // counters are lifetime values but the poll window is ~2s — seeding the
+      // baseline only avoids a giant fake spike into peak/perStream.
+      const seedOnly =
+        this._exl3Seeded !== true ||
+        deltaOut < 0 ||
+        (Number.isFinite(prompt) && deltaIn < 0);
+      if (seedOnly) {
+        this._exl3Seeded = true;
+      } else {
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        if (Number.isFinite(prompt)) {
+          this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+        } else if (!busy && this.generationTps <= 0) {
+          this.prefillTps = 0;
+        }
       }
     } else if (!busy) {
       this.generationTps = 0;
@@ -1384,6 +1543,10 @@ export class LlmProbe {
     if (Number.isFinite(prompt)) this.lastTokenCounts.input = prompt;
     this.lastTokenCounts.output = completion;
     this.totalOutputTokens = completion;
+    this.totalTokensDecoded = completion;
+
+    // Aggregate decode TPS alias (vLLM parity)
+    this.aggregateDecodeTps = this.generationTps;
 
     // Peak + per-stream tracking for the panel dials (parity with DS4/llama.cpp
     // paths). exl3 = single stream: per-stream == aggregate.
@@ -1401,6 +1564,7 @@ export class LlmProbe {
       const prevN = this._exl3StreamSamples ?? 0;
       this._exl3StreamSamples = prevN + 1;
       this.perStreamAvg = ((this.perStreamAvg ?? 0) * prevN + currentAggregate) / (prevN + 1);
+      this.rollingAvgTpsPerSlot = Math.round(this.perStreamAvg * 100) / 100;
     }
   }
 
