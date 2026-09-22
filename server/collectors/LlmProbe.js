@@ -1384,6 +1384,24 @@ export class LlmProbe {
     if (Number.isFinite(prompt)) this.lastTokenCounts.input = prompt;
     this.lastTokenCounts.output = completion;
     this.totalOutputTokens = completion;
+
+    // Peak + per-stream tracking for the panel dials (parity with DS4/llama.cpp
+    // paths). exl3 = single stream: per-stream == aggregate.
+    const currentAggregate = this.generationTps;
+    if (currentAggregate > (this.peakAggregateTps ?? 0)) {
+      this.peakAggregateTps = currentAggregate;
+    }
+    if (currentAggregate > 0) {
+      if (this.perStreamHigh == null || currentAggregate > this.perStreamHigh) {
+        this.perStreamHigh = currentAggregate;
+      }
+      if (this.perStreamLow == null || currentAggregate < this.perStreamLow) {
+        this.perStreamLow = currentAggregate;
+      }
+      const prevN = this._exl3StreamSamples ?? 0;
+      this._exl3StreamSamples = prevN + 1;
+      this.perStreamAvg = ((this.perStreamAvg ?? 0) * prevN + currentAggregate) / (prevN + 1);
+    }
   }
 
   /**
