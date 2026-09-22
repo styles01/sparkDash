@@ -843,11 +843,14 @@ export function LlmPanel({
 
   const isThinking = available &&
     ((llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0) &&
+    (llm?.isPrefilling !== true) &&
     (llm?.generationTps ?? 0) < 1;
   const isPrefilling = available &&
     ((llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0) &&
-    (llm?.generationTps ?? 0) < 1 &&
-    ((llm?.prefillTps ?? 0) > 0 || (llm?.activeContext ?? 0) > 0);
+    (llm?.isPrefilling === true ||
+      // legacy servers without the field: prefill rate is the only honest signal
+      // (activeContext is stale post-gen and must NOT be used as a prefill proxy)
+      (llm?.isPrefilling == null && (llm?.generationTps ?? 0) < 1 && (llm?.prefillTps ?? 0) > 0));
 
   useEffect(() => {
     if (!showSettings) {
