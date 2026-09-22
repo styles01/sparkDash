@@ -155,6 +155,7 @@ export class LlmProbe {
     // vLLM inference metrics from /metrics (null when not vLLM / missing series)
     this.kvCacheUsage = null;
     this.requestsRunning = null;
+    this.isPrefilling = null;
     this.requestsWaiting = null;
     this.ttftP95Seconds = null;
     /** Live recent-window mean TTFT (seconds) from histogram sum/count deltas. null when unavailable. */
@@ -1362,6 +1363,11 @@ export class LlmProbe {
     this.requestsRunning = busy ? 1 : 0;
     this.slotsActive = busy ? 1 : 0;
     this.slotsTotal = 1;
+    // Real prefill state from the engine (shim v5: set at enqueue, cleared at first
+    // token + job end). Fallback: prefill rate visible this window.
+    this.isPrefilling =
+      data?.is_prefilling === true ||
+      (data?.is_prefilling == null && Number(data?.prompt_tokens_total) !== Number(data?.completion_tokens_total) && this.prefillTps > 0);
     this.preemptionsTotal = null; // engine has no preemption concept (m2: clear, don't leak)
     // Single-stream engine: prefill and decode never overlap → no cached/uncached split.
     this.cachedPrefillTps = null;
@@ -3917,6 +3923,7 @@ async _collectSglangRecipeInfo() {
       waitingSlots: this.requestsWaiting ?? this.waitingSlots ?? 0,
       generationTps: this.generationTps,
       prefillTps: this.prefillTps,
+      isPrefilling: this.isPrefilling ?? false,
       cachedPrefillTps: this.cachedPrefillTps,
       uncachedPrefillTps: this.uncachedPrefillTps,
       totalOutputTokens: this.totalOutputTokens,
