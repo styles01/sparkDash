@@ -323,6 +323,11 @@ function fmtUptime(seconds: number | null | undefined): string {
 
 const HISTORY = 60;
 
+// Dial envelopes = the box's observed ceilings (GB10): decode has never exceeded
+// ~120 tok/s, prefill ~2960 tok/s. Dials encode share-of-box, not share-of-infinity.
+const DECODE_DIAL_MAX = 120;
+const PREFILL_DIAL_MAX = 3000;
+
 interface History {
   genTps: number[];
   prefillTps: number[];
@@ -1160,9 +1165,9 @@ export function LlmPanel({
           {/* ═══ ROW 3 — HERO STATS (4 cards: 2 spark + 2 odometer) ═══ */}
           <div className="llm-hero-grid">
             <StatSparkCard label="Decode tok/s" value={fmtNum(displayGenTps, 1)} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
-            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayAggTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)} · avg ${fmtNum(prefillAvg, 1)} · peak ${fmtNum(prefillPeak, 1)}`} color={tpsColor(displayAggTps)} sparkData={sparkGen} />
-            <OdometerCard label="Prefill avg tok/s" value={prefillAvg ?? 0} max={100} displayValue={fmtNum(prefillAvg ?? 0, 1)} sub={`decode ${fmtNum(genAvg ?? 0, 1)}`} color={tpsColor(prefillAvg ?? 0)} sparkData={sparkSingle} />
-            <OdometerCard label="Prefill peak tok/s" value={prefillPeak ?? 0} max={100} displayValue={fmtNum(prefillPeak ?? 0, 1)} sub={`decode ${fmtNum(displayPeak, 1)}`} color={tpsColor(prefillPeak ?? 0)} sparkData={sparkPeak} />
+            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayAggTps, 1)} sub={`${fmtNum(displayPrefillTps, 1)} · avg ${fmtNum(prefillAvg ?? 0, 1)} · peak ${fmtNum(prefillPeak ?? 0, 1)}`} color={tpsColor(displayAggTps)} sparkData={sparkGen} />
+            <OdometerCard label="Prefill avg tok/s" value={prefillAvg ?? 0} max={PREFILL_DIAL_MAX} displayValue={fmtNum(prefillAvg ?? 0, 1)} sub={`decode ${fmtNum(genAvg ?? 0, 1)}`} color={tpsColor(prefillAvg ?? 0)} sparkData={sparkSingle} />
+            <OdometerCard label="Prefill peak tok/s" value={prefillPeak ?? 0} max={PREFILL_DIAL_MAX} displayValue={fmtNum(prefillPeak ?? 0, 1)} sub={`decode ${fmtNum(displayPeak, 1)}`} color={tpsColor(prefillPeak ?? 0)} sparkData={sparkPeak} />
           </div>
 
           {/* ═══ ROW 4 — GAUGE ARCS ═══ */}

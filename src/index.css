@@ -3271,13 +3271,14 @@ html {
 .llm-hero-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 2px;
+  gap: 8px;
 }
 .llm-gauge-row {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 2px;
+  gap: 8px;
 }
+.llm-gauge-row > :last-child:nth-child(odd) { grid-column: 1 / -1; }
 .llm-chart-row {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -3294,10 +3295,17 @@ html {
   gap: 2px;
 }
 @media (max-width: 640px) {
-  .llm-hero-grid { grid-template-columns: repeat(3, 1fr); }
-  .llm-gauge-row { grid-template-columns: repeat(3, 1fr); }
+  .llm-hero-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .llm-gauge-row { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  /* odd gauge count absorbs into a deliberate full-width card, never an orphan */
+  .llm-gauge-row > :last-child:nth-child(odd) { grid-column: 1 / -1; }
   .llm-chart-row { grid-template-columns: 1fr; }
   .llm-advanced-grid { grid-template-columns: repeat(3, 1fr); }
+}
+@media (min-width: 641px) and (max-width: 1024px) {
+  .llm-hero-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .llm-gauge-row { grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .llm-gauge-row > :last-child:nth-child(odd) { grid-column: 1 / -1; }
 }
 /* ─── LLM PANEL: COMPONENT STYLES (previously undefined) ─── */
 
