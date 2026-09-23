@@ -1405,7 +1405,17 @@ export class LlmProbe {
       this.mtpAcceptanceRate =
         mtpDrf > 0 ? Math.round((mtpAcc / mtpDrf) * 10000) / 10000 : null;
       if (this.mtpAcceptanceRate != null) {
-        this.perPositionAcceptance = [this.mtpAcceptanceRate];
+        // Real per-position bars from the engine when it reports them; else the
+        // legacy single overall-ratio element (Pos 0 only).
+        const byPos = Array.isArray(data?.mtp_accept_by_position) ? data.mtp_accept_by_position : null;
+        if (byPos && byPos.length > 0) {
+          this.perPositionAcceptance = byPos
+            .slice()
+            .sort((a, b) => (a?.position ?? 0) - (b?.position ?? 0))
+            .map((e) => (e && e.rate != null ? e.rate : null));
+        } else {
+          this.perPositionAcceptance = [this.mtpAcceptanceRate];
+        }
       }
     } else {
       this.mtpAcceptanceRate = null;
@@ -1523,24 +1533,41 @@ export class LlmProbe {
 
     if (dtSec > 0 && dtSec < 10) {
       const deltaOut = completion - this.lastTokenCounts.output;
-      const deltaIn = prompt - this.lastTokenCounts.input;
+      // Prefer the engine's DURING-prefill counter (climbs per prefill chunk) so
+      // the timeline shows a rising line through prefill; prompt_tokens_total is
+      // a single enqueue-time lump (one spike then flat) and stays the fallback.
+      // Live prefill rate from the engine (tokens / elapsed during the active
+      // prefill) — charts a real line during prefill. Counter diffs stay the
+      // fallback for engines without it.
+      const pfLive = Number(data?.prefill_rate);
+      const pfProcessed = Number(data?.prefill_tokens_processed_total);
+      const prefillBase = Number.isFinite(pfLive) && data?.prefill_rate != null
+        ? pfProcessed
+        : prompt;
+      const deltaIn = Number.isFinite(this.lastTokenCounts.prefillIn ?? NaN)
+        ? prefillBase - this.lastTokenCounts.prefillIn
+        : NaN;
       // Red-team M1: after a probe-failure reset (or first contact), the
       // counters are lifetime values but the poll window is ~2s — seeding the
       // baseline only avoids a giant fake spike into peak/perStream.
       const seedOnly =
         this._exl3Seeded !== true ||
         deltaOut < 0 ||
-        (Number.isFinite(prompt) && deltaIn < 0);
+        (Number.isFinite(deltaIn) && deltaIn < 0);
       if (seedOnly) {
         this._exl3Seeded = true;
       } else {
         this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-        if (Number.isFinite(prompt)) {
+        if (Number.isFinite(pfLive) && data?.prefill_rate != null) {
+          // Engine-reported live prefill rate — use as-is while prefilling.
+          this.prefillTps = data.prefill_rate > 0 ? data.prefill_rate : (busy ? this.prefillTps : 0);
+        } else if (Number.isFinite(deltaIn)) {
           this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
         } else if (!busy && this.generationTps <= 0) {
           this.prefillTps = 0;
         }
       }
+      if (Number.isFinite(deltaIn)) this.lastTokenCounts.prefillIn = prefillBase;
     } else if (!busy) {
       this.generationTps = 0;
       this.prefillTps = 0;

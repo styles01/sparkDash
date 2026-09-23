@@ -348,6 +348,8 @@ export interface LlmMetrics {
   slotsTotal: number;
   generationTps: number;
   prefillTps: number;
+  /** True while the engine is in a prefill phase right now (EXL3 shim /health is_prefilling). */
+  isPrefilling?: boolean | null;
   /** Live cached-prefill tok/s when the backend splits kinds (ds4, llama.cpp, sglang). */
   cachedPrefillTps?: number | null;
   /** Live uncached/computed prefill tok/s when split is available. */

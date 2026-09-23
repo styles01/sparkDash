@@ -560,6 +560,7 @@ function OdometerCard({
   value,
   max,
   displayValue,
+  sub,
   color,
   sparkData,
 }: {
@@ -567,6 +568,7 @@ function OdometerCard({
   value: number;
   max: number;
   displayValue: string;
+  sub?: string;
   color: string;
   sparkData: number[];
 }) {
@@ -574,7 +576,7 @@ function OdometerCard({
     <div className="llm-odometer-card">
       <div className="llm-odometer-label">{label}</div>
       <div className="llm-odometer-body">
-        <ArcGauge value={value} max={max} label="" displayValue={displayValue} sub="tok/s" color={color} size={100} />
+        <ArcGauge value={value} max={max} label="" displayValue={displayValue} sub={sub} color={color} size={100} />
       </div>
       <div className="llm-odometer-spark"><Sparkline data={sparkData} color={color} height={18} /></div>
     </div>
@@ -771,6 +773,7 @@ export function LlmPanel({
   const uncachedFull = useMetricsHistory(sparkId, `llm:${llmPort}.prefillUncached`);
   const genAvg = useMemo(() => avgPositive(genFull), [genFull]);
   const prefillAvg = useMemo(() => avgPositive(prefillFull), [prefillFull]);
+  const prefillPeak = useMemo(() => prefillFull.reduce((m, p) => (Number(p) > m ? Number(p) : m), 0), [prefillFull]);
   const cachedPrefillAvg = useMemo(() => avgPositive(cachedFull), [cachedFull]);
   const uncachedPrefillAvg = useMemo(() => avgPositive(uncachedFull), [uncachedFull]);
   const [history, setHistory] = useState<History>({
@@ -1157,9 +1160,9 @@ export function LlmPanel({
           {/* ═══ ROW 3 — HERO STATS (4 cards: 2 spark + 2 odometer) ═══ */}
           <div className="llm-hero-grid">
             <StatSparkCard label="Decode tok/s" value={fmtNum(displayGenTps, 1)} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
-            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayGenTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)}`} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
-            <OdometerCard label="Avg tok/s" value={displaySingleTps} max={100} displayValue={fmtNum(displaySingleTps, 1)} color={tpsColor(displaySingleTps)} sparkData={sparkSingle} />
-            <OdometerCard label="Peak tok/s" value={displayPeak} max={100} displayValue={fmtNum(displayPeak, 1)} color={tpsColor(displayPeak)} sparkData={sparkPeak} />
+            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayAggTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)} · avg ${fmtNum(prefillAvg, 1)} · peak ${fmtNum(prefillPeak, 1)}`} color={tpsColor(displayAggTps)} sparkData={sparkGen} />
+            <OdometerCard label="Prefill avg tok/s" value={prefillAvg ?? 0} max={100} displayValue={fmtNum(prefillAvg ?? 0, 1)} sub={`decode ${fmtNum(genAvg ?? 0, 1)}`} color={tpsColor(prefillAvg ?? 0)} sparkData={sparkSingle} />
+            <OdometerCard label="Prefill peak tok/s" value={prefillPeak ?? 0} max={100} displayValue={fmtNum(prefillPeak ?? 0, 1)} sub={`decode ${fmtNum(displayPeak, 1)}`} color={tpsColor(prefillPeak ?? 0)} sparkData={sparkPeak} />
           </div>
 
           {/* ═══ ROW 4 — GAUGE ARCS ═══ */}
