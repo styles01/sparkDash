@@ -265,7 +265,7 @@ export function TelemetryChart({
         const yFor = useLog
           ? (v: number) => {
               const lv = Math.log10(Math.max(v, yBot, 1));
-              const frac = (lv - Math.log10(Math.max(yBot, 1))) / ySpan;
+              const frac = Math.min(1, Math.max(0, (lv - Math.log10(Math.max(yBot, 1))) / ySpan));
               return plotY1 - frac * plotH;
             }
           : (v: number) => plotY1 - ((Math.min(yTop, Math.max(yBot, v)) - yBot) / ySpan) * plotH;

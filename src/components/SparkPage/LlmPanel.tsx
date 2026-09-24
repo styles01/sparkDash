@@ -1012,6 +1012,7 @@ export function LlmPanel({
   const lanesColor = (banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)";
 
   const sparkGen = history.genTps;
+  const sparkPrefill = history.prefillTps;
   const sparkAgg = history.genTps.map((g, i) => g + (history.prefillTps[i] ?? 0));
   const sparkAvg = history.genTps.map((_, i) => llm?.rollingAvgTpsPerSlot ?? history.genTps[i] ?? 0);
   const sparkSingle = history.genTps.map((_, i) => llm?.perStreamAvg ?? llm?.rollingAvgTpsPerSlot ?? history.genTps[i] ?? 0);
@@ -1164,10 +1165,10 @@ export function LlmPanel({
 
           {/* ═══ ROW 3 — HERO STATS (4 cards: 2 spark + 2 odometer) ═══ */}
           <div className="llm-hero-grid">
-            <StatSparkCard label="Decode tok/s" value={fmtNum(displayGenTps, 1)} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
-            <StatSparkCard label="Aggregate tok/s" value={fmtNum(displayAggTps, 1)} sub={`${fmtNum(displayPrefillTps, 1)} · avg ${fmtNum(prefillAvg ?? 0, 1)} · peak ${fmtNum(prefillPeak ?? 0, 1)}`} color={tpsColor(displayAggTps)} sparkData={sparkGen} />
-            <OdometerCard label="Prefill avg tok/s" value={prefillAvg ?? 0} max={PREFILL_DIAL_MAX} displayValue={fmtNum(prefillAvg ?? 0, 1)} sub={`decode ${fmtNum(genAvg ?? 0, 1)}`} color={tpsColor(prefillAvg ?? 0)} sparkData={sparkSingle} />
-            <OdometerCard label="Prefill peak tok/s" value={prefillPeak ?? 0} max={PREFILL_DIAL_MAX} displayValue={fmtNum(prefillPeak ?? 0, 1)} sub={`decode ${fmtNum(displayPeak, 1)}`} color={tpsColor(prefillPeak ?? 0)} sparkData={sparkPeak} />
+            <OdometerCard label="Decode tok/s" value={displayGenTps} max={DECODE_DIAL_MAX} displayValue={fmtNum(displayGenTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)}`} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
+            <OdometerCard label="Prefill tok/s" value={displayPrefillTps} max={PREFILL_DIAL_MAX} displayValue={fmtNum(displayPrefillTps, 1)} sub={`decode ${fmtNum(displayGenTps, 1)}`} color={tpsColor(displayPrefillTps)} sparkData={sparkPrefill} />
+            <OdometerCard label="Avg tok/s" value={genAvg ?? 0} max={DECODE_DIAL_MAX} displayValue={fmtNum(genAvg ?? 0, 1)} sub={`prefill avg ${fmtNum(prefillAvg ?? 0, 1)}`} color={tpsColor(genAvg ?? 0)} sparkData={sparkSingle} />
+            <OdometerCard label="Peak tok/s" value={displayPeak} max={DECODE_DIAL_MAX} displayValue={fmtNum(displayPeak, 1)} sub={`prefill peak ${fmtNum(prefillPeak ?? 0, 1)}`} color={tpsColor(displayPeak)} sparkData={sparkPeak} />
           </div>
 
           {/* ═══ ROW 4 — GAUGE ARCS ═══ */}
@@ -1213,7 +1214,7 @@ export function LlmPanel({
           <div className="llm-chart-row">
             <div className="llm-chart-block">
               <div className="llm-chart-title">Throughput <span className="llm-chart-sub">decode + prefill · last 60</span></div>
-              <TelemetryChart series={[genSeries, preSeries]} maxPoints={HISTORY} height={110} yUnit="" yUnitRight="" yMin={0} yMax={100} yMaxRight={2000} />
+              <TelemetryChart series={[genSeries, preSeries]} maxPoints={HISTORY} height={110} yUnit="" yUnitRight="" yMin={0} yMax={100} yMaxRight={3000} />
             </div>
             <div className="llm-chart-block">
               <div className="llm-chart-title">Latency <span className="llm-chart-sub">TTFT + E2E · seconds</span></div>
