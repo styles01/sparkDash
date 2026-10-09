@@ -4814,14 +4814,18 @@ async _collectSglangRecipeInfo() {
       reasoningEffort: this.reasoningEffort,
       reasoningEffortTs: this.reasoningEffortTs,
       // llama.cpp expanded surface
-      promptTokens: this.promptTokens,
-      promptTokensProcessed: this.promptTokensProcessed,
-      promptTokensCache: this.promptTokensCache,
+      promptTokens: this.promptTokens ?? this.totalPromptTokens,
+      promptTokensProcessed: this.promptTokensProcessed ?? (
+        this.totalPromptTokens != null && this.totalCachedTokens != null
+          ? Math.max(0, Math.round(this.totalPromptTokens - this.totalCachedTokens))
+          : null
+      ),
+      promptTokensCache: this.promptTokensCache ?? this.totalCachedTokens,
       cacheHitRatio: this.cacheHitRatio,
       nCtx: this.nCtx,
       isProcessing: this.isProcessing,
       nRemain: this.nRemain,
-      nDecoded: this.nDecoded,
+      nDecoded: this.nDecoded ?? this.totalOutputTokens,
       samplingParams: this.samplingParams,
       speculativeTypes: this.speculativeTypes,
       reasoningFormat: this.reasoningFormat,
