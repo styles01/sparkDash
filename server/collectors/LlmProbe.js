@@ -2172,15 +2172,15 @@ export class LlmProbe {
       } catch (e2) { console.error("[fills] gen err:", e2 && e2.message); }
     }
     if (this.totalCachedTokens != null) this.promptCachedTokens = Math.round(this.totalCachedTokens);
-    if (this.kvUsedTokens != null && this.kvPoolTokens != null) {
-      this.kvCacheTokensAvailable = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
-    }
-    if (this.kvPoolTokens != null && this.kvUsedTokens != null) {
-      this.remainingCtx = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
-      this.nRemain = this.remainingCtx;
-    }
 
     this._applyVllmKvPool(txt);
+    if (this.kvUsedTokens != null && this.kvPoolTokens != null) {
+      this.kvCacheTokensAvailable = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
+      this.remainingCtx = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
+      this.nRemain = this.remainingCtx;
+      this.kvUsedTokens = Math.max(this.kvUsedTokens, 0);
+    }
+
     // -- Real context usage: KV-cache pool occupancy in tokens --
     // usage gauge x pool capacity = tokens resident in the KV cache right
     // now. prompt/generation totals are LIFETIME counters (1.5M+ since
