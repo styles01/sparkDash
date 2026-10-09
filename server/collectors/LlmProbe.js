@@ -3578,6 +3578,10 @@ export class LlmProbe {
     if (tokens != null && this.kvCacheUsage != null && Number.isFinite(this.kvCacheUsage)) {
       const used = Math.min(1, Math.max(0, this.kvCacheUsage));
       this.kvCacheTokensAvailable = Math.max(0, Math.round(tokens * (1 - used)));
+      this.kvUsedTokens = Math.round(tokens * used);
+      this.kvPoolTokens = Math.round(tokens);
+      this.remainingCtx = Math.max(0, Math.round(tokens * (1 - used)));
+      this.nRemain = this.remainingCtx;
     } else {
       this.kvCacheTokensAvailable = null;
     }
