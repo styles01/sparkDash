@@ -2109,6 +2109,65 @@ export class LlmProbe {
     this.kvCacheUsage =
       this._getVllmMetric(txt, "kv_cache_usage_perc") ??
       this._getVllmMetric(txt, "gpu_cache_usage_perc");
+    // styles01 fills for tiles the FreeToken /v1/stats path owns but vLLM
+    // exposes by other means: n_ctx from /v1/models max_model_len, engine
+    // uptime from the host PID table (lane runs on the host network ns),
+    // sampler defaults from the served engine generation_config.json.
+    if (this.contextLength != null && this.nCtx == null) {
+      this.nCtx = Math.round(this.contextLength);
+    }
+    try {
+      const fs = require("fs");
+      const procDirs = fs.readdirSync("/host/proc").filter((p2) => /^[0-9]+$/.test(p2));
+      for (const pid of procDirs) {
+        try {
+          const cl = fs.readFileSync(`/host/proc/${pid}/cmdline`, "utf8").replace(/ /g, " ");
+          if (cl.includes("/usr/local/bin/vllm serve") && cl.includes("--port 8000")) {
+            const st = fs.readFileSync(`/host/proc/${pid}/stat`, "utf8");
+            const f = st.substring(st.lastIndexOf(")") + 2).split(" ");
+            const up = Number(fs.readFileSync("/host/proc/uptime", "utf8").split(" ")[0]);
+            const hz = 100;
+            const age = up - Number(f[21]) / hz;
+            if (Number.isFinite(age) && age > 0) {
+              this.engineUptimeSeconds = Math.round(age);
+            }
+            break;
+          }
+        } catch {}
+      }
+    } catch {}
+    if (this.temperature == null || this.topP == null) {
+      try {
+        const fs2 = require("fs");
+        const hub = "/host/root/home/jaita/MODELS/hf/hub";
+        const mdirs = fs2.readdirSync(hub).filter((d) => d.startsWith("models--"));
+        for (const d of mdirs) {
+          const snaps = `${hub}/${d}/snapshots`;
+          const snap = fs2.readdirSync(snaps)[0];
+          const gen = JSON.parse(fs2.readFileSync(`${snaps}/${snap}/generation_config.json`, "utf8"));
+          const t = Number(gen.temperature);
+          const tp = Number(gen.top_p);
+          const k = Number(gen.top_k);
+          if (Number.isFinite(t)) this.temperature = t;
+          if (Number.isFinite(tp)) this.topP = tp;
+          if (Number.isFinite(k) && k > 0) this.topK = k;
+          this.samplers = [
+            Number.isFinite(t) ? `temp ${t}` : null,
+            Number.isFinite(tp) ? `top_p ${tp}` : null,
+            Number.isFinite(k) && k > 0 ? `top_k ${k}` : null,
+          ].filter(Boolean);
+          break;
+        }
+      } catch {}
+    }
+    if (this.totalCachedTokens != null) this.promptCachedTokens = Math.round(this.totalCachedTokens);
+    if (this.kvUsedTokens != null && this.kvPoolTokens != null) {
+      this.kvCacheTokensAvailable = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
+    }
+    if (this.kvPoolTokens != null && this.kvUsedTokens != null) {
+      this.remainingCtx = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
+    }
+
     this._applyVllmKvPool(txt);
     // -- Real context usage: KV-cache pool occupancy in tokens --
     // usage gauge x pool capacity = tokens resident in the KV cache right
