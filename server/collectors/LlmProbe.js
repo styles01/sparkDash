@@ -2174,6 +2174,7 @@ export class LlmProbe {
     if (this.totalCachedTokens != null) this.promptCachedTokens = Math.round(this.totalCachedTokens);
 
     this._applyVllmKvPool(txt);
+    this._applyVllmSpec(txt);
     if (this.kvUsedTokens != null && this.kvPoolTokens != null) {
       this.kvCacheTokensAvailable = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
       this.remainingCtx = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
@@ -3570,6 +3571,36 @@ export class LlmProbe {
    * multi-engine sum cannot drive the free count negative.
    * @param {string} txt
    */
+  /**
+   * Spec-decode + request counters from Prometheus /metrics (lifetime).
+   * Our vLLM build exposes nothing in /server_info speculative; everything
+   * lives in prom counters, readable even at idle.
+   */
+  _applyVllmSpec(txt) {
+    const drafts = this._getPromMetric(txt, "spec_decode_num_drafts_total");
+    const draftTokens = this._getPromMetric(txt, "spec_decode_num_draft_tokens_total");
+    const accepted = this._getPromMetric(txt, "spec_decode_num_accepted_tokens_total");
+    if (drafts != null) this.specDrafts = Math.round(drafts);
+    if (accepted != null) this.specHits = Math.round(accepted);
+    if (draftTokens != null) this.specGeneratedTokens = Math.round(draftTokens);
+    if (accepted != null) this.mtpAcceptedTokens = Math.round(accepted);
+    if (draftTokens != null) this.mtpDraftedTokens = Math.round(draftTokens);
+    if (draftTokens > 0 && accepted != null) {
+      this.mtpAcceptanceRate = Math.round((accepted / draftTokens) * 1000) / 1000;
+      this.specAcceptanceRate = this.mtpAcceptanceRate;
+    }
+    if (drafts > 0 && draftTokens > 0) {
+      this.specMeanLen = Math.round((draftTokens / drafts) * 100) / 100;
+    }
+    const perPos = [];
+    for (let p = 0; p < 8; p++) {
+      const v = this._getPromMetricLabeled(txt, "spec_decode_num_accepted_tokens_per_pos_total", "position", String(p));
+      if (v != null) perPos.push(v);
+      else break;
+    }
+    if (perPos.length) this.perPositionAcceptance = perPos;
+    this.speculativeTypes = ["mtp"];
+  }
   _applyVllmKvPool(txt) {
     const tokens = this._sumPromLabel(txt, "vllm:cache_config_info", "kv_cache_size_tokens");
     const bytes = this._sumPromLabel(txt, "vllm:cache_config_info", "kv_cache_memory_bytes");
