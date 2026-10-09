@@ -4713,6 +4713,7 @@ async _collectSglangRecipeInfo() {
   }
 
   _getSnapshot() {
+    if (this.totalPromptTokens != null && this.promptTokens == null) console.error("[snap] promptTokens null while totalPrompt=", this.totalPromptTokens);
     const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
     return {
       available: metricsLive,
