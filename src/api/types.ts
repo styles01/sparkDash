@@ -23,6 +23,8 @@ export interface SparkConfig {
     host: string;
     user: string;
     auth: "key" | "pass";
+    /** TCP port for SSH. Omitted or invalid values are stored as 22. */
+    port?: number;
     /** Request-only: never returned by GET/list */
     password?: string;
     /** Response-only: true when a password is held in server memory */
@@ -167,6 +169,8 @@ export interface HardwareInfo {
   cpuCores: number | null;
   totalMemoryGB: number | null;
   gpuChip: string | null;
+  /** Number of physical GPUs behind `gpuChip` (absent on DGX Spark units). */
+  gpuCount?: number;
   cudaDriver: string | null;
   storageModel: string | null;
 }
@@ -188,6 +192,15 @@ export interface GpuThrottle {
   smClockPct: number | null;
   /** Human-readable active reasons (tooltip). */
   detail: string;
+}
+
+/** One health finding for a Spark (server rules in server/health/HealthEvaluator.js). */
+export interface HealthFinding {
+  id: "thermal" | "low-power" | "memory" | "xid" | "oom" | "concurrency" | "link-speed";
+  severity: "warn" | "critical";
+  title: string;
+  detail: string;
+  hint: string;
 }
 
 export interface GpuMetrics {
@@ -212,12 +225,38 @@ export interface GpuMetrics {
   throttle?: GpuThrottle | null;
   /** Kernel NVRM NV_ERR_NO_MEMORY count since boot (cached ~60s). */
   nvErrNoMemory?: number;
+  /** Kernel Xid errors and OOM-killer kills since boot (cached ~60s). null when the journal is unreadable. */
+  kernelErrors?: { xid: number; oomKills: number; lastXid: string | null } | null;
+  /**
+   * Per-physical-GPU breakdown for multi-card hosts. The fields above stay the
+   * fleet-wide aggregate (hottest / busiest card, summed power and VRAM), so a
+   * one-GPU DGX Spark has exactly one entry here mirroring them.
+   */
+  gpus?: GpuDevice[];
+}
+
+/** One physical GPU as reported by nvidia-smi (`index,name,uuid`). */
+export interface GpuDevice {
+  index: number;
+  name: string | null;
+  uuid: string | null;
+  temperature: number;
+  usage: number;
+  power: { draw: number; limit: number };
+  vram: { used: number; total: number; percentage: number; available: number };
+  throttle?: GpuThrottle | null;
+  /** Processes holding memory on this card only. */
+  processes?: Array<{ pid: number; name: string; vramMB: number }>;
 }
 
 // ─── CPU metrics ─────────────────────────────────────────
 export interface CpuMetrics {
   usage: number;
   temperature: number;
+  /** What the temperature reading is: "CPU", or "ACPI"/"SoC" for a board zone. */
+  temperatureLabel?: string | null;
+  /** Raw sensor name behind the reading (e.g. "acpitz", "coretemp"). */
+  temperatureSource?: string | null;
   draw: number;
   tdp: number;
 }
@@ -338,9 +377,11 @@ export interface RecipeInfo {
 // ─── LLM metrics ─────────────────────────────────────────
 export interface LlmMetrics {
   available: boolean;
-  backend: "vllm" | "llama.cpp" | "sglang" | "ds4" | "exl3" | "q27" | null;
+  backend: "vllm" | "llama.cpp" | "sglang" | "ds4" | "exl3" | "q27" | "tensorfold" | "freetoken" | null;
   modelId: string | null;
   modelPath: string | null;
+  /** Exact served request IDs from /v1/models, in response order. */
+  models?: string[];
   contextLength: number | null;
   /** GPU memory utilization for the LLM engine (0–1), e.g. 0.9. Only from vLLM internal info. */
   gpuMemoryUtilization: number | null;
@@ -350,14 +391,33 @@ export interface LlmMetrics {
   prefillTps: number;
   /** True while the engine is in a prefill phase right now (EXL3 shim /health is_prefilling). */
   isPrefilling?: boolean | null;
+  /** A prompt is being processed right now. With no live rate available (TensorFold reports totals only for finished requests) the UI says "prefilling" instead of 0. */
+  prefillActive?: boolean;
   /** Live cached-prefill tok/s when the backend splits kinds (ds4, llama.cpp, sglang). */
   cachedPrefillTps?: number | null;
   /** Live uncached/computed prefill tok/s when split is available. */
   uncachedPrefillTps?: number | null;
   /** Cumulative total output (generation) tokens as reported by the LLM server */
   totalOutputTokens: number;
-  /** vLLM KV cache usage fraction (0–1). null when backend !== vllm or unreachable. */
+  /** Cumulative cached (prefix-cache served) prompt tokens. null when the backend does not expose the split. */
+  totalCachedTokens: number | null;
+  /** Cumulative total prompt (prefill) tokens as reported by the LLM server. null when the backend does not expose it. */
+  totalPromptTokens: number | null;
+  /**
+   * Share of the engine's KV cache pool held by requests (0–1): vLLM, q27,
+   * SGLang (`token_usage`) and TensorFold (`pool_tokens`). null when unknown.
+   */
   kvCacheUsage?: number | null;
+  /** Allocated KV-cache pool in tokens (vLLM `cache_config_info`). null when unknown. */
+  kvCacheTokens?: number | null;
+  /** Free tokens in that pool (pool × (1 − usage)). null when pool or usage is unknown. */
+  kvCacheTokensAvailable?: number | null;
+  /** Allocated KV-cache pool in bytes. null when unknown. */
+  kvCacheMemoryBytes?: number | null;
+  /** Engine KV cache pool size in GB (SGLang). null when the backend does not report it. */
+  kvCacheGb?: number | null;
+  /** Engine model weights resident in GPU memory, GB (SGLang). null when not reported. */
+  weightsGb?: number | null;
   /** vLLM running request count. null when unavailable. */
   requestsRunning?: number | null;
   /** vLLM waiting request count. null when unavailable. */
@@ -532,6 +592,8 @@ export interface LlmMetrics {
   e2eLatency?: number | null;
   /** Rolling average E2E latency over the last 10 inferences (seconds). */
   rollingAvgE2e?: number | null;
+  /** Engine uptime in seconds (vLLM process_start_time_seconds / shim StartedAt). */
+  engineUptimeSeconds?: number | null;
   /** DS4 engine uptime in seconds. */
   ds4Uptime?: number | null;
   /** vLLM inter-token latency p95 in seconds. */
@@ -541,6 +603,11 @@ export interface LlmMetrics {
   /** vLLM end-to-end request latency p95 in seconds. */
   e2eP95Seconds?: number | null;
   posture?: LlmPosture | null;
+  /**
+   * Epoch ms of the last poll in which this endpoint generated or prefilled
+   * tokens. Server memory only: null after a sparkDash restart until traffic.
+   */
+  lastActiveAt?: number | null;
   error: string | null;
 }
 
@@ -731,7 +798,11 @@ export interface SparkMetrics {
 // ─── Spark snapshot (server pushes this) ──────────────────
 export interface SparkSnapshot {
   id: string;
+  /** Active health findings, most important first is not guaranteed; sort with sortFindings. */
+  health?: HealthFinding[];
   name: string;
+  /** Why the last liveness check failed, when offline. null/absent when online. */
+  offlineReason?: string | null;
   /** Unit type: spark (DGX Spark) or host (dedicated GPU Linux box). */
   kind?: "spark" | "host";
   online: boolean;
@@ -793,19 +864,39 @@ export interface FleetEnergy {
   trackedNodeIds: string[];
   currentNodeIds: string[];
   freshNodeCount: number;
+  /** Tracked nodes without a fresh power reading right now (offline or stale telemetry). */
+  staleNodeIds?: string[];
   currentWatts30s: number | null;
   energy24hKwh: number | null;
   energy31dKwh: number | null;
   whPerOutputToken24h: number | null;
   outputTokens24h: number;
   coverage24hMs: number;
+  /** Window coverage24hMs is measured over (server-owned; fleet-size independent). */
+  coverage24hWindowMs?: number;
   coverage31dMs: number;
+  coverage31dWindowMs?: number;
   nodeCoverage24hMs: Record<string, number>;
   nodeCoverage31dMs: Record<string, number>;
   hourlyWatts24h: Array<number | null>;
 }
 
 // ─── API responses ────────────────────────────────────────
+/**
+ * How the server authenticates requests (GET /api/health).
+ * "open-remote" — bound off loopback with no SPARKDASH_TOKEN: anyone who can reach it can mutate.
+ * "required-missing" — the same bind with SPARKDASH_ALLOW_OPEN_REMOTE=0, failing closed.
+ */
+export type AuthMode = "bearer" | "loopback-open" | "open-remote" | "required-missing";
+
+export interface HealthResponse {
+  ok: boolean;
+  bindHost: string;
+  authMode: AuthMode;
+  errors: string[];
+  warnings: string[];
+}
+
 export interface Settings {
   pollIntervalMs: number;
   defaultLlmPort: number;
@@ -823,6 +914,20 @@ export interface Settings {
   showFleetExceptions: boolean;
   /** Overview search field + status filter. Off by default. */
   showOverviewSearch: boolean;
+  showLlmTokenTotals: boolean;
+  /** Benchmark dialogs offer "Copy image" — a PNG share card of the results. */
+  benchShareImage: boolean;
+  /** Electricity price per kWh for cost estimates on the energy page; null = not set. */
+  energyPricePerKwh: number | null;
+  /** Currency symbol shown with cost estimates. */
+  energyCurrency: string;
+  /**
+   * VRAM bars split by engine / system / free and judged by headroom. On by
+   * default (server DEFAULTS and the UI's pre-load fallback both say true).
+   */
+  showVramBreakdown: boolean;
+  /** Serve GET /metrics in Prometheus text format. Off by default (404 when off). */
+  prometheusExport: boolean;
 }
 
 export interface SparksListResponse {
@@ -1011,6 +1116,8 @@ export interface PrefillBenchConfig {
   port: number;
   modelId: string | null;
   contextSizes: number[];
+  /** Model context the run was started against (null/absent when unknown). */
+  contextLength?: number | null;
   host?: string;
   tls?: boolean;
 }
@@ -1020,6 +1127,20 @@ export interface PrefillBenchSizeResult {
   promptTokens: number;
   promptChars: number;
   prefillTps: number;
+  /** "server" = backend-reported prompt timing; "ttft" = tokens / (TTFT − calibrated overhead). */
+  method?: "server" | "ttft";
+  /** Prompt tokens served from the prefix cache (excluded from the rate). */
+  cachedTokens?: number;
+  /** Successful samples (the reported values are the median-rate one). */
+  samples?: number;
+  /** Samples the size asked for; samples < samplesRequested means a partial row (see `notice`). */
+  samplesRequested?: number;
+  /** The TTFT-method rate leans heavily on the overhead calibration (overhead > 30% of TTFT). */
+  lowConfidence?: boolean;
+  /** Why a row is partial (some samples failed or were cancelled). */
+  notice?: string;
+  /** Fixed per-request overhead subtracted from TTFT, ms. */
+  overheadMs?: number;
   ttftMs: number;
   ttftContentMs: number | null;
   completionTokens: number;
@@ -1065,6 +1186,127 @@ export interface PrefillBenchListResponse {
 export interface StartPrefillBenchRequest {
   port?: number;
   contextSizes: number[];
+  modelId?: string | null;
+  host?: string;
+  tls?: boolean;
+}
+
+// ─── LLM quality benchmark ───────────────────────────────
+export type QualityCategory = "qa" | "reason" | "arith" | "track" | "gsm8k" | "mmlu" | "follow" | "long";
+
+export interface QualityBenchConfig {
+  port: number;
+  modelId: string | null;
+  /** Model context from the live probe or `/v1/models` (null when unknown). */
+  contextLength: number | null;
+  suiteVersion: number;
+  /** Scoring-rule version; runs with different values are not comparable. Absent on old runs (= 1). */
+  scoringVersion?: number;
+  categories: QualityCategory[];
+  longSizes: number[];
+  longItems: number;
+  concurrency: number;
+  /** Free-text run label, e.g. "fp4 KV". */
+  label: string;
+  host?: string;
+  tls?: boolean;
+}
+
+export interface QualityItemResult {
+  id: string;
+  category: QualityCategory;
+  ok: boolean;
+  /** Short reply excerpt (head for direct answers, tail for thinking categories). */
+  excerpt: string;
+  /** sha256 prefix of the reply — "identical replies" in compare. */
+  hash: string;
+  finishReason: string | null;
+  completionTokens: number;
+  promptTokens: number;
+  durationMs: number;
+  error: string | null;
+  /** Parsed answer, failing test line, or long-recall key counts. */
+  detail: string | null;
+  longCorrect?: number;
+  longTotal?: number;
+  longStale?: number;
+}
+
+export interface QualityCategorySummary {
+  /** Passed among scored items (request errors/timeouts excluded). */
+  passed: number;
+  /** Every item run, errors included. */
+  total: number;
+  /** Items that got an answer (total − errors); pct = passed / scored. Absent on old runs. */
+  scored?: number;
+  pct: number | null;
+  errors: number;
+  meanCompletionTokens: number;
+  hitMaxTokens: number;
+  keysFound?: number;
+  keysTotal?: number;
+  stale?: number;
+}
+
+export interface QualityBenchResults {
+  /** Omitted in history summaries — fetch the run by id for per-item rows. */
+  items?: QualityItemResult[];
+  itemCount?: number;
+  categories: Partial<Record<QualityCategory, QualityCategorySummary>>;
+  /** Mean of the category percentages. */
+  overallPct: number | null;
+  /** Long sizes skipped because they exceed the model context. */
+  skippedLongSizes: number[];
+}
+
+export interface QualityBenchProgress {
+  currentCategory: QualityCategory | null;
+  categoryDone: number;
+  categoryTotal: number;
+  done: number;
+  total: number;
+  message: string;
+}
+
+export interface QualityBenchJob {
+  benchId: string;
+  sparkId: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  startedAt: number;
+  completedAt: number | null;
+  config: QualityBenchConfig;
+  progress: QualityBenchProgress;
+  results: QualityBenchResults;
+  error: string | null;
+  durationMs: number;
+}
+
+export interface QualityBenchDefaults {
+  categories: QualityCategory[];
+  defaultCategories: QualityCategory[];
+  longSizes: number[];
+  defaultLongSizes: number[];
+  defaultLongItems: number;
+  maxLongItems: number;
+  defaultConcurrency: number;
+  maxConcurrency: number;
+}
+
+export interface QualityBenchListResponse {
+  active: QualityBenchJob | null;
+  last: QualityBenchJob | null;
+  /** Newest first, last 30 runs; summaries only (no per-item rows). */
+  history: QualityBenchJob[];
+  defaults: QualityBenchDefaults;
+}
+
+export interface StartQualityBenchRequest {
+  port?: number;
+  categories: QualityCategory[];
+  longSizes?: number[];
+  longItems?: number;
+  concurrency?: number;
+  label?: string;
   modelId?: string | null;
   host?: string;
   tls?: boolean;
@@ -1164,4 +1406,332 @@ export interface ShowcaseListResponse {
 export interface ShowcaseStartResponse {
   sessionId: string;
   status: "running";
+}
+
+export interface ActivityEvent {
+  id: number;
+  ts: number;
+  type: string;
+  severity: "info" | "warn" | "error" | "success";
+  sparkId?: string | null;
+  sparkName?: string | null;
+  message: string;
+  data?: unknown;
+}
+
+// ─── User-registered LLM launchers (start.sh / stop.sh) ───
+export interface LlmLauncher {
+  id: string;
+  name: string;
+  /** Absolute directory (or ~/…) holding the scripts. */
+  dir: string;
+  startScript: string;
+  stopScript: string;
+  /** LLM port this model serves on, used to show "serving" when the probe sees it. */
+  port: number | null;
+  notes: string;
+  createdAt?: number;
+}
+
+export type LlmLauncherInput = {
+  name: string;
+  dir: string;
+  startScript?: string;
+  stopScript?: string;
+  port?: number | null;
+  notes?: string;
+};
+
+export type LauncherAction = "start" | "stop" | "attach";
+export type LauncherJobStatus = "running" | "completed" | "failed" | "cancelled" | "detached";
+export type LauncherRunState = "running" | "stopped" | "unknown";
+
+export interface LauncherJob {
+  id: string;
+  sparkId: string;
+  launcherId: string;
+  launcherName: string;
+  action: LauncherAction;
+  status: LauncherJobStatus;
+  exitCode: number | null;
+  startedAt: number;
+  finishedAt: number | null;
+  error: string | null;
+}
+
+export interface LauncherListResponse {
+  launchers: LlmLauncher[];
+  job: LauncherJob | null;
+  statuses?: Record<string, LauncherRunState>;
+}
+
+export interface LauncherJobRead {
+  job: LauncherJob;
+  lines: { seq: number; text: string }[];
+  partial: string;
+  nextSeq: number;
+  truncated: boolean;
+}
+
+// ─── Detailed fleet pages: history APIs ───
+/** One bucket of token traffic for one (Spark, port, model). `t` is a UTC date ("2026-10-07") or UTC hour ("2026-10-07T14"). */
+export interface TokenHistoryRow {
+  t: string;
+  sparkId: string;
+  port: number;
+  modelId: string;
+  promptTokens: number;
+  completionTokens: number;
+  /** Prompt tokens served from the prefix cache (always <= promptTokens). */
+  cachedTokens: number;
+}
+
+export interface TokenHistory {
+  generatedAt: number;
+  retention: { days: number; hours: number };
+  firstDay: string | null;
+  firstHour: string | null;
+  day: TokenHistoryRow[];
+  hour: TokenHistoryRow[];
+}
+
+/** One UTC hour of fleet energy. `t` is the hour start in ms. */
+export interface EnergyHistoryRow {
+  t: number;
+  nodeWh: Record<string, number>;
+  nodeCoverageMs: Record<string, number>;
+  avgWatts: number | null;
+  fleetEnergyWh: number;
+  fleetCoverageMs: number;
+  outputTokens: number;
+  coveredOutputTokens: number;
+}
+
+export interface EnergyHistory {
+  estimated: boolean;
+  membershipChanged: boolean;
+  generatedAt: number;
+  retentionMs: number;
+  nodeIds: string[];
+  hourly: EnergyHistoryRow[];
+}
+
+export interface ActivityEventsPage {
+  events: ActivityEvent[];
+  /** Id of the oldest event the server still holds (null when it has none). */
+  oldestId: number | null;
+}
+
+// ─── Tool Eval (tool-eval-bench on a Spark) ───────────────
+
+export type ToolEvalKind =
+  | "bool" | "int" | "float" | "string" | "text" | "choice" | "csv" | "list"
+  | "repeat" | "path" | "url" | "json" | "range" | "secret";
+
+export interface ToolEvalArgSpec {
+  name: string;
+  flag: string;
+  kind: ToolEvalKind;
+  group: string;
+  label: string;
+  help: string;
+  default?: number | string;
+  min?: number;
+  max?: number;
+  choices?: string[];
+  /** RegExp source (the server strips the RegExp object). */
+  pattern?: string;
+  itemPattern?: string;
+  maxItems?: number;
+  secret?: boolean;
+  maxLen?: number;
+  maxBytes?: number;
+}
+
+export interface ToolEvalGroup {
+  id: string;
+  label: string;
+  help: string;
+}
+
+export interface ToolEvalSpec {
+  groups: ToolEvalGroup[];
+  args: ToolEvalArgSpec[];
+  backends: string[];
+  categories: string[];
+  types: Record<string, string>;
+  install: { extras: string[]; source?: string };
+}
+
+export interface ToolEvalStatus {
+  reachable?: boolean;
+  installed: boolean;
+  version: string | null;
+  path: string | null;
+  uv: string | null;
+  python: string | null;
+  pythonVersion: string | null;
+  workDir: string | null;
+  error: string | null;
+}
+
+export interface ToolEvalUpdateCheck {
+  installed: boolean;
+  installedCommit?: string | null;
+  latestCommit?: string | null;
+  latestDate?: string | null;
+  /** null when it cannot be told (no commit in the installed version, or GitHub did not answer). */
+  upToDate?: boolean | null;
+  error?: string | null;
+}
+
+export type ToolEvalRunStatus = "running" | "completed" | "failed" | "stopped" | "gone";
+
+export interface ToolEvalRunSummary {
+  finalScore: number | null;
+  rating: string | null;
+  deployability: number | null;
+  responsiveness: number | null;
+  totalScenarios: number | null;
+  safetyWarnings: number;
+  toolRunId: string | null;
+  model: string | null;
+  backend: string | null;
+  counts: { pass: number; partial: number; fail: number; other: number } | null;
+  toolVersion: string | null;
+}
+
+export interface ToolEvalRun {
+  id: string;
+  sparkId: string;
+  type: string;
+  typeLabel: string;
+  status: ToolEvalRunStatus;
+  startedAt: number;
+  finishedAt: number | null;
+  exitCode: number | null;
+  label: string;
+  port: number;
+  model: string | null;
+  baseUrl: string;
+  command: string;
+  options: Record<string, unknown>;
+  summary: ToolEvalRunSummary | null;
+  resultCached: boolean;
+}
+
+export type ToolEvalJobStatus = "running" | "completed" | "failed" | "cancelled" | "detached" | "stopped";
+
+export interface ToolEvalJob {
+  id: string;
+  sparkId: string;
+  kind: "run" | "attach" | "install";
+  type: string | null;
+  status: ToolEvalJobStatus;
+  exitCode: number | null;
+  startedAt: number;
+  finishedAt: number | null;
+  error: string | null;
+}
+
+export interface ToolEvalLine {
+  seq: number;
+  text: string;
+  stream?: "out" | "err";
+}
+
+export interface ToolEvalEvent {
+  seq: number;
+  event: string;
+  [key: string]: unknown;
+}
+
+export interface ToolEvalScenarioProgress {
+  id: string | null;
+  title: string | null;
+  category: string | null;
+  status: string;
+  points: number | null;
+  durationSeconds: number | null;
+}
+
+export interface ToolEvalProgress {
+  phase: string;
+  server: { baseUrl: string | null; backend: string | null } | null;
+  model: string | null;
+  total: number | null;
+  index: number;
+  done: number;
+  current: { id: string | null; title: string | null; category: string | null } | null;
+  counts: { pass: number; partial: number; fail: number; other: number };
+  points: number;
+  scenarios: ToolEvalScenarioProgress[];
+  finalScore: number | null;
+  error: { code: string; message: string | null } | null;
+}
+
+export interface ToolEvalLive {
+  job: ToolEvalJob;
+  lines: ToolEvalLine[];
+  events: ToolEvalEvent[];
+  partial: string;
+  progress: ToolEvalProgress;
+  nextLine: number;
+  nextEvent: number;
+}
+
+export interface ToolEvalStreamRead {
+  run: ToolEvalRun | null;
+  live: ToolEvalLive | null;
+}
+
+export interface ToolEvalInstallRead {
+  job: ToolEvalJob;
+  lines: ToolEvalLine[];
+  partial?: string;
+  nextLine: number;
+}
+
+export interface ToolEvalRunRequest {
+  type: string;
+  options: Record<string, unknown>;
+  extraArgs?: string;
+  port?: number;
+  useSavedKey?: boolean;
+  dryRun?: boolean;
+}
+
+export interface ToolEvalPreviewResponse {
+  ok: boolean;
+  command: string;
+  port?: number;
+  usesSavedKey?: boolean;
+  dryRun?: { ok: boolean; exitCode: number | null; output: string; error: string | null };
+}
+
+export interface ToolEvalProbeResponse {
+  ok: boolean;
+  exitCode: number | null;
+  output: string;
+  error: string | null;
+  target: string;
+}
+
+export interface ToolEvalRunList {
+  runs: ToolEvalRun[];
+  active: ToolEvalJob | null;
+}
+
+/** Error thrown by the Tool Eval client; carries the server's per-field messages and any busy job. */
+export class ToolEvalApiError extends Error {
+  status: number;
+  errors: string[];
+  active: ToolEvalJob | null;
+  constructor(message: string, status: number, errors: string[] = [], active: ToolEvalJob | null = null) {
+    super(message);
+    this.name = "ToolEvalApiError";
+    this.status = status;
+    this.errors = errors;
+    this.active = active;
+  }
 }

@@ -33,6 +33,7 @@ import {
   normalizeDecodeBenchType,
   DECODE_BENCH_DEFAULT_TYPE,
   DECODE_BENCH_TYPES,
+  DECODE_CODE_WARMUP_PROMPT,
 } from "../../src/shared/llmPrompts.js";
 import { formatLlmBaseUrl } from "../../src/shared/llmTarget.js";
 
@@ -123,7 +124,9 @@ function decodeRequestBody(modelId, prompt, maxTokens) {
  */
 async function warmupDecode({ baseUrl, modelId, abortSignal, apiKey, debug = false, promptType = DECODE_BENCH_DEFAULT_TYPE }) {
   const url = `${baseUrl}/v1/chat/completions`;
-  const warmupPrompt = decodeBenchPromptForType(promptType);
+  const kind = normalizeDecodeBenchType(promptType);
+  const warmupPrompt =
+    kind === "code" ? DECODE_CODE_WARMUP_PROMPT : decodeBenchPromptForType(kind);
   const body = decodeRequestBody(modelId, warmupPrompt, WARMUP_MAX_TOKENS);
   const ctrl = new AbortController();
   const onParentAbort = () => ctrl.abort();
@@ -434,8 +437,24 @@ export class DecodeBenchManager {
     this.historyBySpark = new Map();
     this.historyPath = historyPath;
     this.activePath = activePath;
+    /** @type {((kind: string, job: object) => void) | null} */
+    this._onEvent = null;
     this._loadHistory();
     this._recoverInterruptedActive();
+  }
+
+  /** Optional sink invoked once when a job reaches completed/failed/cancelled. */
+  setEventSink(fn) {
+    this._onEvent = typeof fn === "function" ? fn : null;
+  }
+
+  _emitFinished(job) {
+    if (!this._onEvent) return;
+    try {
+      this._onEvent("decode", job);
+    } catch {
+      /* event recording must never break the bench */
+    }
   }
 
   activeCount() {
@@ -913,6 +932,7 @@ export class DecodeBenchManager {
       this.activeBySpark.delete(job.sparkId);
       this._pushHistory(job);
       this._checkpointActive();
+      this._emitFinished(job);
     }
   }
 

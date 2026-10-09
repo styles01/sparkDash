@@ -102,11 +102,28 @@ test("vLLM probe: counter diffs + tiles; skips get_server_info when known vllm",
   assert.equal(snap.slotsActive, 2);
   assert.equal(snap.requestsWaiting, 1);
   assert.equal(snap.kvCacheUsage, 0.42);
+  assert.equal(snap.kvCacheTokens, null);
+  assert.equal(snap.kvCacheTokensAvailable, null);
+  assert.equal(snap.kvCacheGb, null); // vLLM reports no pool size
+  assert.equal(snap.weightsGb, null);
   assert.equal(snap.preemptionsTotal, 3);
   assert.equal(snap.prefixCacheHitRate, 0.5);
+  assert.equal(snap.totalCachedTokens, 10); // prefix_cache_hits_total is token-granular
   assert.equal(snap.mtpAcceptanceRate, 0.8);
   assert.equal(snap.available, true);
   assert.ok(!hits.some((h) => h.includes("get_server_info")));
+});
+
+test("vLLM: older gpu_cache_usage_perc stands in for kv_cache_usage_perc", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 8000);
+  const legacy = VLLM_METRICS.replace("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc");
+  probe._applyVllmMetrics(legacy, 2);
+  assert.equal(probe.kvCacheUsage, 0.42);
+  // The current name wins when both are exposed.
+  probe._applyVllmMetrics(VLLM_METRICS + 'vllm:gpu_cache_usage_perc{engine="0"} 0.99\n', 2);
+  assert.equal(probe.kvCacheUsage, 0.42);
+  probe._applyVllmMetrics(VLLM_METRICS.replace(/^vllm:kv_cache_usage_perc.*\n/m, ""), 2);
+  assert.equal(probe.kvCacheUsage, null);
 });
 
 test("vLLM idle: flat counters → 0 tok/s (not sticky gauge logic)", async () => {
@@ -304,6 +321,7 @@ test("llama.cpp probe: n_prompt_tokens_cache → cached vs uncached prefill", as
   };
   const snap = await probe.probe();
   assert.equal(snap.prefillTps, 10); // processed (25-5)/2
+  assert.equal(snap.totalCachedTokens, 40); // n_prompt_tokens_cache cumulative
   assert.equal(snap.uncachedPrefillTps, 10); // (25-5)/2
   assert.equal(snap.cachedPrefillTps, 15); // (40-10)/2
 });
@@ -392,4 +410,32 @@ test("known llama.cpp redetect still uses /slots (not forced OpenAI)", async () 
   assert.equal(probe.backendType, "llama.cpp");
   assert.equal(probe.serverIsOpenAI, false);
   assert.ok(hits.includes("/slots"));
+});
+
+test("vLLM cache_config_info: free tokens from pool size and usage", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 8000);
+  const body = [
+    'vllm:kv_cache_usage_perc{engine="0",model_name="m"} 0.4',
+    'vllm:cache_config_info{block_size="64",kv_cache_dtype_skip_layers="[]",kv_cache_memory_bytes="15032385536",kv_cache_size_tokens="883552",num_cpu_blocks="None",num_gpu_blocks="553"} 1.0',
+  ].join("\n");
+  probe._applyVllmMetrics(body, 2);
+  assert.equal(probe.kvCacheUsage, 0.4);
+  assert.equal(probe.kvCacheTokens, 883552);
+  assert.equal(probe.kvCacheMemoryBytes, 15032385536);
+  assert.equal(probe.kvCacheTokensAvailable, Math.round(883552 * 0.6));
+});
+
+test("vLLM cache_config_info: sums pools across engines and clamps usage", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 8000);
+  probe._applyVllmMetrics(
+    [
+      'vllm:kv_cache_usage_perc{engine="0"} 1.4',
+      'vllm:cache_config_info{engine="0",kv_cache_size_tokens="1000",kv_cache_memory_bytes="100"} 1',
+      'vllm:cache_config_info{engine="1",kv_cache_size_tokens="2000",kv_cache_memory_bytes="50"} 1',
+    ].join("\n"),
+    2
+  );
+  assert.equal(probe.kvCacheTokens, 3000);
+  assert.equal(probe.kvCacheMemoryBytes, 150);
+  assert.equal(probe.kvCacheTokensAvailable, 0);
 });

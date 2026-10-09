@@ -11,14 +11,15 @@ export default defineConfig({
     },
   },
   server: {
-    host: "0.0.0.0",
+    host: "127.0.0.1",
     port: 5173,
-    // Allow HMR when opened via LAN IP / Docker
+    // Allow HMR in Docker
     watch: {
       usePolling: process.env.CHOKIDAR_USEPOLLING === "1",
     },
     proxy: {
       "/api": "http://127.0.0.1:5555",
+      "/metrics": "http://127.0.0.1:5555",
       "/ws": {
         target: "ws://127.0.0.1:5555",
         ws: true,

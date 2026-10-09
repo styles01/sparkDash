@@ -9,22 +9,75 @@ import { ComfyProbe } from "../collectors/ComfyProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
 import { llmDaily } from "../collectors/LlmDaily.js";
+import { HealthEvaluator } from "../health/HealthEvaluator.js";
 import { sshExec } from "../collectors/ssh.js";
 import {
-  POLL_INTERVAL_GPU,
-  POLL_INTERVAL_CPU,
-  POLL_INTERVAL_NETWORK,
   POLL_INTERVAL_STORAGE,
-  POLL_INTERVAL_LLM,
-  POLL_INTERVAL_COMFY,
-  POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
   POLL_INTERVAL_HERMES,
   POLL_INTERVAL_TAILSCALE,
   LLM_PORT,
   COMFY_PORT,
   HOST_PATHS,
+  resolveFastPollIntervals,
 } from "../config.js";
+
+/**
+ * Domains on a timer of their own that follow Settings → Poll interval
+ * (unless pinned by env — see resolveFastPollIntervals). LLM and ComfyUI follow
+ * it too but are armed only while their monitoring is on. Storage, liveness,
+ * Tailnet, Hermes and the NV_ERR journal scan keep their own cadences.
+ */
+const FAST_TIMER_DOMAINS = ["gpu", "cpu", "network", "ram", "memory"];
+
+/**
+ * Liveness retry schedule. Network failures widen gradually — a rebooting host
+ * comes back on its own. Credential failures get a handful of quick attempts
+ * and then effectively stop: they are a configuration problem, and hammering a
+ * host that keeps refusing us is exactly how one mistyped unit produced ~60k
+ * failed logins a day. The slow tail is kept so the unit recovers by itself
+ * when the fix happens on the *remote* side (an authorized_keys entry added
+ * there never touches this install), and editing the unit resets the count so
+ * a local fix retries immediately.
+ */
+const LIVENESS_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000];
+/** Quick attempts before a credential failure is treated as "stopped". */
+const LIVENESS_AUTH_ATTEMPTS = 5;
+/** Safety-net cadence once those attempts are spent: ~96 logins a day, not 60k. */
+const LIVENESS_AUTH_IDLE_MS = 15 * 60_000;
+
+/** True when the liveness error is a credential problem, not a network one. */
+export function isSshAuthFailure(message) {
+  return /permission denied|publickey|password|authentication/i.test(String(message || ""));
+}
+
+/** How long to wait before the next liveness attempt. */
+export function nextLivenessDelayMs(failures, reason) {
+  if (isSshAuthFailure(reason)) {
+    if (failures >= LIVENESS_AUTH_ATTEMPTS) return LIVENESS_AUTH_IDLE_MS;
+    return LIVENESS_BACKOFF_MS[Math.min(Math.max(failures, 1), LIVENESS_BACKOFF_MS.length) - 1];
+  }
+  const index = Math.min(Math.max(failures, 1), LIVENESS_BACKOFF_MS.length) - 1;
+  return LIVENESS_BACKOFF_MS[index];
+}
+
+/** True once credential failures have used up their quick attempts. */
+export function sshAuthGaveUp(failures) {
+  return failures >= LIVENESS_AUTH_ATTEMPTS;
+}
+
+/** Short, human-readable liveness failure for the UI. */
+export function livenessReason(err) {
+  const raw = String(err?.message || err || "").trim();
+  if (!raw) return "unreachable";
+  if (/timed out|timeout|ETIMEDOUT/i.test(raw)) return "connection timed out";
+  if (/ECONNREFUSED|refused/i.test(raw)) return "connection refused";
+  if (/EHOSTUNREACH|no route|ENETUNREACH/i.test(raw)) return "no route to host";
+  if (isSshAuthFailure(raw)) {
+    return "SSH authentication failed — check the key or user for this unit";
+  }
+  return raw.split("\n")[0].slice(0, 140);
+}
 
 const ONLINE_GRACE_MS = 10000;
 
@@ -32,16 +85,36 @@ const ONLINE_GRACE_MS = 10000;
  * SparkMonitor — one per Spark. Owns collectors + rate state + poll loop.
  * Exposes snapshot() for WebSocket pushed payload.
  */
+const HEALTH_LABELS = {
+  thermal: "GPU temperature",
+  "low-power": "GPU power draw",
+  memory: "Unified memory",
+  concurrency: "Model concurrency",
+  "link-speed": "Network link speed",
+};
+
 export class SparkMonitor {
   /**
    * @param {object} spark
-   * @param {{ onWolMac?: (sparkId: string, mac: string) => void, onHermesChange?: () => void, resolveHeadModelId?: ((headId: string) => string | null) }} [options]
+   * @param {{ onWolMac?: (sparkId: string, mac: string) => void, onHermesChange?: () => void, resolveHeadModelId?: ((headId: string) => string | null), pollIntervalMs?: number }} [options]
+   *   pollIntervalMs: Settings → Poll interval; drives the fast collector timers.
    */
   constructor(spark, options = {}) {
     this.spark = spark;
     this._onWolMac = typeof options.onWolMac === "function" ? options.onWolMac : null;
     this._onHermesChange =
       typeof options.onHermesChange === "function" ? options.onHermesChange : null;
+    // Fleet event log sink: ({ type, severity, message, data? }) => void.
+    // Only state *transitions* are reported (never the first baseline sample).
+    this._onEvent = typeof options.onEvent === "function" ? options.onEvent : null;
+    /** @type {boolean | null} null until the first liveness result (baseline). */
+    this._prevOnline = null;
+    /** @type {boolean | null} null until the first successful GPU sample. */
+    this._prevThermal = null;
+    /** Health rules + their sample-streak state; findings go out in snapshot().health. */
+    this._healthEval = new HealthEvaluator();
+    this._health = [];
+    this._prevHealthIds = null;
     // Resolver for worker derived label: maps a head spark id to its live
     // LLM model id (or null when unknown). Wired by index.js from the monitor
     // map; never writes back to registry config (derived display only).
@@ -90,6 +163,14 @@ export class SparkMonitor {
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
     this.lastOnlineOk = 0;
+    /** Why liveness last failed — surfaced so a broken unit is diagnosable. */
+    this.offlineReason = null;
+    /** Consecutive liveness failures, used for the retry backoff. */
+    this._livenessFailures = 0;
+    /** Earliest timestamp for the next liveness attempt (0 = now). */
+    this._nextLivenessAt = 0;
+    /** Whether collector polls are currently suspended (logged once). */
+    this._pollsPaused = false;
 
     // System uptime seconds (from /proc/uptime), null when offline
     this._uptimeSeconds = null;
@@ -108,6 +189,12 @@ export class SparkMonitor {
     };
     this._lastUpdate = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
+    /**
+     * Last poll (epoch ms) in which each LLM port generated or prefilled
+     * tokens. In-memory only — null again after a restart until traffic.
+     * @type {Map<number, number>}
+     */
+    this._llmLastActiveAt = new Map();
 
     // Hardware summary: kind "spark" uses the static DGX Spark specs; kind
     // "host" (dedicated GPU Linux box) detects real hardware once in the
@@ -125,6 +212,10 @@ export class SparkMonitor {
     }
 
     // Timers
+    /** Per-domain cadence for the fast collectors (ms). */
+    this._fastIntervals = resolveFastPollIntervals(options.pollIntervalMs);
+    /** @type {Record<string, ReturnType<typeof setInterval>>} fast domain → timer */
+    this._domainTimers = {};
     this._intervals = [];
     /** @type {ReturnType<typeof setInterval> | null} */
     this._llmIntervalId = null;
@@ -142,6 +233,11 @@ export class SparkMonitor {
 
   /** Hot-update config without tearing down poll loops / rate baselines. */
   updateConfig(spark) {
+    // A unit edit is the user telling us something changed — most often the key
+    // or user — so the credential backoff starts over and the next liveness
+    // attempt is immediate.
+    this._livenessFailures = 0;
+    this._nextLivenessAt = 0;
     const wasLlm = this._llmMonitoringEnabled(this.spark);
     const wasComfy = this._comfyMonitoringEnabled(this.spark);
     const prevComfyPort = this._comfyPort(this.spark);
@@ -253,6 +349,7 @@ export class SparkMonitor {
    * @returns {string | null}
    */
   headLlmModelId() {
+    if (!this.online) return null;
     const llm = this._metrics?.llm;
     if (!Array.isArray(llm)) return null;
     for (const entry of llm) {
@@ -296,8 +393,7 @@ export class SparkMonitor {
       this._llmIntervalId = null;
     }
     if (this._llmMonitoringEnabled() && this._running) {
-      this._llmIntervalId = setInterval(() => this._pollDomain("llm"), POLL_INTERVAL_LLM);
-      this._intervals.push(this._llmIntervalId);
+      this._llmIntervalId = this._armDomainTimer("llm");
       void this._pollDomain("llm");
     }
   }
@@ -325,8 +421,7 @@ export class SparkMonitor {
       this._comfyIntervalId = null;
     }
     if (this._comfyMonitoringEnabled() && this._running) {
-      this._comfyIntervalId = setInterval(() => this._pollDomain("comfy"), POLL_INTERVAL_COMFY);
-      this._intervals.push(this._comfyIntervalId);
+      this._comfyIntervalId = this._armDomainTimer("comfy");
       void this._pollDomain("comfy");
     }
   }
@@ -381,6 +476,34 @@ export class SparkMonitor {
     }
   }
 
+  /**
+   * Record which LLM ports served tokens in this poll and return the probe
+   * results with `lastActiveAt` (epoch ms, or null if never seen serving
+   * since the server started) on each entry. Ports no longer probed are
+   * forgotten so a re-added port does not resurface an old timestamp.
+   * @param {Array<{ port: number }>} probes  same order as `results`
+   * @param {Array<Record<string, unknown>>} results
+   */
+  _stampLlmLastActive(probes, results) {
+    const now = Date.now();
+    const ports = new Set();
+    const stamped = results.map((entry, i) => {
+      const port = probes[i]?.port;
+      if (port == null || !entry || typeof entry !== "object") return entry;
+      ports.add(port);
+      const gen = Number(entry.generationTps);
+      const pre = Number(entry.prefillTps);
+      if ((Number.isFinite(gen) && gen > 0) || (Number.isFinite(pre) && pre > 0)) {
+        this._llmLastActiveAt.set(port, now);
+      }
+      return { ...entry, lastActiveAt: this._llmLastActiveAt.get(port) ?? null };
+    });
+    for (const port of this._llmLastActiveAt.keys()) {
+      if (!ports.has(port)) this._llmLastActiveAt.delete(port);
+    }
+    return stamped;
+  }
+
   /** Returns array of LLM ports from spark config. */
   _llmPorts() {
     const raw = this.spark?.llmPorts;
@@ -396,6 +519,44 @@ export class SparkMonitor {
     return [LLM_PORT];
   }
 
+  /** Repeating poll of one domain at its current cadence; tracked for stop(). */
+  _armDomainTimer(domain) {
+    const id = setInterval(() => this._pollDomain(domain), this._fastIntervals[domain]);
+    this._intervals.push(id);
+    return id;
+  }
+
+  _clearTimer(id) {
+    clearInterval(id);
+    this._intervals = this._intervals.filter((other) => other !== id);
+  }
+
+  /**
+   * Apply a new Settings → Poll interval. Only timers whose cadence actually
+   * changes are re-armed, and nothing else is touched: in-flight guards, the
+   * run generation, liveness backoff and the offline pause all carry over, so
+   * a poll already running is neither duplicated nor discarded.
+   * @param {number} pollIntervalMs
+   */
+  setPollInterval(pollIntervalMs) {
+    const prev = this._fastIntervals;
+    this._fastIntervals = resolveFastPollIntervals(pollIntervalMs);
+    if (!this._running) return;
+    for (const domain of FAST_TIMER_DOMAINS) {
+      if (prev[domain] === this._fastIntervals[domain]) continue;
+      if (this._domainTimers[domain] != null) this._clearTimer(this._domainTimers[domain]);
+      this._domainTimers[domain] = this._armDomainTimer(domain);
+    }
+    if (this._llmIntervalId != null && prev.llm !== this._fastIntervals.llm) {
+      this._clearTimer(this._llmIntervalId);
+      this._llmIntervalId = this._armDomainTimer("llm");
+    }
+    if (this._comfyIntervalId != null && prev.comfy !== this._fastIntervals.comfy) {
+      this._clearTimer(this._comfyIntervalId);
+      this._comfyIntervalId = this._armDomainTimer("comfy");
+    }
+  }
+
   /** Start background polling. */
   start() {
     if (this._running) return;
@@ -403,12 +564,10 @@ export class SparkMonitor {
     this._running = true;
     this._stopped = false;
     this._poll();
-    this._intervals.push(setInterval(() => this._pollDomain("gpu"), POLL_INTERVAL_GPU));
-    this._intervals.push(setInterval(() => this._pollDomain("cpu"), POLL_INTERVAL_CPU));
-    this._intervals.push(setInterval(() => this._pollDomain("network"), POLL_INTERVAL_NETWORK));
+    for (const domain of FAST_TIMER_DOMAINS) {
+      this._domainTimers[domain] = this._armDomainTimer(domain);
+    }
     this._intervals.push(setInterval(() => this._pollDomain("storage"), POLL_INTERVAL_STORAGE));
-    this._intervals.push(setInterval(() => this._pollDomain("ram"), POLL_INTERVAL_CPU));
-    this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
     this._restartLlmPollInterval();
     this._restartComfyPollInterval();
     this._restartHermesPollInterval();
@@ -427,6 +586,7 @@ export class SparkMonitor {
     this._stopped = true;
     for (const id of this._intervals) clearInterval(id);
     this._intervals = [];
+    this._domainTimers = {};
     this._llmIntervalId = null;
     this._comfyIntervalId = null;
     this._hermesIntervalId = null;
@@ -452,6 +612,8 @@ export class SparkMonitor {
       name: this.spark.name,
       kind: this.spark.kind || "spark",
       online: this.online,
+      /** Last liveness failure, or null. "offline" with no reason is a bug. */
+      offlineReason: this.online ? null : this.offlineReason,
       uptime: this._uptimeSeconds,
       lanIp: this.spark.lanIp || "",
       isLocal: Boolean(this.spark.isLocal),
@@ -477,6 +639,7 @@ export class SparkMonitor {
       comfyPort: this._comfyPort(),
       tailscaleMonitoring: tailscaleOn,
       hermes: this._hermes,
+      health: this._health,
       hardware: this._hardwareSummary,
       metrics: {
         // NOTE: no `timestamp` here on purpose. The broadcast path skips
@@ -514,9 +677,86 @@ export class SparkMonitor {
     return Number.isFinite(secs) ? Math.floor(secs) : null;
   }
 
+  /** Report an event to the fleet log; never throws into the poll loop. */
+  _emit(event) {
+    if (!this._onEvent) return;
+    try {
+      this._onEvent({ sparkId: this.spark.id, sparkName: this.spark.name || this.spark.id, ...event });
+    } catch (err) {
+      console.error(`[SparkMonitor] ${this.spark.id} event error:`, err?.message);
+    }
+  }
+
+  _noteOnline(next) {
+    const prev = this._prevOnline;
+    this._prevOnline = next;
+    if (prev == null || prev === next) return;
+    const name = this.spark.name || this.spark.id;
+    this._emit(
+      next
+        ? { type: "spark.online", severity: "success", message: `${name} came online` }
+        : { type: "spark.offline", severity: "warn", message: `${name} went offline` }
+    );
+  }
+
+  /** Re-run the health rules, emit events for changes (never for the first baseline). */
+  _updateHealth(domain = "other") {
+    try {
+      const ev = this._healthEval;
+      const findings = ev.evaluate(
+        {
+          gpu: this._metrics.gpu,
+          unifiedMemory: this._metrics.unifiedMemory,
+          network: this._metrics.network,
+          llm: this._metrics.llm,
+        },
+        domain
+      );
+      this._health = findings;
+      const name = this.spark.name || this.spark.id;
+      for (const e of ev.pendingEvents) this._emit(e);
+      const ids = new Set(findings.map((f) => f.id));
+      const prev = this._prevHealthIds;
+      this._prevHealthIds = ids;
+      if (prev == null) return;
+      for (const f of findings) {
+        if (prev.has(f.id) || f.id === "xid" || f.id === "oom") continue;
+        this._emit({
+          type: `health.${f.id}`,
+          severity: f.severity === "critical" ? "error" : "warn",
+          message: `${name}: ${f.title} — ${f.detail}`,
+        });
+      }
+      for (const id of prev) {
+        if (ids.has(id) || id === "xid" || id === "oom") continue;
+        this._emit({ type: "health.cleared", severity: "success", message: `${name}: ${HEALTH_LABELS[id] ?? id} is back to normal` });
+      }
+    } catch (err) {
+      console.error(`[SparkMonitor] ${this.spark.id} health error:`, err?.message);
+    }
+  }
+
+  _noteThrottle(gpu) {
+    if (!collectionWasSuccessful(gpu)) return;
+    const thermal = gpu?.throttle?.reason === "thermal" && Boolean(gpu?.throttle?.active);
+    const prev = this._prevThermal;
+    this._prevThermal = thermal;
+    if (prev == null || prev === thermal) return;
+    const name = this.spark.name || this.spark.id;
+    const temp = Number.isFinite(gpu?.temperature) ? ` (${Math.round(gpu.temperature)}°C)` : "";
+    this._emit(
+      thermal
+        ? { type: "gpu.throttle.thermal", severity: "warn", message: `${name} started thermal throttling${temp}` }
+        : { type: "gpu.throttle.cleared", severity: "success", message: `${name} stopped thermal throttling${temp}` }
+    );
+  }
+
   // ─── Liveness ─────────────────────────────────────────────
   async _checkOnline() {
     if (!this._running || this._inflight.online) return;
+    // Backoff gate: a unit that keeps refusing us is probed on a widening
+    // schedule (see _scheduleNextLiveness) instead of every 5 seconds forever.
+    if (Date.now() < this._nextLivenessAt) return;
     const runGeneration = this._runGeneration;
     const checkToken = Symbol("online");
     this._inflight.online = checkToken;
@@ -546,19 +786,50 @@ export class SparkMonitor {
       }
       if (!isCurrentRun()) return;
       this.online = true;
+      this.offlineReason = null;
+      this._livenessFailures = 0;
+      this._nextLivenessAt = 0;
       this.lastOnlineOk = Date.now();
       this._uptimeSeconds = uptimeSeconds;
-    } catch {
+      this._noteOnline(true);
+    } catch (err) {
       if (!isCurrentRun()) return;
+      this._livenessFailures += 1;
+      const reason = livenessReason(err);
+      this.offlineReason =
+        isSshAuthFailure(reason) && sshAuthGaveUp(this._livenessFailures)
+          ? `${reason} (paused after ${this._livenessFailures} attempts — edit the unit to retry now)`
+          : reason;
+      this._nextLivenessAt = Date.now() + nextLivenessDelayMs(this._livenessFailures, this.offlineReason);
       if (!this.lastOnlineOk || Date.now() - this.lastOnlineOk > ONLINE_GRACE_MS) {
         this.online = false;
         this._uptimeSeconds = null;
+        this._invalidateSshMetrics();
+        this._noteOnline(false);
       }
     } finally {
       if (this._inflight.online === checkToken) {
         this._inflight.online = false;
       }
     }
+  }
+
+  /**
+   * A remote unit stayed unreachable past the grace period: its SSH-backed
+   * cached metrics are stale, so replace them with the honest "no data"
+   * defaults instead of serving the last good reading indefinitely. HTTP-only
+   * domains (llm, comfy) keep polling and keep their own state.
+   */
+  _invalidateSshMetrics() {
+    if (this.spark.isLocal) return;
+    const c = this.collector;
+    this._metrics.gpu = c._defaultGpu();
+    this._metrics.cpu = c._defaultCpu();
+    this._metrics.ram = c._defaultRam();
+    this._metrics.storage = [];
+    this._metrics.network = c._defaultNetwork();
+    this._metrics.unifiedMemory = c._defaultUnifiedMemory();
+    this._metricCollectionSuccessful = { gpu: false, cpu: false };
   }
 
   // ─── Polling ──────────────────────────────────────────────
@@ -581,6 +852,27 @@ export class SparkMonitor {
 
   async _pollDomain(domain) {
     if (!this._running || this._inflight[domain]) return;
+    // A remote unit that just failed liveness is unreachable for everything —
+    // metrics, tunnels, SSH commands. Polling it anyway is how one broken unit
+    // produced ~60k failed SSH logins a day: every domain interval fired, every
+    // attempt failed, nothing backed off. Local units are exempt (their checks
+    // read /proc and /sys and are cheap and honest about partial failures).
+    // HTTP-only probes (LLM, ComfyUI) do not use SSH, so a failed SSH liveness
+    // check must not freeze them: the engine may be reachable on its own.
+    const sshBacked = domain !== "llm" && domain !== "comfy";
+    if (sshBacked && !this.spark.isLocal && !this.online) {
+      if (!this._pollsPaused) {
+        this._pollsPaused = true;
+        console.log(
+          `[SparkMonitor] ${this.spark.id}: unreachable (${this.offlineReason || "no liveness"}) — pausing collector polls`
+        );
+      }
+      return;
+    }
+    if (sshBacked && this._pollsPaused) {
+      this._pollsPaused = false;
+      console.log(`[SparkMonitor] ${this.spark.id}: reachable again — resuming collector polls`);
+    }
     // Skip storage auto-poll when disabled for this spark
     if (domain === "storage" && this.spark.storagePollDisabled) return;
     // Worker nodes: no local LLM API
@@ -641,6 +933,8 @@ export class SparkMonitor {
         case "gpu":
           this._metrics.gpu = result;
           this._metricCollectionSuccessful.gpu = collectionWasSuccessful(result);
+          this._noteThrottle(result);
+          this._updateHealth("gpu");
           break;
         case "cpu":
           this._metrics.cpu = result;
@@ -651,6 +945,7 @@ export class SparkMonitor {
           break;
         case "network":
           this._metrics.network = result;
+          this._updateHealth();
           if (result?.wolMac && this._onWolMac) {
             try {
               this._onWolMac(this.spark.id, result.wolMac);
@@ -664,11 +959,13 @@ export class SparkMonitor {
           break;
         case "memory":
           this._metrics.unifiedMemory = result;
+          this._updateHealth();
           break;
         case "llm":
-          this._metrics.llm = result;
           {
             const probes = Array.from(this.llmProbes.values());
+            this._metrics.llm = this._stampLlmLastActive(probes, result);
+            this._updateHealth();
             for (let i = 0; i < result.length; i++) {
               const probe = probes[i];
               if (probe) llmDaily.record(this.spark.id, probe.port, result[i]);
@@ -751,6 +1048,18 @@ export class SparkMonitor {
     if (!result.error && this._hermes.status !== "running") {
       this._hermes.status = "idle";
     }
+    if (prev.updateAvailable === false && result.updateAvailable === true) {
+      const name = this.spark.name || this.spark.id;
+      const n = Number.isFinite(result.behindCommits) && result.behindCommits > 0
+        ? ` (${result.behindCommits} commit${result.behindCommits === 1 ? "" : "s"} behind)`
+        : "";
+      this._emit({
+        type: "hermes.update.available",
+        severity: "info",
+        message: `Hermes update available on ${name}${n}`,
+        data: { version: result.version ?? null },
+      });
+    }
     if (changed) this._notifyHermesChange();
   }
 
@@ -788,6 +1097,11 @@ export class SparkMonitor {
             error: null,
             finishedAt: res.finishedAt ?? Date.now(),
           };
+          this._emit({
+            type: "hermes.update.success",
+            severity: "success",
+            message: `Hermes updated on ${this.spark.name || this.spark.id}${res.version ? ` to ${res.version}` : ""}`,
+          });
           // Refresh update availability right away (don't wait for the next poll).
           try {
             const check = await this.hermesProbe.check();
@@ -812,6 +1126,11 @@ export class SparkMonitor {
             error: res?.error || res?.output?.slice(-400) || "hermes update failed",
             finishedAt: res?.finishedAt ?? Date.now(),
           };
+          this._emit({
+            type: "hermes.update.error",
+            severity: "error",
+            message: `Hermes update failed on ${this.spark.name || this.spark.id}`,
+          });
         }
       } catch (err) {
         if (!this._running) return;
@@ -821,6 +1140,11 @@ export class SparkMonitor {
           error: err instanceof Error ? err.message : String(err),
           finishedAt: Date.now(),
         };
+        this._emit({
+          type: "hermes.update.error",
+          severity: "error",
+          message: `Hermes update failed on ${this.spark.name || this.spark.id}`,
+        });
       }
       this._notifyHermesChange();
     })();

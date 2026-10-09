@@ -4,8 +4,11 @@ import net from "net";
 import os from "os";
 import path from "path";
 import fs from "fs";
+import { EventEmitter } from "events";
+import { PassThrough } from "stream";
 import {
   allocateLocalPort,
+  openSshLlmTunnel,
   onceClose,
   probeLlmHttp,
   resolveLlmHttpTarget,
@@ -184,4 +187,37 @@ test("DecodeBench closes resolveTarget when the LLM is down", async () => {
     await new Promise((r) => setTimeout(r, 50));
   }
   assert.fail("decode bench did not finish");
+});
+
+test("openSshLlmTunnel reads ssh's stderr with a real encoding and returns once the forward accepts", async () => {
+  // Regression: setEncoding("text") threw ERR_UNKNOWN_ENCODING before the tunnel could open.
+  const server = net.createServer((sock) => sock.end());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const child = Object.assign(new EventEmitter(), { stderr: new PassThrough(), kill() {}, killed: false });
+  try {
+    const tunnel = await openSshLlmTunnel(
+      { isLocal: false, lanIp: "192.168.1.143", ssh: { host: "192.168.1.143", user: "mia", auth: "key" } },
+      8888,
+      { spawnImpl: () => child, allocatePort: async () => port }
+    );
+    assert.equal(tunnel.via, "ssh-tunnel");
+    assert.equal(tunnel.port, port);
+    tunnel.close();
+  } finally {
+    server.close();
+  }
+});
+
+test("resolveLlmHttpTarget: an unreachable llmHost never falls back to the SSH host's loopback", async () => {
+  let tunneled = 0;
+  await assert.rejects(
+    resolveLlmHttpTarget(
+      { isLocal: false, lanIp: "192.168.1.143", llmHost: "192.168.1.150", ssh: { host: "192.168.1.143", user: "mia", auth: "key" } },
+      8888,
+      { probe: async () => false, openTunnel: async () => { tunneled += 1; return {}; } }
+    ),
+    /llmHost/
+  );
+  assert.equal(tunneled, 0);
 });

@@ -44,6 +44,28 @@ test("local units may omit LAN IP while remote units still require a host", () =
   assert.equal(validateSparkTarget({ lanIp: "192.168.1.20" }), null);
 });
 
+test("SSH port is optional and must be an integer from 1 to 65535", () => {
+  assert.equal(validateSparkTarget({ lanIp: "192.168.1.20", ssh: { port: 2222 } }), null);
+  assert.equal(validateSparkTarget({ lanIp: "192.168.1.20", ssh: { port: "2200" } }), null);
+  assert.equal(validateSparkTarget({ lanIp: "192.168.1.20", ssh: { port: "" } }), null);
+  assert.match(
+    validateSparkTarget({ lanIp: "192.168.1.20", ssh: { port: 0 } }),
+    /SSH port/
+  );
+  assert.match(
+    validateSparkTarget({ lanIp: "192.168.1.20", ssh: { port: 65536 } }),
+    /SSH port/
+  );
+  assert.match(
+    validateSparkTarget({ lanIp: "192.168.1.20", ssh: { port: "22abc" } }),
+    /SSH port/
+  );
+});
+
+test("local units get the same SSH user check as remote ones", () => {
+  assert.match(validateSparkTarget({ isLocal: true, ssh: { user: "a;b" } }), /Invalid SSH user/);
+});
+
 test("rate limiter expires stale keys instead of growing forever", () => {
   const allow = createRateLimiter(2, 20);
   assert.equal(allow("a"), true);
@@ -52,4 +74,17 @@ test("rate limiter expires stale keys instead of growing forever", () => {
   const started = Date.now();
   while (Date.now() - started < 30) { /* wait out the window */ }
   assert.equal(allow("a"), true);
+});
+
+test("llmHost validates for remote and hostless local Sparks", () => {
+  for (const base of [{ lanIp: "spark-head" }, { isLocal: true }]) {
+    assert.equal(validateSparkTarget({ ...base, llmHost: "192.168.0.64" }), null);
+    assert.equal(validateSparkTarget({ ...base, llmHost: " 192.168.0.64 " }), null);
+    assert.equal(validateSparkTarget({ ...base, llmHost: " " }), null);
+    assert.equal(validateSparkTarget({ ...base, llmHost: null }), null);
+    assert.equal(validateSparkTarget({ ...base, llmHost: "" }), null);
+    for (const llmHost of ["169.254.169.254", "http://bad", "bad;host", 123]) {
+      assert.match(validateSparkTarget({ ...base, llmHost }), /llmHost/);
+    }
+  }
 });

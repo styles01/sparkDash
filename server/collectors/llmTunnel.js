@@ -174,7 +174,7 @@ export async function openSshLlmTunnel(spark, remotePort, opts = {}) {
     stdio: ["ignore", "ignore", "pipe"],
   });
   if (child.stderr) {
-    child.stderr.setEncoding("text");
+    child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
       stderr += String(chunk);
       if (stderr.length > 4000) stderr = stderr.slice(-2000);
@@ -283,6 +283,12 @@ export async function resolveLlmHttpTarget(spark, port, opts = {}) {
     opts.onStatus?.(`Reaching LLM on ${host}:${p}…`);
     const ok = await probe(host, p, { apiKey: opts.apiKey });
     if (ok) return direct;
+  }
+
+  // llmHost points at a specific machine; a tunnel to the SSH host's loopback
+  // would reach whatever listens on that port there, not the configured server.
+  if (spark?.llmHost) {
+    throw new Error(`LLM on ${host}:${p} (llmHost) is not reachable from the dashboard`);
   }
 
   try {

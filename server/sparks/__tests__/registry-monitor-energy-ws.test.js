@@ -31,6 +31,8 @@ async function startServer(t) {
       SECRETS_KEY_PATH: path.join(tmp, ".secrets-key"),
       LLM_DAILY_JSON_PATH: path.join(tmp, "llm-daily.json"),
       FLEET_ENERGY_JSON_PATH: path.join(tmp, "fleet-energy.json"),
+      EVENTS_JSON_PATH: path.join(tmp, "events.json"),
+      GPU_HISTORY_JSON_PATH: path.join(tmp, "gpu-history.json"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -107,4 +109,20 @@ test("registry mutation starts a monitor, invalidates energy, and appears on the
   assert.equal(removed.body.success, true);
   const after = await json(port, "/api/sparks");
   assert.equal(after.body.sparks.length, 0);
+});
+
+test("a This host unit with no IP can be edited", async (t) => {
+  const { port } = await startServer(t);
+  await json(port, "/api/sparks", { method: "POST", body: JSON.stringify(sparkPayload("alpha", "")) });
+  const edited = await json(port, "/api/sparks/alpha", {
+    method: "PATCH",
+    body: JSON.stringify({ name: "renamed", lanIp: "", ssh: { host: "", user: "spark" } }),
+  });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.body.spark.name, "renamed");
+  const remote = await json(port, "/api/sparks/alpha", {
+    method: "PATCH",
+    body: JSON.stringify({ isLocal: false, lanIp: "" }),
+  });
+  assert.match(remote.body.error, /lanIp or ssh.host/);
 });

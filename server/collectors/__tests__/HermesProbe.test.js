@@ -115,6 +115,20 @@ test("HermesProbe update reports failure when the binary is missing", async () =
   assert.match(res.error, /not found/);
 });
 
+test("HermesProbe never runs a script for an SSH user that would break out of it", async () => {
+  // A unit saved before the API validated local units' SSH users.
+  const probe = new HermesProbe({ id: "s", isLocal: true, ssh: { user: "x; touch /tmp/pwned #" } });
+  let ran = false;
+  probe._execLocal = async () => {
+    ran = true;
+    return "";
+  };
+  await assert.rejects(probe._run("echo hi", 1000), /Invalid SSH user/);
+  const status = await probe.check();
+  assert.equal(ran, false, "nothing reached the shell");
+  assert.match(status.error ?? "", /Invalid SSH user/);
+});
+
 test("parseHostPasswd resolves the host user identity", () => {
   const passwd =
     "root:x:0:0:root:/root:/bin/bash\n" +
@@ -281,4 +295,18 @@ test("remote execution command carries no GIT_CONFIG (runs as the real user)", a
   };
   await probe.check();
   assert.doesNotMatch(sent, /GIT_CONFIG/);
+});
+
+test("requireDrop refuses to fall back to root when the user cannot be resolved", () => {
+  const base = { mntNs: "/host/proc/1/ns/mnt", currentUid: 0, cmd: "echo hi", requireDrop: true };
+  const passwdText = "zurih:x:1000:1000::/home/zurih:/bin/bash\nroot:x:0:0::/root:/bin/bash\n";
+  assert.throws(() => chooseLocalInvocation({ ...base, passwdText, user: "" }), /Refusing/);
+  assert.throws(() => chooseLocalInvocation({ ...base, passwdText, user: "ghost" }), /Refusing/);
+  assert.throws(() => chooseLocalInvocation({ ...base, passwdText, user: "root" }), /root/);
+  assert.throws(() => chooseLocalInvocation({ ...base, passwdText, user: "zurih", currentUid: 1001 }), /wrong user/);
+  // Resolvable user still drops privileges; the same unprivileged user runs in place.
+  assert.equal(chooseLocalInvocation({ ...base, passwdText, user: "zurih" }).args[2], "setpriv");
+  assert.equal(chooseLocalInvocation({ ...base, passwdText, user: "zurih", currentUid: 1000 }).file, "sh");
+  // Default (Hermes) behaviour is unchanged.
+  assert.equal(chooseLocalInvocation({ ...base, requireDrop: false, passwdText, user: "" }).file, "nsenter");
 });

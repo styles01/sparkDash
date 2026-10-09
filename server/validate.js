@@ -36,6 +36,32 @@ function normalizedHost(host) {
   return value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
 }
 
+/** Dotted IPv4 for an IPv4-mapped IPv6 address, including the hex form. */
+function mappedIpv4(host) {
+  let body = host;
+  let dotted = null;
+  const v4 = body.match(/:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4 && net.isIP(v4[1]) === 4) {
+    dotted = v4[1];
+    body = body.slice(0, v4.index);
+  }
+  const halves = body.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const groups = head.length + tail.length + (dotted ? 2 : 0);
+  if (halves.length === 1 ? groups !== 8 : groups >= 8) return null;
+  const parts = [...head, ...(halves.length === 2 ? Array(8 - groups).fill("0") : []), ...tail];
+  if (dotted) {
+    const octets = dotted.split(".").map((octet) => Number(octet));
+    parts.push(((octets[0] << 8) | octets[1]).toString(16), ((octets[2] << 8) | octets[3]).toString(16));
+  }
+  if (parts.length !== 8 || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return null;
+  const nums = parts.map((part) => parseInt(part, 16));
+  if (nums.slice(0, 5).some((n) => n !== 0) || nums[5] !== 0xffff) return null;
+  return `${nums[6] >> 8}.${nums[6] & 255}.${nums[7] >> 8}.${nums[7] & 255}`;
+}
+
 export function isForbiddenAddress(address) {
   const host = normalizedHost(address);
   const family = net.isIP(host);
@@ -47,7 +73,8 @@ export function isForbiddenAddress(address) {
     if (host === "::" || host.startsWith("ff")) return true;
     const first = parseInt(host.split(":", 1)[0] || "0", 16);
     if ((first & 0xffc0) === 0xfe80) return true;
-    if (host.startsWith("::ffff:")) return isForbiddenAddress(host.slice(7));
+    const mapped = mappedIpv4(host);
+    if (mapped) return isForbiddenAddress(mapped);
     return false;
   }
   return false;
@@ -107,6 +134,7 @@ export function classifyHostScope(host) {
   if (a === 10) return "lan";
   if (a === 172 && b >= 16 && b <= 31) return "lan";
   if (a === 192 && b === 168) return "lan";
+  if (a === 100 && b >= 64 && b <= 127) return "lan"; // Tailscale CGNAT (100.64.0.0/10)
   if (a === 169 && b === 254) return "lan";
   if (a === 0 || a >= 224) return "unknown";
   return "public";
@@ -147,10 +175,38 @@ export function isValidSparkId(id) {
 }
 
 /**
+ * SSH port. Missing or blank becomes 22. Anything else that is not an
+ * integer from 1 to 65535 returns null so callers can reject it.
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function normalizeSshPort(value) {
+  if (value == null || value === "") return 22;
+  let n;
+  if (typeof value === "number") {
+    n = value;
+  } else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    n = Number(value.trim());
+  } else {
+    return null;
+  }
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
+  return n;
+}
+
+/**
  * Validate fields used for SSH/LLM probes. Returns null if ok, else error message.
- * @param {{ lanIp?: string, ssh?: { host?: string, user?: string } }} body
+ * @param {{ lanIp?: string, llmHost?: string, ssh?: { host?: string, user?: string, port?: unknown } }} body
  */
 export function validateSparkTarget(body) {
+  const user = body?.ssh?.user;
+  if (user != null && user !== "" && !isValidSshUser(user)) {
+    return "Invalid SSH user (allowed: letters, digits, . _ -)";
+  }
+  const llmHost = typeof body?.llmHost === "string" ? body.llmHost.trim() : body?.llmHost;
+  if (llmHost != null && llmHost !== "" && !isAllowedTargetHost(llmHost)) {
+    return `Invalid or disallowed llmHost: ${llmHost}`;
+  }
   const lanIp = body?.lanIp || "";
   const sshHost = body?.ssh?.host || "";
   const target = sshHost || lanIp;
@@ -163,9 +219,11 @@ export function validateSparkTarget(body) {
   if (lanIp && !isAllowedTargetHost(lanIp)) {
     return `Invalid or disallowed lanIp: ${lanIp}`;
   }
-  const user = body?.ssh?.user;
-  if (user != null && user !== "" && !isValidSshUser(user)) {
-    return "Invalid SSH user (allowed: letters, digits, . _ -)";
+  if (body?.ssh && Object.prototype.hasOwnProperty.call(body.ssh, "port")) {
+    const raw = body.ssh.port;
+    if (raw != null && raw !== "" && normalizeSshPort(raw) == null) {
+      return "SSH port must be an integer from 1 to 65535";
+    }
   }
   return null;
 }

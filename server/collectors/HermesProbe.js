@@ -30,6 +30,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { HOST_PATHS, HERMES_UPDATE_TIMEOUT_MS } from "../config.js";
 import { sshExec } from "./ssh.js";
+import { isValidSshUser } from "../validate.js";
 import { parsePendingCommits } from "./HermesReleases.js";
 
 const HERMES_MISSING = "__HERMES_MISSING__";
@@ -75,11 +76,31 @@ export function parseHostPasswd(passwdText, user) {
  * @param {number} opts.currentUid  uid of the current process
  * @param {string|undefined} opts.user  configured host user (spark.ssh.user)
  * @param {string} opts.cmd  command script to run
+ * @param {boolean} [opts.requireDrop]  opt-in (LLM launchers): never fall back to
+ *   running as the current/root user. Throws when the configured user cannot be
+ *   resolved from passwd, is uid 0, or (for a non-root process) is not the
+ *   process's own uid. Hermes callers leave this off and keep the old fallback.
  */
-export function chooseLocalInvocation({ mntNs, passwdText, currentUid, user, cmd }) {
+export function chooseLocalInvocation({ mntNs, passwdText, currentUid, user, cmd, requireDrop = false }) {
   const hasNs = Boolean(mntNs);
   const isRoot = Number.isInteger(currentUid) && currentUid === 0;
   const ident = parseHostPasswd(passwdText, user);
+
+  if (requireDrop) {
+    if (!ident) {
+      throw new Error(
+        `Refusing to run as the dashboard user: cannot resolve SSH user ${user ? `"${user}"` : "(not set)"} in the host passwd file. Set the Spark's SSH user.`
+      );
+    }
+    if (ident.uid === 0) throw new Error("Refusing to run launcher scripts as root; configure a non-root SSH user.");
+    if (!isRoot) {
+      if (currentUid !== ident.uid) {
+        throw new Error(`Cannot switch to user "${user}" (uid ${ident.uid}) from uid ${currentUid}; refusing to run as the wrong user.`);
+      }
+      // Already the right unprivileged user: run in place, no drop needed.
+      return { file: "sh", args: ["-c", cmd], repair: null };
+    }
+  }
 
   if (ident && isRoot) {
     const fullCmd = `export HOME='${ident.home}'; ${cmd}`;
@@ -227,6 +248,13 @@ export class HermesProbe {
 
   /** Run a command on the Spark: SSH for remote, host drop + nsenter for local. */
   async _run(cmd, timeoutMs) {
+    // The SSH user is spliced into these scripts (/home/<user>/...), and for a
+    // local unit they run as root in the host namespace. The API validates it,
+    // but a sparks.json written before that check never went through it.
+    const user = this.spark.ssh?.user;
+    if (user != null && user !== "" && !isValidSshUser(user)) {
+      throw new Error("Invalid SSH user for Hermes (allowed: letters, digits, . _ -)");
+    }
     if (this.spark.isLocal) return this._execLocal(cmd, timeoutMs);
     return sshExec(this.spark, cmd, { timeoutMs });
   }

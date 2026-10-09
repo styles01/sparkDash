@@ -1,9 +1,12 @@
+import { benchId } from "../../constants";
+import { BenchIcon } from "../bench/BenchIcon";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { LlmMetrics, LlmBenchTarget } from "../../api/types";
 import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
+import { TrendLine } from "../ui/TrendLine";
 import { Panel } from "../ui/Panel";
-import { TelemetryChart, type ChartSeries } from "../ui/TelemetryChart";
-import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
+import { Tag, type TagTone } from "../ui/Tag";
+import { BotIcon, ExpandIcon, FlaskIcon, GearIcon, InfoIcon, ServerIcon } from "../ui/icons";
 import {
   useMetricsHistory,
   useMetricsHistoryTail,
@@ -11,42 +14,77 @@ import {
 } from "../../hooks/metricsStore";
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { PrefillBenchDialog } from "./PrefillBenchDialog";
+import { QualityBenchDialog } from "./QualityBenchDialog";
 import { LlmDailyChart } from "./LlmDailyChart";
+import { LlmTokenTotals } from "./LlmTokenTotals";
+import { ENGINE_GENERATED_LABEL, ENGINE_GENERATED_TITLE } from "./tokenTotalsCopy";
 import { parseLlmTargetInput } from "../../shared/llmTarget.js";
+import { backendLabel } from "../../shared/llmBackends.js";
+import { TelemetryChart, type ChartSeries } from "../ui/TelemetryChart";
 import { LlmTrendChart } from "./LlmTrendChart";
+import type { BenchKind } from "./BenchSwitcher";
+import { engineStateLabel } from "./llmEngineState";
+import { idleLabel, isLlmIdle } from "../../shared/llmIdle";
 
 interface LlmPanelProps {
   llm: LlmMetrics | null;
   sparkId: string;
+  /** Unit display name — lands on the benchmark share card. */
+  sparkName?: string;
   llmPort: number;
   llmPorts?: number[];
   hasApiKey?: boolean;
+  /** Show "Copy image" in the benchmark dialogs (Settings, off by default). */
+  shareImage?: boolean;
   onRemovePort?: (port: number) => void;
-  llmPortsCount?: number;
   className?: string;
 }
 
 const VLLM_METRIC_INFO = {
   kvCache:
-    "Fraction of the engine KV cache memory currently in use (0-100%). High values mean little room for new or long contexts and often lead to queuing or preemptions.",
+    "Free tokens left in the engine’s KV-cache pool, over the allocated pool (tokens and memory). The pool is shared across concurrent requests and can be larger than one request’s max context. High usage (≥80% full) means little room for new or long contexts and often leads to queuing or preemptions.",
   requests:
     "Run = requests actively generating on the GPU. Wait = accepted but not yet scheduled (capacity or constraints). Growing wait with high KV cache usually means the server is overloaded.",
+  ttftMean:
+    "Mean time-to-first-token reported by FreeToken (a mean, not a percentile): how long requests wait until the first output token.",
   ttftP95:
     "95th percentile time-to-first-token from the engine’s request history: how long “slow” requests wait until the first output token. Spikes mean queueing, long prefills, or cold paths—not average decode speed.",
   preempts:
     "Cumulative times the engine paused a running request to free KV cache for others. Rising under load signals memory pressure; zero is normal when the server is comfortable.",
   prefixCache:
-    "Lifetime fraction of prefix-cache lookups that hit (hits / queries). Higher means more prompt reuse and less prefill work.",
+    "Lifetime fraction of prefix-cache lookups that hit (hits ÷ queries). Higher means more prompt reuse and less prefill work; — when the series is missing or unused.",
   e2eP95:
     "95th percentile end-to-end request latency from the engine’s request history: arrival until the request finishes. Includes queue wait, prefill, and decode—not just token generation speed.",
   itlP95:
     "95th percentile inter-token latency (time between successive output tokens) from the engine’s request history. Spikes mean decode stalls or contention; lower is smoother streaming.",
   mtpAccept:
-    "Lifetime speculative / MTP acceptance rate (accepted draft tokens / drafted tokens). Higher means speculative decoding is paying off.",
+    "Lifetime speculative / MTP acceptance rate (accepted draft tokens ÷ drafted tokens). Higher means speculative decoding is paying off; — when speculation is off or unused.",
 } as const;
 
-const LAUNCHER_BTN =
-  "rounded border border-border bg-surface-elevated px-3 py-1.5 text-xs font-medium text-text transition-colors hover:border-accent hover:bg-accent-soft";
+/** Compact token counts for the KV pool tile (883552 → 884k). */
+function formatKvTokens(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) {
+    const v = Math.round((n / 1_000_000) * 10) / 10;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}M`;
+  }
+  if (abs >= 1000) {
+    const v = abs >= 10_000 ? Math.round(n / 1000) : Math.round((n / 1000) * 10) / 10;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}k`;
+  }
+  return Math.round(n).toLocaleString();
+}
+
+function formatKvBytes(n: number): string {
+  const gib = n / 1024 ** 3;
+  if (gib >= 10) return `${Math.round(gib)} GB`;
+  if (gib >= 1) {
+    const v = Math.round(gib * 10) / 10;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)} GB`;
+  }
+  return `${Math.round(n / 1024 ** 2)} MB`;
+}
+
 const REMOTE_STORAGE_KEY = "sparkdash.remote-bench-target";
 
 function readStoredRemote(): { host: string; port: string; tls: boolean } {
@@ -64,24 +102,20 @@ function readStoredRemote(): { host: string; port: string; tls: boolean } {
   }
 }
 
-/** Decode / prefill / Showcase launchers — shown even when the live probe is empty
+/** Decode / Prefill / Quality / Showcase launchers — shown even when the live probe is empty
  *  (remote loopback-bound servers can still be benched via SSH tunnel). */
 function LlmLaunchers({
   sparkId,
   llmPort,
   modelId,
-  onDecode,
-  onPrefill,
-  onRemoteDecode,
-  onRemotePrefill,
+  onLaunch,
+  onRemoteLaunch,
 }: {
   sparkId: string;
   llmPort: number;
   modelId?: string | null;
-  onDecode: () => void;
-  onPrefill: () => void;
-  onRemoteDecode: (target: LlmBenchTarget) => void;
-  onRemotePrefill: (target: LlmBenchTarget) => void;
+  onLaunch: (kind: BenchKind) => void;
+  onRemoteLaunch: (kind: BenchKind, target: LlmBenchTarget) => void;
 }) {
   const [remoteOpen, setRemoteOpen] = useState(false);
   const [hostDraft, setHostDraft] = useState(() => readStoredRemote().host);
@@ -110,7 +144,7 @@ function LlmLaunchers({
     }
   };
 
-  const launchRemote = (kind: "decode" | "prefill") => {
+  const launchRemote = (kind: BenchKind) => {
     try {
       const p = parseLlmTargetInput(hostDraft, portDraft, tls);
       persist(p);
@@ -118,23 +152,51 @@ function LlmLaunchers({
       setPortDraft(String(p.port));
       setTls(p.tls);
       setRemoteError(null);
-      if (kind === "decode") onRemoteDecode(p);
-      else onRemotePrefill(p);
+      onRemoteLaunch(kind, p);
     } catch (err: unknown) {
       setRemoteError(err instanceof Error ? err.message : String(err));
     }
   };
 
+  const localHint =
+    "Runs against this Spark’s LLM. Remote units use LAN HTTP, or an SSH tunnel to loopback if the server only listens on 127.0.0.1.";
+
   return (
-    <div className="border-t border-border pt-3 space-y-2">
-      <div className="flex gap-2">
+    <div className="sp-launchers">
+      <div className="sp-btns">
+        {(
+          [
+            ["decode", "Decode", `Decode benchmark: generation speed at rising concurrency, on this Spark. ${localHint}`],
+            ["prefill", "Prefill", `Prefill benchmark: prompt processing speed and time to first token, on this Spark. ${localHint}`],
+            ["quality", "Quality", "Quality suite (QA, reasoning, arithmetic, state tracking, GSM8K, MMLU) against this port's model. Compare runs across models, quantizations and KV-cache formats."],
+            ["tool-eval", "Tool Eval Bench", "Benchmark this model's tool calling."],
+          ] as const
+        ).map(([type, label, title]) => (
+          <button
+            key={type}
+            type="button"
+            // Opens the benchmark's own page, already set to this Spark.
+            onClick={() => window.dispatchEvent(new CustomEvent("sparkdash:navigate", { detail: { id: benchId(type), spark: sparkId } }))}
+            className="btn btn--sm"
+            title={title}
+          >
+            <BenchIcon id={type} className="h-3.5 w-3.5" />
+            {label}
+          </button>
+        ))}
         <button
           type="button"
-          onClick={onDecode}
-          className={`${LAUNCHER_BTN} min-w-0 flex-1`}
-          title="Runs against this Spark’s LLM. Remote units use LAN HTTP, or an SSH tunnel to loopback if the server only listens on 127.0.0.1."
+          onClick={() => {
+            const params = new URLSearchParams();
+            if (llmPort) params.set("port", String(llmPort));
+            if (modelId) params.set("model", modelId);
+            const q = params.toString() ? `?${params.toString()}` : "";
+            window.open(`/showcase/${encodeURIComponent(sparkId)}${q}`, "_blank", "noopener,noreferrer");
+          }}
+          className="btn btn--sm"
         >
-          Run decode benchmark
+          <ExpandIcon className="h-3.5 w-3.5" />
+          Showcase
         </button>
         <button
           type="button"
@@ -142,50 +204,21 @@ function LlmLaunchers({
             setRemoteOpen((v) => !v);
             setRemoteError(null);
           }}
-          className={`shrink-0 rounded border px-2.5 py-1.5 text-[10px] font-medium uppercase tracking-wide transition-colors ${
-            remoteOpen
-              ? "border-accent bg-accent-soft text-accent"
-              : "border-border bg-surface-elevated text-muted hover:border-accent hover:text-accent"
-          }`}
+          className={`btn btn--sm btn--ghost sp-btns__end ${remoteOpen ? "is-on" : ""}`}
           aria-expanded={remoteOpen}
           title="On-demand bench against a typed host (HTTPS Tailscale, LAN IP, …). Not probed until you run."
         >
-          Remote
-        </button>
-      </div>
-      <div className="flex gap-2">
-        <button
-          type="button"
-          onClick={onPrefill}
-          className={`${LAUNCHER_BTN} min-w-0 flex-1`}
-          title="Runs against this Spark’s LLM. Remote units use LAN HTTP, or an SSH tunnel to loopback if the server only listens on 127.0.0.1."
-        >
-          Run prefill benchmark
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            setRemoteOpen((v) => !v);
-            setRemoteError(null);
-          }}
-          className={`shrink-0 rounded border px-2.5 py-1.5 text-[10px] font-medium uppercase tracking-wide transition-colors ${
-            remoteOpen
-              ? "border-accent bg-accent-soft text-accent"
-              : "border-border bg-surface-elevated text-muted hover:border-accent hover:text-accent"
-          }`}
-          aria-expanded={remoteOpen}
-          title="On-demand bench against a typed host (HTTPS Tailscale, LAN IP, …). Not probed until you run."
-        >
+          <ServerIcon className="h-3.5 w-3.5" />
           Remote
         </button>
       </div>
       {remoteOpen && (
-        <div className="space-y-2 rounded border border-border bg-surface-elevated p-2">
-          <p className="text-[10px] leading-snug text-muted">
+        <div className="sp-remote">
+          <p className="sp-hint">
             On-demand endpoint. Paste a URL or type host + port — nothing is probed until you run.
           </p>
-          <label className="block space-y-1">
-            <span className="text-[10px] uppercase tracking-wide text-muted">Host</span>
+          <label className="sp-field">
+            <span className="eyebrow">Host</span>
             <input
               type="text"
               value={hostDraft}
@@ -195,12 +228,12 @@ function LlmLaunchers({
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-tabular text-xs text-text outline-none focus:border-accent"
+              className="sp-input"
             />
           </label>
-          <div className="flex items-end gap-2">
-            <label className="min-w-0 flex-1 space-y-1">
-              <span className="text-[10px] uppercase tracking-wide text-muted">Port</span>
+          <div className="sp-field-row">
+            <label className="sp-field sp-field--grow">
+              <span className="eyebrow">Port</span>
               <input
                 type="number"
                 min={1}
@@ -208,10 +241,10 @@ function LlmLaunchers({
                 inputMode="numeric"
                 value={portDraft}
                 onChange={(e) => setPortDraft(e.target.value)}
-                className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-tabular text-xs text-text outline-none focus:border-accent"
+                className="sp-input"
               />
             </label>
-            <label className="flex shrink-0 items-center gap-1.5 pb-1.5 text-[10px] text-muted">
+            <label className="sp-check">
               <input
                 type="checkbox"
                 checked={tls}
@@ -221,46 +254,111 @@ function LlmLaunchers({
                   if (next && portDraft === "8888") setPortDraft("443");
                   if (!next && portDraft === "443") setPortDraft("8888");
                 }}
-                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
               />
               HTTPS
             </label>
           </div>
-          {remoteError && <p className="text-[10px] text-danger">{remoteError}</p>}
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => launchRemote("decode")}
-              className={`${LAUNCHER_BTN} flex-1`}
-            >
+          {remoteError && <p className="sp-error">{remoteError}</p>}
+          <div className="sp-btns">
+            <button type="button" onClick={() => launchRemote("decode")} className="btn btn--sm">
               Decode
             </button>
-            <button
-              type="button"
-              onClick={() => launchRemote("prefill")}
-              className={`${LAUNCHER_BTN} flex-1`}
-            >
+            <button type="button" onClick={() => launchRemote("prefill")} className="btn btn--sm">
               Prefill
+            </button>
+            <button type="button" onClick={() => launchRemote("quality")} className="btn btn--sm">
+              Quality
             </button>
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+const POSTURE_TONE: Record<NonNullable<LlmMetrics["posture"]>["level"], TagTone> = {
+  ok: "good",
+  warn: "warn",
+  danger: "bad",
+};
+
+/** Exposure / auth posture from the unauthenticated probe (issue #17). */
+function PostureBadge({ posture }: { posture: NonNullable<LlmMetrics["posture"]> }) {
+  return (
+    <Tag tone={POSTURE_TONE[posture.level]} title={posture.detail}>
+      {posture.label}
+    </Tag>
+  );
+}
+
+/** Small (i) next to a metric label; one open tooltip at a time. */
+function MetricInfoTip({
+  id,
+  label,
+  text,
+  openId,
+  setOpenId,
+  /** Anchor tooltip to the right so edge columns don’t clip off-screen */
+  align = "left",
+}: {
+  id: string;
+  label: string;
+  text: string;
+  openId: string | null;
+  setOpenId: (id: string | null) => void;
+  align?: "left" | "right";
+}) {
+  const open = openId === id;
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearTimer = useCallback(() => {
+    if (timer.current != null) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+  }, []);
+
+  const scheduleClose = useCallback(() => {
+    clearTimer();
+    timer.current = setTimeout(() => setOpenId(null), 2000);
+  }, [clearTimer, setOpenId]);
+
+  useEffect(() => () => clearTimer(), [clearTimer]);
+
+  return (
+    <div className="sp-tile__label">
+      <span>{label}</span>
       <button
         type="button"
         onClick={() => {
-          const params = new URLSearchParams();
-          if (llmPort) params.set("port", String(llmPort));
-          if (modelId) params.set("model", modelId);
-          const q = params.toString() ? `?${params.toString()}` : "";
-          window.open(
-            `/showcase/${encodeURIComponent(sparkId)}${q}`,
-            "_blank",
-            "noopener,noreferrer"
-          );
+          if (open) {
+            clearTimer();
+            setOpenId(null);
+          } else {
+            setOpenId(id);
+            scheduleClose();
+          }
         }}
-        className={`${LAUNCHER_BTN} w-full`}
+        onMouseEnter={() => {
+          clearTimer();
+          setOpenId(id);
+        }}
+        onMouseLeave={scheduleClose}
+        className="relative cursor-pointer opacity-60 hover:opacity-100"
+        aria-label={`${label} info`}
       >
-        Showcase
+        <InfoIcon className="h-2.5 w-2.5" />
+        {open && (
+          <div
+            onMouseEnter={clearTimer}
+            onMouseLeave={scheduleClose}
+            className={`absolute top-full z-20 mt-1 w-52 max-w-[min(13rem,calc(100vw-1.5rem))] rounded-xl border border-border-strong bg-surface-elevated px-3 py-2 text-left text-[11px] font-normal normal-case leading-snug text-text shadow-lg ${
+              align === "right" ? "right-0 left-auto" : "left-0 right-auto"
+            }`}
+          >
+            {text}
+          </div>
+        )}
       </button>
     </div>
   );
@@ -288,6 +386,7 @@ function pct(v: number | undefined | null, digits = 0): string {
 }
 
 /* ── SYNTHWAVE COLOR SPECTRUM ── */
+
 function tpsColor(tps: number): string {
   if (!Number.isFinite(tps) || tps <= 0) return "var(--color-muted)";
   if (tps >= 40) return "var(--color-success)";
@@ -321,21 +420,6 @@ function fmtUptime(seconds: number | null | undefined): string {
   return `${sec}s`;
 }
 
-const HISTORY = 60;
-
-// Dial envelopes = the box's observed ceilings (GB10): decode has never exceeded
-// ~120 tok/s, prefill ~2960 tok/s. Dials encode share-of-box, not share-of-infinity.
-const DECODE_DIAL_MAX = 120;
-const PREFILL_DIAL_MAX = 3000;
-
-interface History {
-  genTps: number[];
-  prefillTps: number[];
-  ttft: number[];
-  e2e: number[];
-  specAccept: number[];
-}
-
 function pushSample(arr: number[], v: number, max = HISTORY): number[] {
   const next = arr.length >= max ? arr.slice(arr.length - max + 1) : arr.slice();
   next.push(Number.isFinite(v) ? v : 0);
@@ -343,6 +427,7 @@ function pushSample(arr: number[], v: number, max = HISTORY): number[] {
 }
 
 /* ── SPARKLINE ── */
+
 function Sparkline({ data, color, height = 24 }: { data: number[]; color: string; height?: number }) {
   const valid = data.filter((v) => Number.isFinite(v));
   if (valid.length < 2) return <div style={{ height }} />;
@@ -366,6 +451,7 @@ function Sparkline({ data, color, height = 24 }: { data: number[]; color: string
 }
 
 /* ── ARC GAUGE ── */
+
 function ArcGauge({
   value,
   max,
@@ -427,6 +513,7 @@ function ArcGauge({
 }
 
 /* ── FULL CIRCLE GAUGE ── */
+
 function FullCircleGauge({
   value,
   max,
@@ -474,6 +561,7 @@ function FullCircleGauge({
 }
 
 /* ── GAUGE CARD ── */
+
 function GaugeCard({
   label,
   children,
@@ -495,6 +583,7 @@ function GaugeCard({
 }
 
 /* ── STAT SPARK CARD ── */
+
 function StatSparkCard({
   label,
   value,
@@ -519,6 +608,7 @@ function StatSparkCard({
 }
 
 /* ── HORIZONTAL BAR ── */
+
 function HorizontalBar({
   label,
   value,
@@ -542,6 +632,7 @@ function HorizontalBar({
 }
 
 /* ── COMPACT STAT CARD (for advanced grid) ── */
+
 function CompactCard({
   label,
   value,
@@ -560,6 +651,7 @@ function CompactCard({
 }
 
 /* ── ODOMETER CARD (radial gauge for tok/s) ── */
+
 function OdometerCard({
   label,
   value,
@@ -599,6 +691,7 @@ function RecipeBadge({ label, value, accent }: { label: string; value: string; a
 }
 
 /* ── CONFIG / PROVENANCE SECTION (top of panel) ── */
+
 function ConfigProvenanceSection({
   llm,
 }: {
@@ -757,15 +850,30 @@ function ConfigProvenanceSection({
   );
 }
 
+const HISTORY = 60;
+const DECODE_DIAL_MAX = 120;
+const PREFILL_DIAL_MAX = 3000;
+
+interface LlmChartHistory {
+  genTps: number[];
+  prefillTps: number[];
+  ttft: number[];
+  e2e: number[];
+  specAccept: number[];
+}
+
 export function LlmPanel({
   llm,
   sparkId,
+  sparkName,
   llmPort,
   llmPorts,
   hasApiKey = false,
+  shareImage = false,
   onRemovePort,
   className,
 }: LlmPanelProps) {
+  // Tail keyed by port so multi-port LLM sparklines stay distinct (8b).
   const genHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.tps`);
   const prefillHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.prefill`);
   const cachedPrefillHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.prefillCached`);
@@ -778,47 +886,43 @@ export function LlmPanel({
   const uncachedFull = useMetricsHistory(sparkId, `llm:${llmPort}.prefillUncached`);
   const genAvg = useMemo(() => avgPositive(genFull), [genFull]);
   const prefillAvg = useMemo(() => avgPositive(prefillFull), [prefillFull]);
-  const prefillPeak = useMemo(() => prefillFull.reduce((m, p) => (Number(p) > m ? Number(p) : m), 0), [prefillFull]);
   const cachedPrefillAvg = useMemo(() => avgPositive(cachedFull), [cachedFull]);
   const uncachedPrefillAvg = useMemo(() => avgPositive(uncachedFull), [uncachedFull]);
-  const [history, setHistory] = useState<History>({
-    genTps: [], prefillTps: [], ttft: [], e2e: [], specAccept: [],
-  });
   const [showSettings, setShowSettings] = useState(false);
   const [portDraft, setPortDraft] = useState(String(llmPort));
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [clearApiKey, setClearApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [benchOpen, setBenchOpen] = useState(false);
-  const [prefillBenchOpen, setPrefillBenchOpen] = useState(false);
+  const [engineInfoOpen, setEngineInfoOpen] = useState(false);
+  const [openBench, setOpenBench] = useState<BenchKind | null>(null);
+  const benchOpen = openBench === "decode";
+  const prefillBenchOpen = openBench === "prefill";
+  const setBenchOpen = (v: boolean) => setOpenBench(v ? "decode" : null);
   const [remoteTarget, setRemoteTarget] = useState<LlmBenchTarget | null>(null);
-  const openRemoteDecode = useCallback((target: LlmBenchTarget) => {
-    setRemoteTarget(target);
-    setBenchOpen(true);
-  }, []);
-  const openRemotePrefill = useCallback((target: LlmBenchTarget) => {
-    setRemoteTarget(target);
-    setPrefillBenchOpen(true);
-  }, []);
-  const openLocalDecode = useCallback(() => {
+  const launchLocal = useCallback((kind: BenchKind) => {
     setRemoteTarget(null);
-    setBenchOpen(true);
+    setOpenBench(kind);
   }, []);
-  const openLocalPrefill = useCallback(() => {
-    setRemoteTarget(null);
-    setPrefillBenchOpen(true);
+  const launchRemote = useCallback((kind: BenchKind, target: LlmBenchTarget) => {
+    setRemoteTarget(target);
+    setOpenBench(kind);
   }, []);
   /** Which vLLM metric info tip is open (kvCache | requests | ttftP95 | preempts). */
   const [metricInfoId, setMetricInfoId] = useState<string | null>(null);
   const engineInfoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Sticky refs
-  const stickyGenTps = useRef<number>(0);
-  const stickyPrefillTps = useRef<number>(0);
-  const stickyAggTps = useRef<number>(0);
-  const stickySingleTps = useRef<number>(0);
-  const stickyPeak = useRef<number>(0);
+  const clearEngineInfoTimer = useCallback(() => {
+    if (engineInfoTimer.current != null) {
+      clearTimeout(engineInfoTimer.current);
+      engineInfoTimer.current = null;
+    }
+  }, []);
+
+  const startEngineInfoTimer = useCallback(() => {
+    clearEngineInfoTimer();
+    engineInfoTimer.current = setTimeout(() => setEngineInfoOpen(false), 2000);
+  }, [clearEngineInfoTimer]);
 
   const generationTps = llm?.generationTps ?? 0;
   const prefillTps = llm?.prefillTps ?? 0;
@@ -826,29 +930,11 @@ export function LlmPanel({
   const cachedPrefillTps = llm?.cachedPrefillTps ?? 0;
   const uncachedPrefillTps = llm?.uncachedPrefillTps ?? 0;
   const available = llm?.available ?? false;
-
-  useEffect(() => {
-    if (!llm || !available) return;
-    const gen = llm.generationTps ?? 0;
-    const pre = llm.prefillTps ?? 0;
-    const agg = gen + pre;
-    const single = llm.perStreamAvg ?? llm.rollingAvgTpsPerSlot ?? 0;
-    const peak = llm.peakAggregateTps ?? 0;
-    if (gen > 0) stickyGenTps.current = gen;
-    if (pre > 0) stickyPrefillTps.current = pre;
-    else if ((llm.requestsRunning ?? llm.slotsActive ?? 0) === 0) stickyPrefillTps.current = 0;
-    if (agg > 0) stickyAggTps.current = agg;
-    if (single > 0) stickySingleTps.current = single;
-    if (peak > 0) stickyPeak.current = peak;
-  }, [llm, available]);
-
-  const displayGenTps = (llm?.generationTps ?? 0) > 0 ? (llm!.generationTps ?? 0) : stickyGenTps.current;
-  const displayPrefillTps = (llm?.prefillTps ?? 0) > 0 ? (llm!.prefillTps ?? 0) : stickyPrefillTps.current;
-  const displayAggTps = displayGenTps + displayPrefillTps;
-  const liveSingleTps = llm?.perStreamAvg ?? llm?.rollingAvgTpsPerSlot ?? 0;
-  const displaySingleTps = liveSingleTps > 0 ? liveSingleTps : stickySingleTps.current;
-  const displayPeak = (llm?.peakAggregateTps ?? 0) > 0 ? (llm!.peakAggregateTps ?? 0) : stickyPeak.current;
-
+  // While nothing is flowing, say when the endpoint last served.
+  const idleNote = available && isLlmIdle({ generationTps, prefillTps })
+    ? idleLabel(llm?.lastActiveAt)
+    : null;
+  // styles01 badge states
   const isThinking = available &&
     ((llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0) &&
     (llm?.isPrefilling !== true) &&
@@ -856,10 +942,25 @@ export function LlmPanel({
   const isPrefilling = available &&
     ((llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0) &&
     (llm?.isPrefilling === true ||
-      // legacy servers without the field: prefill rate is the only honest signal
-      // (activeContext is stale post-gen and must NOT be used as a prefill proxy)
       (llm?.isPrefilling == null && (llm?.generationTps ?? 0) < 1 && (llm?.prefillTps ?? 0) > 0));
 
+  useEffect(() => {
+    if (!llm || !available) return;
+    const gen = llm.generationTps ?? 0;
+    const rawPre = llm.prefillTps ?? 0;
+    const ttft = llm.ttft ?? NaN;
+    const e2e = llm.e2eLatency ?? NaN;
+    const specRate = llm.specAcceptanceRate ?? llm.dsparkAcceptRatio ?? llm.mtpAcceptanceRate ?? NaN;
+    setHistory((prev) => ({
+      genTps: pushSample(prev.genTps, gen),
+      prefillTps: pushSample(prev.prefillTps, rawPre),
+      ttft: pushSample(prev.ttft, ttft),
+      e2e: pushSample(prev.e2e, e2e),
+      specAccept: pushSample(prev.specAccept, specRate),
+    }));
+  }, [llm, available]);
+
+  // Keep draft in sync when server pushes a different port (other tab / reload)
   useEffect(() => {
     if (!showSettings) {
       setPortDraft(String(llmPort));
@@ -867,32 +968,6 @@ export function LlmPanel({
       setClearApiKey(false);
     }
   }, [llmPort, showSettings]);
-
-  useEffect(() => {
-    if (!llm || !available) return;
-    const gen = llm.generationTps ?? 0;
-    const rawPre = llm.prefillTps ?? 0;
-    // Prefill bursts: vLLM only reports a non-zero prefill rate on the sample where a
-    // chunked-prefill step ran; the in-flight request still owns the engine between
-    // samples. Hold the last observed prefill rate while requests are running so the
-    // prefill line renders as a continuous band across the burst window instead of
-    // single-sample spikes; release it when no requests remain.
-    const running = (llm.requestsRunning ?? llm.slotsActive ?? 0) > 0;
-    const pre = rawPre > 0
-      ? rawPre
-      : (running ? stickyPrefillTps.current : 0);
-    const ttft = llm.ttft ?? NaN;
-    const e2e = llm.e2eLatency ?? NaN;
-    // Data-availability chain: prefer the most specific spec-decode source present.
-    const specRate = llm.specAcceptanceRate ?? llm.dsparkAcceptRatio ?? llm.mtpAcceptanceRate ?? NaN;
-    setHistory((prev) => ({
-      genTps: pushSample(prev.genTps, gen),
-      prefillTps: pushSample(prev.prefillTps, pre),
-      ttft: pushSample(prev.ttft, ttft),
-      e2e: pushSample(prev.e2e, e2e),
-      specAccept: pushSample(prev.specAccept, specRate),
-    }));
-  }, [llm, available]);
 
   const parsedPort = (() => {
     const n = parseInt(portDraft, 10);
@@ -907,7 +982,7 @@ export function LlmPanel({
 
   const handleSaveSettings = async () => {
     if (parsedPort === null) {
-      setSaveError("Port must be an integer 1\u201365535");
+      setSaveError("Port must be an integer 1–65535");
       return;
     }
     if (!settingsDirty) {
@@ -918,12 +993,14 @@ export function LlmPanel({
     setSaveError(null);
     try {
       if (portDirty) {
-        const currentPorts = Array.isArray(llmPorts) && llmPorts.length > 0 ? llmPorts : [llmPort];
+        const currentPorts =
+          Array.isArray(llmPorts) && llmPorts.length > 0 ? llmPorts : [llmPort];
         if (currentPorts.includes(parsedPort) && parsedPort !== llmPort) {
           setSaveError(`Port ${parsedPort} is already configured`);
           setSaving(false);
           return;
         }
+        // Rename this panel's port in-place so sibling ports (and their keys) survive
         if (currentPorts.length > 1) {
           const next = currentPorts.map((p) => (p === llmPort ? parsedPort : p));
           await updateLlmPorts(sparkId, next);
@@ -947,17 +1024,32 @@ export function LlmPanel({
     }
   };
 
-  const genSeries: ChartSeries = { label: "decode", color: "var(--color-success)", data: history.genTps, area: true, yAxis: "left" };
-  const preSeries: ChartSeries = { label: "prefill", color: "var(--color-accent)", data: history.prefillTps, area: false, yAxis: "right", logScale: true };
-  const ttftSeries: ChartSeries = { label: "TTFT", color: "var(--color-danger)", data: history.ttft, area: false };
-  const e2eSeries: ChartSeries = { label: "E2E", color: "var(--color-info)", data: history.e2e, area: false };
 
+  // styles01 chart history
+  const [history, setHistory] = useState<LlmChartHistory>({
+    genTps: [], prefillTps: [], ttft: [], e2e: [], specAccept: [],
+  });
+  // styles01 display values (sticky last-positive for idle gaps)
+  const stickyGenTps = useRef<number>(0);
+  const stickyPrefillTps = useRef<number>(0);
+  const stickyPeak = useRef<number>(0);
+  useEffect(() => {
+    if (!llm || !available) return;
+    if ((llm.generationTps ?? 0) > 0) stickyGenTps.current = llm.generationTps;
+    if ((llm.prefillTps ?? 0) > 0) stickyPrefillTps.current = llm.prefillTps;
+    else if ((llm.requestsRunning ?? llm.slotsActive ?? 0) === 0) stickyPrefillTps.current = 0;
+    if ((llm.peakAggregateTps ?? 0) > 0) stickyPeak.current = llm.peakAggregateTps as number;
+  }, [llm, available]);
+  const displayGenTps = (llm?.generationTps ?? 0) > 0 ? (llm?.generationTps ?? 0) : stickyGenTps.current;
+  const displayPrefillTps = (llm?.prefillTps ?? 0) > 0 ? (llm?.prefillTps ?? 0) : stickyPrefillTps.current;
+  const displayAggTps = displayGenTps + displayPrefillTps;
+  const displaySingleTps = llm?.perStreamAvg ?? llm?.rollingAvgTpsPerSlot ?? displayGenTps;
+  const displayPeak = (llm?.peakAggregateTps ?? 0) > 0 ? (llm?.peakAggregateTps ?? 0) : stickyPeak.current;
+  const prefillPeak = prefillFull.reduce((m, p) => (Number(p) > m ? Number(p) : m), 0);
+
+  /* -- styles01 dashboard derivations (ported; data-availability gated) -- */
   const currentSpecAccept = llm?.specAcceptanceRate ?? llm?.dsparkAcceptRatio ?? llm?.mtpAcceptanceRate ?? null;
   const avgSpecAccept = arrMean(history.specAccept);
-  const mtpRate = currentSpecAccept;
-  // Spec-decode counters: prefer the most specific source present. llama.cpp
-  // exposes specAcceptedTokens/specGeneratedTokens (from the server log); the
-  // MTP/DSpark fields are vLLM/ds4-native. Data-availability gated, not backend.
   const specAccepted = llm?.specAcceptedTokens ?? llm?.mtpAcceptedTokens ?? null;
   const specGenerated = llm?.specGeneratedTokens ?? llm?.mtpDraftedTokens ?? null;
   const mtpAccepted = specAccepted;
@@ -968,11 +1060,8 @@ export function LlmPanel({
   const banksLive = llm?.banksLive ?? null;
   const banksTotal = llm?.banksTotal ?? null;
   const prefixHit = llm?.prefixCacheHitRate ?? llm?.cacheHitRatio ?? null;
-  const slots = llm?.slots ?? [];
   const runningSlots = llm?.runningSlots ?? llm?.slotsActive ?? 0;
   const waitingSlots = llm?.waitingSlots ?? 0;
-
-  // ── llama.cpp expanded /slots surface (data-availability gated) ──
   const promptTokens = llm?.promptTokens ?? null;
   const promptTokensProcessed = llm?.promptTokensProcessed ?? null;
   const promptTokensCache = llm?.promptTokensCache ?? null;
@@ -990,86 +1079,109 @@ export function LlmPanel({
   const specAcceptedTokens = llm?.specAcceptedTokens ?? null;
   const specGeneratedTokens = llm?.specGeneratedTokens ?? null;
   const specMeanLen = llm?.specMeanLen ?? null;
-  // Context used = prompt tokens + decoded so far (llama.cpp /slots).
   const contextUsedTokens = (promptTokens != null ? promptTokens : 0) + (nDecoded != null ? nDecoded : 0);
   const contextUsedPct = nCtx != null && nCtx > 0 ? contextUsedTokens / nCtx : null;
-  // KV cache usage: prefer the backend-native field; for llama.cpp derive it
-  // from the /slots context counters (contextUsedTokens / nCtx). Data-availability
-  // gated — only non-null when we have the underlying data.
-  const kvUsage = llm?.kvCacheUsage ?? (nCtx != null && nCtx > 0 ? contextUsedTokens / nCtx : null);
-
+  const kvUsage = llm?.kvCacheUsage ?? null;
   const specDecodeMethod = llm?.recipeInfo?.specDecodeMethod ?? null;
-  // Spec-decode label: prefer the explicit recipe method, then the live
-  // speculative.types from the server (llama.cpp exposes "none,ngram-mod").
-  // Data-availability gated — no backend conditionals.
   const specDecodeLabel = specDecodeMethod
     ? specDecodeMethod.replace(/\s*k=\d+$/, "").trim()
     : speculativeTypes && speculativeTypes !== "none"
       ? speculativeTypes
       : "MTP";
-
   const kvColor = kvUsage != null && kvUsage >= 0.8 ? "var(--color-danger)" : kvUsage != null && kvUsage >= 0.5 ? "var(--color-accent)" : "var(--color-success)";
   const lanesColor = (banksLive ?? 0) > 0 ? "var(--color-success)" : "var(--color-muted)";
-
-  const sparkGen = history.genTps;
-  const sparkPrefill = history.prefillTps;
-  const sparkAgg = history.genTps.map((g, i) => g + (history.prefillTps[i] ?? 0));
-  const sparkAvg = history.genTps.map((_, i) => llm?.rollingAvgTpsPerSlot ?? history.genTps[i] ?? 0);
-  const sparkSingle = history.genTps.map((_, i) => llm?.perStreamAvg ?? llm?.rollingAvgTpsPerSlot ?? history.genTps[i] ?? 0);
-  const sparkPeak = history.genTps.map((_, i) => llm?.peakAggregateTps ?? displayPeak);
-
+  const sparkGen = genHistory;
+  const sparkPrefill = prefillHistory;
+  const sparkAvg = genHistory;
+  const sparkSingle = genHistory;
+  const sparkPeak = genHistory;
   const reasoningEffort = llm?.reasoningEffort ?? null;
   const effortIndex = reasoningEffort === "high" ? 3 : reasoningEffort === "medium" ? 2 : reasoningEffort === "low" ? 1 : 0;
+  const specDecodeBars: { label: string; value: number }[] = perPos.length > 0
+    ? perPos.map((p, i) => ({ label: `Pos ${i}`, value: p }))
+    : [{ label: "Pos 0", value: Number(currentSpecAccept ?? 0) }];
+  const genSeries: ChartSeries = { label: "decode", color: "var(--color-success)", data: history.genTps, area: true, yAxis: "left" };
+  const preSeries: ChartSeries = { label: "prefill", color: "var(--color-accent)", data: history.prefillTps, area: false, yAxis: "right", logScale: true };
+  const ttftSeries: ChartSeries = { label: "TTFT", color: "var(--color-danger)", data: history.ttft, area: false };
+  const e2eSeries: ChartSeries = { label: "E2E", color: "var(--color-info)", data: history.e2e, area: false };
 
-  /* ── Derive spec decode per-position data ── */
-  // Per-position acceptance bars (Pos 0, Pos 1, Pos 2, ...) — same as vLLM had.
-  // For vLLM: perPositionAcceptance is populated from spec_decode_num_accepted_tokens_per_pos_total.
-  // For DS4 (DSpark k=2): no per-position breakdown in /metrics, so synthesize from
-  // overall acceptance ratio using geometric decay: pos 0 = 1.0 (base), pos 1 = r, pos 2 = r^2, etc.
-  const specDecodeBars: { label: string; value: number }[] = (() => {
-    // vLLM path: use actual per-position data
-    if (perPos.length > 0) {
-      return perPos.map((p, i) => ({ label: `Pos ${i}`, value: p }));
-    }
-    // DS4 path: synthesize per-position from overall acceptance ratio
-    // Determine k (number of draft positions) from spec decode method or default to 2
-    const specMethod = llm?.recipeInfo?.specDecodeMethod ?? "";
-    const kMatch = specMethod.match(/k=(\d+)/);
-    const k = kMatch ? parseInt(kMatch[1]) : 2; // default k=2 for DSpark, no cap (supports up to 15+)
-    // Get overall acceptance ratio
-    let overallRate: number | null = null;
-    if (specHits != null && specDrafts != null && specDrafts > 0) {
-      overallRate = specHits / specDrafts;
-    } else if (currentSpecAccept != null) {
-      overallRate = currentSpecAccept;
-    } else if (llm?.dsparkAcceptRatio != null) {
-      overallRate = llm.dsparkAcceptRatio;
-    }
-    if (overallRate != null && overallRate > 0) {
-      // Position 0 is the base token (always accepted = 1.0)
-      // Position N has acceptance = overallRate^N (geometric decay)
-      const bars: { label: string; value: number }[] = [];
-      for (let i = 0; i <= k; i++) {
-        const rate = i === 0 ? 1.0 : Math.pow(overallRate, i);
-        bars.push({ label: `Pos ${i}`, value: Math.round(rate * 10000) / 10000 });
-      }
-      return bars;
-    }
-    // No data at all — show placeholder bars at 0
-    return [{ label: "Pos 0", value: 0 }, { label: "Pos 1", value: 0 }];
-  })();
+  const fmtTps = (n: number) => (n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(1));
+  const fmtAvg = (n: number) => (n >= 100 ? n.toFixed(0) : n.toFixed(1));
+  const isVllm = llm != null && (llm.backend === "vllm" || llm.backend === "q27");
+  // FreeToken reports KV use, active requests and a TTFT mean in /v1/stats; the tiles below are null-gated.
+  const isFreeToken = llm?.backend === "freetoken";
+  const showEngineTiles = isVllm || isFreeToken;
+  const kvTone =
+    llm?.kvCacheUsage == null
+      ? ""
+      : llm.kvCacheUsage >= 0.8
+        ? "text-danger"
+        : llm.kvCacheUsage >= 0.5
+          ? "text-warning"
+          : "text-success";
+  const contextLabel = llm?.contextLength
+    ? llm.contextLength >= 1000
+      ? `${Math.round(llm.contextLength / 1024)}k ctx`
+      : `${llm.contextLength} ctx`
+    : null;
+  const backend = backendLabel(llm?.backend ?? null);
+
+  const tile = (id: string, label: string, value: string, opts?: { tone?: string; sub?: string; align?: "left" | "right" }) => (
+    <div className="sp-tile" key={id}>
+      <b className={opts?.tone ?? ""}>{value}</b>
+      <MetricInfoTip
+        id={id}
+        label={label}
+        text={VLLM_METRIC_INFO[id as keyof typeof VLLM_METRIC_INFO]}
+        openId={metricInfoId}
+        setOpenId={setMetricInfoId}
+        align={opts?.align}
+      />
+      {opts?.sub && <small>{opts.sub}</small>}
+    </div>
+  );
+
+  const kvValue =
+    llm?.kvCacheUsage != null
+      ? `${(llm.kvCacheUsage * 100).toFixed(0)}%`
+      : llm?.kvCacheTokensAvailable != null
+        ? `${formatKvTokens(llm.kvCacheTokensAvailable)} free`
+        : llm?.kvCacheTokens != null
+          ? formatKvTokens(llm.kvCacheTokens)
+          : null;
+  const kvSub = [
+    llm?.kvCacheUsage != null && llm?.kvCacheTokensAvailable != null
+      ? `${formatKvTokens(llm.kvCacheTokensAvailable)} free`
+      : null,
+    llm?.kvCacheTokens != null ? `${formatKvTokens(llm.kvCacheTokens)} pool` : null,
+    llm?.kvCacheMemoryBytes != null ? formatKvBytes(llm.kvCacheMemoryBytes) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <Panel
-      title="LLM"
+      title="LLM server"
       accent={available}
       icon={<BotIcon />}
-      className={`panel-llm ${className}`}
+      className={`panel-llm ${className ?? ""}`}
+      bodyClassName="sp-stack"
       actions={
-        <div className="flex items-center gap-1.5">
+        <div className="sp-actions">
+          {available && backend && (
+            <Tag tone="info" title={`Backend: ${backend}`}>
+              {backend} · :{llmPort}
+            </Tag>
+          )}
           {onRemovePort && (
-            <button type="button" title={`Remove port ${llmPort}`} onClick={() => onRemovePort(llmPort)} className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-danger transition-colors hover:bg-danger/10">
-              <span aria-hidden>{"\u00D7"}</span><span>Remove</span>
+            <button
+              type="button"
+              title={`Remove port ${llmPort}`}
+              onClick={() => onRemovePort(llmPort)}
+              className="btn btn--sm btn--danger"
+            >
+              <span aria-hidden>×</span>
+              <span>Remove</span>
             </button>
           )}
           <button
@@ -1085,7 +1197,7 @@ export function LlmPanel({
               setShowSettings(!showSettings);
             }}
             disabled={saving}
-            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-hover disabled:opacity-50 ${showSettings ? "bg-surface-elevated text-text" : ""}`}
+            className={`btn btn--sm btn--ghost ${showSettings ? "is-on" : ""}`}
           >
             <GearIcon />
             <span>{showSettings ? "Done" : "Settings"}</span>
@@ -1094,53 +1206,128 @@ export function LlmPanel({
       }
     >
       {showSettings ? (
-        <div className="space-y-3">
-          <p className="text-[10px] text-muted">
-            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / OpenAI-compatible gateway).
+        <div className="sp-stack">
+          <p className="sp-hint">
+            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / TensorFold / OpenAI-compatible gateway).
           </p>
-          <label className="block space-y-1">
-            <span className="text-xs text-muted">Port</span>
-            <input type="number" min={1} max={65535} inputMode="numeric" value={portDraft} onChange={(e) => { setPortDraft(e.target.value); setSaveError(null); }} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleSaveSettings(); } }} className="w-full rounded-md border border-border bg-surface-elevated px-3 py-1.5 font-tabular text-sm text-text outline-none focus:border-accent" />
+          <label className="sp-field">
+            <span className="eyebrow">Port</span>
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              inputMode="numeric"
+              value={portDraft}
+              onChange={(e) => {
+                setPortDraft(e.target.value);
+                setSaveError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveSettings();
+                }
+              }}
+              className="sp-input"
+            />
           </label>
-          <label className="block space-y-1">
-            <span className="text-xs text-muted">API key (optional)</span>
-            <input type="password" autoComplete="new-password" spellCheck={false} value={apiKeyDraft} disabled={clearApiKey} placeholder={hasApiKey && !clearApiKey ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)" : "Bearer token if required"} onChange={(e) => { setApiKeyDraft(e.target.value); setClearApiKey(false); setSaveError(null); }} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleSaveSettings(); } }} className="w-full rounded-md border border-border bg-surface-elevated px-3 py-1.5 font-mono text-sm text-text outline-none focus:border-accent disabled:opacity-50" />
+          <label className="sp-field">
+            <span className="eyebrow">API key (optional)</span>
+            <input
+              type="password"
+              autoComplete="new-password"
+              spellCheck={false}
+              value={apiKeyDraft}
+              disabled={clearApiKey}
+              placeholder={hasApiKey && !clearApiKey ? "•••••••• (saved — leave blank to keep)" : "Bearer token if required"}
+              onChange={(e) => {
+                setApiKeyDraft(e.target.value);
+                setClearApiKey(false);
+                setSaveError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveSettings();
+                }
+              }}
+              className="sp-input"
+            />
           </label>
           {hasApiKey && (
-            <label className="flex cursor-pointer items-center gap-2 text-[11px] text-muted">
-              <input type="checkbox" checked={clearApiKey} onChange={(e) => { setClearApiKey(e.target.checked); if (e.target.checked) setApiKeyDraft(""); setSaveError(null); }} className="h-3.5 w-3.5 accent-[var(--color-accent)]" />
+            <label className="sp-check">
+              <input
+                type="checkbox"
+                checked={clearApiKey}
+                onChange={(e) => {
+                  setClearApiKey(e.target.checked);
+                  if (e.target.checked) setApiKeyDraft("");
+                  setSaveError(null);
+                }}
+              />
               Clear saved API key
             </label>
           )}
-          {portInvalid && <p className="text-[10px] text-danger">Enter an integer between 1 and 65535</p>}
-          {saveError && <p className="text-[10px] text-danger">{saveError}</p>}
-          <div className="flex items-center justify-end gap-2">
-            <button type="button" onClick={() => { setPortDraft(String(llmPort)); setApiKeyDraft(""); setClearApiKey(false); setSaveError(null); setShowSettings(false); }} disabled={saving} className="rounded border border-border px-2 py-1 text-[10px] text-muted hover:bg-surface-hover disabled:opacity-50">Cancel</button>
-            <button type="button" onClick={() => void handleSaveSettings()} disabled={saving || portInvalid || !settingsDirty} className="rounded bg-accent px-2 py-1 text-[10px] font-medium text-white hover:bg-accent-hover disabled:opacity-50">{saving ? "Saving\u2026" : "Save"}</button>
+          {portInvalid && <p className="sp-error">Enter an integer between 1 and 65535</p>}
+          {saveError && <p className="sp-error">{saveError}</p>}
+          <div className="sp-btns sp-btns--end">
+            <button
+              type="button"
+              onClick={() => {
+                setPortDraft(String(llmPort));
+                setApiKeyDraft("");
+                setClearApiKey(false);
+                setSaveError(null);
+                setShowSettings(false);
+              }}
+              disabled={saving}
+              className="btn btn--sm"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleSaveSettings()}
+              disabled={saving || portInvalid || !settingsDirty}
+              className="btn btn--sm btn--primary"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
           </div>
         </div>
       ) : !available ? (
-        <div className="space-y-1">
-          <div className="flex flex-wrap items-center gap-2 py-1">
-            {llm?.posture ? (
-              <span className={`llm-posture llm-posture--${llm.posture.level}`}><span className="llm-posture__dot" />{llm.posture.label}</span>
-            ) : (
-              <span className="h-1.5 w-1.5 rounded-full bg-muted" />
-            )}
-            <p className="text-xs text-muted">{llm?.posture?.auth === "protected" ? `${llm.posture.label} on :${llmPort}` : `No model loaded on :${llmPort}`}</p>
+        <div className="sp-stack">
+          <div className="sp-chips">
+            {llm?.posture ? <PostureBadge posture={llm.posture} /> : <span className="sdot sdot--off" />}
+            <p className="sp-muted">
+              {llm?.posture?.auth === "protected"
+                ? `${llm.posture.label} on :${llmPort}`
+                : `No model loaded on :${llmPort}`}
+            </p>
           </div>
           <LlmLaunchers
             sparkId={sparkId}
             llmPort={llmPort}
             modelId={llm?.modelId}
-            onDecode={openLocalDecode}
-            onPrefill={openLocalPrefill}
-            onRemoteDecode={openRemoteDecode}
-            onRemotePrefill={openRemotePrefill}
+            onLaunch={launchLocal}
+            onRemoteLaunch={launchRemote}
           />
           <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+          <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
         </div>
       ) : (
+        <div className="sp-stack">
+          <div className="sp-model">
+            <div className="eyebrow">
+              <span>Model</span>
+              {contextLabel && <span>{contextLabel}</span>}
+            </div>
+            <code title={llm?.modelId ?? undefined}>{llm?.modelId ?? "—"}</code>
+            {llm?.modelPath && llm.modelPath !== llm.modelId && !llm.modelPath.includes("models--") && (
+              <small title={llm.modelPath}>{llm.modelPath}</small>
+            )}
+          </div>
+
         <div className="llm-dashboard">
           {/* ═══ ROW 1 — HEADER BAR ═══ */}
           <div className="llm-header-bar">
@@ -1165,10 +1352,10 @@ export function LlmPanel({
 
           {/* ═══ ROW 3 — HERO STATS (4 cards: 2 spark + 2 odometer) ═══ */}
           <div className="llm-hero-grid">
-            <OdometerCard label="Decode tok/s" value={displayGenTps} max={DECODE_DIAL_MAX} displayValue={fmtNum(displayGenTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)}`} color={tpsColor(displayGenTps)} sparkData={sparkGen} />
-            <OdometerCard label="Prefill tok/s" value={displayPrefillTps} max={PREFILL_DIAL_MAX} displayValue={fmtNum(displayPrefillTps, 1)} sub={`decode ${fmtNum(displayGenTps, 1)}`} color={tpsColor(displayPrefillTps)} sparkData={sparkPrefill} />
-            <OdometerCard label="Avg tok/s" value={genAvg ?? 0} max={DECODE_DIAL_MAX} displayValue={fmtNum(genAvg ?? 0, 1)} sub={`prefill avg ${fmtNum(prefillAvg ?? 0, 1)}`} color={tpsColor(genAvg ?? 0)} sparkData={sparkSingle} />
-            <OdometerCard label="Peak tok/s" value={displayPeak} max={DECODE_DIAL_MAX} displayValue={fmtNum(displayPeak, 1)} sub={`prefill peak ${fmtNum(prefillPeak ?? 0, 1)}`} color={tpsColor(displayPeak)} sparkData={sparkPeak} />
+            <OdometerCard label="Decode tok/s" value={displayGenTps} max={DECODE_DIAL_MAX} displayValue={fmtNum(displayGenTps, 1)} sub={`prefill ${fmtNum(displayPrefillTps, 1)}`} color={tpsColor(displayGenTps)} sparkData={sparkGen as number[]} />
+            <OdometerCard label="Prefill tok/s" value={displayPrefillTps} max={PREFILL_DIAL_MAX} displayValue={fmtNum(displayPrefillTps, 1)} sub={`decode ${fmtNum(displayGenTps, 1)}`} color={tpsColor(displayPrefillTps)} sparkData={sparkPrefill as number[]} />
+            <OdometerCard label="Avg tok/s" value={genAvg ?? 0} max={DECODE_DIAL_MAX} displayValue={fmtNum(genAvg ?? 0, 1)} sub={`prefill avg ${fmtNum(prefillAvg ?? 0, 1)}`} color={tpsColor(genAvg ?? 0)} sparkData={sparkSingle as number[]} />
+            <OdometerCard label="Peak tok/s" value={displayPeak} max={DECODE_DIAL_MAX} displayValue={fmtNum(displayPeak, 1)} sub={`prefill peak ${fmtNum(prefillPeak ?? 0, 1)}`} color={tpsColor(displayPeak)} sparkData={sparkPeak as number[]} />
           </div>
 
           {/* ═══ ROW 4 — GAUGE ARCS ═══ */}
@@ -1317,7 +1504,7 @@ export function LlmPanel({
             <CompactCard label="Min-P" value={samplingParams?.min_p != null ? fmtNum(Number(samplingParams.min_p), 2) : "\u2014"} />
             <CompactCard label="Max Tokens" value={samplingParams?.max_tokens != null ? fmtInt(Number(samplingParams.max_tokens)) : "\u2014"} />
             {/* Engine metrics */}
-            <CompactCard label="Uptime" value={fmtUptime(llm?.ds4Uptime ?? llm?.recipeInfo?.uptime)} />
+            <CompactCard label="Uptime" value={fmtUptime(llm?.engineUptimeSeconds ?? llm?.ds4Uptime ?? llm?.recipeInfo?.uptime)} />
             <CompactCard label="Reasoning" value={reasoningEffort ?? "\u2014"} color={effortIndex > 0 ? "var(--color-accent)" : "var(--color-muted)"} />
             <CompactCard label="Requests Started" value={fmtInt(llm?.requestsStarted)} />
             <CompactCard label="Requests Done" value={fmtInt(llm?.requestsCompleted)} />
@@ -1333,24 +1520,50 @@ export function LlmPanel({
             <button type="button" onClick={() => { const params = new URLSearchParams(); if (llmPort) params.set("port", String(llmPort)); if (llm?.modelId) params.set("model", llm.modelId); const q = params.toString() ? `?${params.toString()}` : ""; window.open(`/showcase/${encodeURIComponent(sparkId)}${q}`, "_blank", "noopener,noreferrer"); }} className="llm-action-btn">Showcase</button>
           </div>
         </div>
+        </div>
       )}
 
       <BenchmarkDialog
-        open={benchOpen}
-        onClose={() => setBenchOpen(false)}
+        open={openBench === "decode"}
+        onClose={() => setOpenBench(null)}
+        onSwitchBench={setOpenBench}
         sparkId={sparkId}
         llmPort={llmPort}
         modelId={remoteTarget ? null : llm?.modelId ?? null}
+        models={remoteTarget || (available && llm?.backend === "llama.cpp") ? undefined : llm?.models}
         remoteTarget={remoteTarget}
+        shareImage={shareImage}
+        sparkName={sparkName ?? null}
+        engine={remoteTarget ? null : llm?.backend ?? null}
+        posture={remoteTarget ? null : llm?.posture ?? null}
+        liveTps={remoteTarget ? null : llm?.generationTps ?? null}
       />
       <PrefillBenchDialog
-        open={prefillBenchOpen}
-        onClose={() => setPrefillBenchOpen(false)}
+        open={openBench === "prefill"}
+        onClose={() => setOpenBench(null)}
+        onSwitchBench={setOpenBench}
         sparkId={sparkId}
         llmPort={llmPort}
         modelId={remoteTarget ? null : llm?.modelId ?? null}
         contextLength={remoteTarget ? null : llm?.contextLength ?? null}
         remoteTarget={remoteTarget}
+        shareImage={shareImage}
+        sparkName={sparkName ?? null}
+        engine={remoteTarget ? null : llm?.backend ?? null}
+        posture={remoteTarget ? null : llm?.posture ?? null}
+      />
+      <QualityBenchDialog
+        open={openBench === "quality"}
+        onClose={() => setOpenBench(null)}
+        onSwitchBench={setOpenBench}
+        sparkId={sparkId}
+        llmPort={llmPort}
+        modelId={remoteTarget ? null : llm?.modelId ?? null}
+        contextLength={remoteTarget ? null : llm?.contextLength ?? null}
+        remoteTarget={remoteTarget}
+        sparkName={sparkName ?? null}
+        engine={remoteTarget ? null : llm?.backend ?? null}
+        posture={remoteTarget ? null : llm?.posture ?? null}
       />
     </Panel>
   );

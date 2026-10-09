@@ -174,7 +174,7 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
     /* try next */
   }
 
-  // EXL3 serve_openai.py — cumulative completion tokens on /health
+  // EXL3 serve_openai.py / TensorFold — cumulative completion tokens on /health
   try {
     const res = await fetch(`${baseUrl}/health`, {
       signal: AbortSignal.timeout(5_000),
@@ -184,6 +184,7 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
       const data = await res.json();
       const v = Number(data?.completion_tokens_total);
       if (Number.isFinite(v) && data?.backend === "exl3") return v;
+      if (Number.isFinite(v) && data?.backend === "tensorfold") return v;
       if (Number.isFinite(v) && typeof data?.busy === "boolean") return v;
     }
   } catch {
@@ -531,6 +532,11 @@ async function runStreamingRequestOnce(
   let chunkTokenCount = 0;
   let usageCompletionTokens = null;
   let usagePromptTokens = null;
+  /** Prompt tokens served from the prefix cache (usage.prompt_tokens_details / llama.cpp timings). */
+  let cachedPromptTokens = 0;
+  /** Server-measured prompt-processing time, when the backend reports it (llama.cpp `timings`). */
+  let serverPromptMs = null;
+  let serverPromptN = null;
   /** @type {Record<string, number> | null} */
   let usage = null;
   let model = null;
@@ -587,6 +593,8 @@ async function runStreamingRequestOnce(
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
+      // Normalize the accumulated buffer so CRLF split across chunks also works.
+      buffer = buffer.replace(/\r\n/g, "\n");
 
       // SSE events are separated by blank lines
       let sep;
@@ -627,6 +635,20 @@ async function runStreamingRequestOnce(
             }
             if (json.usage.prompt_tokens != null) {
               usagePromptTokens = Number(json.usage.prompt_tokens);
+            }
+            const cached = Number(json.usage.prompt_tokens_details?.cached_tokens);
+            if (Number.isFinite(cached) && cached > 0) cachedPromptTokens = Math.max(cachedPromptTokens, cached);
+          }
+          if (json.timings && typeof json.timings === "object") {
+            const ms = Number(json.timings.prompt_ms);
+            const n = Number(json.timings.prompt_n);
+            if (Number.isFinite(ms) && ms > 0 && Number.isFinite(n) && n > 0) {
+              serverPromptMs = ms;
+              serverPromptN = n;
+            }
+            const cacheN = Number(json.timings.cache_n);
+            if (Number.isFinite(cacheN) && cacheN > 0) {
+              cachedPromptTokens = Math.max(cachedPromptTokens, cacheN);
             }
           }
 
@@ -712,6 +734,11 @@ async function runStreamingRequestOnce(
     decodeTps: round2(decodeTps),
     prefillTokens,
     prefillTps: round2(prefillTps),
+    /** Prompt tokens the server reused from its prefix cache (0 when unknown/none). */
+    cachedPromptTokens,
+    /** Server-measured prompt processing (ms / tokens actually computed); null when not reported. */
+    serverPromptMs,
+    serverPromptN,
     totalMs: round2(totalMs),
     /** Absolute performance.now() marks for wave-level aggregation */
     t0,

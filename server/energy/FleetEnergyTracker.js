@@ -94,45 +94,39 @@ function hasExactNodeKeys(value, nodeIds, nodeIdSet) {
   );
 }
 
-function tokenObservation(snapshots, atMs, nodeIdSet) {
-  const heads = snapshots.filter(
-    (snapshot) => nodeIdSet.has(snapshot?.id) && snapshot?.role === "head"
-  );
-  if (heads.length !== 1) return null;
-
-  const head = heads[0];
-  const entries = head?.metrics?.llm;
-  const ports = head?.llmPorts;
-  if (!Array.isArray(entries) || !Array.isArray(ports) || entries.length !== ports.length) {
-    return null;
+/**
+ * One observation per available LLM endpoint on a tracked head or standalone
+ * node, keyed `nodeId:port`. A fleet can run several clusters and standalone
+ * engines at once, so every endpoint is its own counter. Workers are skipped:
+ * a worker fronts its head's engine, and counting it would double the pair.
+ */
+function tokenObservations(snapshots, atMs, nodeIdSet) {
+  const observations = new Map();
+  for (const snapshot of snapshots) {
+    if (!nodeIdSet.has(snapshot?.id)) continue;
+    if (snapshot.role !== "head" && snapshot.role !== "standalone") continue;
+    const entries = snapshot.metrics?.llm;
+    const ports = snapshot.llmPorts;
+    if (!Array.isArray(entries) || !Array.isArray(ports) || entries.length !== ports.length) {
+      continue;
+    }
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const port = ports[index];
+      if (
+        entry?.available !== true ||
+        !validNonnegativeSafeInteger(port) ||
+        !validNonnegativeSafeInteger(entry.totalOutputTokens)
+      ) {
+        continue;
+      }
+      observations.set(`${snapshot.id}:${port}`, {
+        totalOutputTokens: entry.totalOutputTokens,
+        observedAtMs: atMs,
+      });
+    }
   }
-  const availableIndexes = [];
-  for (let index = 0; index < entries.length; index += 1) {
-    if (entries[index]?.available === true) availableIndexes.push(index);
-  }
-  if (availableIndexes.length !== 1) return null;
-  const index = availableIndexes[0];
-  const entry = entries[index];
-  const port = ports[index];
-  if (
-    !validNonnegativeSafeInteger(port) ||
-    !validNonnegativeSafeInteger(entry.totalOutputTokens)
-  ) {
-    return null;
-  }
-  return {
-    headId: head.id,
-    port,
-    totalOutputTokens: entry.totalOutputTokens,
-    observedAtMs: atMs,
-  };
-}
-
-function sameTokenSource(left, right) {
-  return (
-    left?.headId === right?.headId &&
-    left?.port === right?.port
-  );
+  return observations;
 }
 
 function writeStateAtomically(filePath, contents, fileSystem) {
@@ -239,10 +233,15 @@ export class FleetEnergyTracker {
     this._nodeBaselines = new Map();
     this._fleetBaseline = null;
     this._integrationHighWaterMs = null;
-    this._tokenCounter = null;
-    this._tokenNeedsRebase = false;
+    // nodeId:port → last output-token counter. Never persisted: after a
+    // restart every counter rebases, so a stored one could never be used.
+    this._tokenCounters = new Map();
+    // Minute in which any token source was first seen. Efficiency divides only
+    // energy from here on: earlier energy has no token counts to divide by.
+    this._tokensTrackedSinceMs = null;
     this._recentFullFleetSamples = [];
     this._latestFreshNodeCount = 0;
+    this._latestFreshNodeIds = [];
     this._latestRecordAt = null;
     this._membershipChanged = false;
     this._currentNodeIds = [...this.nodeIds];
@@ -282,6 +281,7 @@ export class FleetEnergyTracker {
     if (this._membershipChanged) {
       this._recentFullFleetSamples = [];
       this._latestFreshNodeCount = 0;
+      this._latestFreshNodeIds = [];
     }
     return this._membershipChanged;
   }
@@ -345,21 +345,33 @@ export class FleetEnergyTracker {
   }
 
   _recordTokens(snapshots, atMs, hasFullFleetInterval) {
-    const observation = tokenObservation(snapshots, atMs, this._nodeIdSet);
-    if (!observation) return;
+    const observations = tokenObservations(snapshots, atMs, this._nodeIdSet);
 
-    const previous = this._tokenCounter;
-    const gapMs = previous ? atMs - previous.observedAtMs : null;
-    const rebase =
-      !previous ||
-      this._tokenNeedsRebase ||
-      !sameTokenSource(previous, observation) ||
-      observation.totalOutputTokens < previous.totalOutputTokens ||
-      gapMs < 0 ||
-      gapMs > MAX_GAP_MS;
+    // A counter that went backwards (engine restart) or was last seen over
+    // MAX_GAP_MS ago rebases: the new value is a baseline, never a delta.
+    let delta = 0;
+    for (const [key, observation] of observations) {
+      const previous = this._tokenCounters.get(key);
+      const gapMs = previous ? atMs - previous.observedAtMs : null;
+      if (
+        previous &&
+        gapMs >= 0 &&
+        gapMs <= MAX_GAP_MS &&
+        observation.totalOutputTokens > previous.totalOutputTokens
+      ) {
+        delta += observation.totalOutputTokens - previous.totalOutputTokens;
+      }
+      this._tokenCounters.set(key, observation);
+    }
+    for (const [key, counter] of this._tokenCounters) {
+      if (atMs - counter.observedAtMs > MAX_GAP_MS) this._tokenCounters.delete(key);
+    }
+    if (observations.size === 0) return;
+    if (this._tokensTrackedSinceMs === null) {
+      this._tokensTrackedSinceMs = Math.floor(atMs / MINUTE_MS) * MINUTE_MS;
+    }
 
-    if (!rebase && observation.totalOutputTokens > previous.totalOutputTokens) {
-      const delta = observation.totalOutputTokens - previous.totalOutputTokens;
+    if (delta > 0) {
       const minuteStartMs = Math.floor(atMs / MINUTE_MS) * MINUTE_MS;
       const bucket = this._bucket(minuteStartMs);
       const nextTotal = bucket.outputTokens + delta;
@@ -369,8 +381,6 @@ export class FleetEnergyTracker {
         if (Number.isSafeInteger(nextCovered)) bucket.coveredOutputTokens = nextCovered;
       }
     }
-    this._tokenCounter = observation;
-    this._tokenNeedsRebase = false;
     this._dirty = true;
   }
 
@@ -420,11 +430,12 @@ export class FleetEnergyTracker {
     if (!Array.isArray(snapshots) || !Number.isFinite(timestamp)) return false;
     if (this._latestRecordAt !== null && timestamp === this._latestRecordAt) return false;
     if (this._latestRecordAt !== null && timestamp < this._latestRecordAt) {
-      this._tokenNeedsRebase = true;
+      this._tokenCounters.clear();
       this._nodeBaselines.clear();
       this._fleetBaseline = null;
       this._recentFullFleetSamples = [];
       this._latestFreshNodeCount = 0;
+      this._latestFreshNodeIds = [];
     }
 
     const byId = new Map();
@@ -493,14 +504,15 @@ export class FleetEnergyTracker {
 
     this._recordTokens(snapshots, timestamp, hasFullFleetInterval);
     this._latestFreshNodeCount = validNodes.size;
+    this._latestFreshNodeIds = [...validNodes.keys()];
     this._latestRecordAt = timestamp;
     this._dirty = true;
     this._prune(timestamp);
     return true;
   }
 
-  _window(atMs, windowMs) {
-    const cutoff = alignedWindowCutoff(atMs, windowMs);
+  _window(atMs, windowMs, fromMs = null) {
+    const cutoff = Math.max(alignedWindowCutoff(atMs, windowMs), fromMs ?? -Infinity);
     const nodeWh = nodeValues(this.nodeIds);
     const nodeCoverageMs = nodeValues(this.nodeIds);
     let fleetCoverageMs = 0;
@@ -562,6 +574,9 @@ export class FleetEnergyTracker {
     this._prune(safeTimestamp);
     const last24h = this._window(safeTimestamp, DAY_MS);
     const last31d = this._window(safeTimestamp, RETENTION_MS);
+    const tracked24h = this._tokensTrackedSinceMs === null
+      ? null
+      : this._window(safeTimestamp, DAY_MS, this._tokensTrackedSinceMs);
     const sampleCount = this._recentFullFleetSamples.length;
     const currentWatts30s = sampleCount > 0
       ? this._recentFullFleetSamples.reduce((sum, sample) => sum + sample.watts, 0) / sampleCount
@@ -580,18 +595,28 @@ export class FleetEnergyTracker {
       trackedNodeIds: [...this.nodeIds],
       currentNodeIds: [...this._currentNodeIds],
       freshNodeCount: this._membershipChanged ? 0 : freshNodeCount,
+      // Tracked nodes that have no fresh power reading right now (offline or telemetry stale).
+      staleNodeIds: this._membershipChanged
+        ? []
+        : this.nodeIds.filter((id) => !(freshNodeCount > 0 && this._latestFreshNodeIds.includes(id))),
       currentWatts30s: this._membershipChanged ? null : currentWatts30s,
       energy24hKwh:
         !this._membershipChanged && last24h.hasObservedEnergy ? last24h.energyWh / 1000 : null,
       energy31dKwh:
         !this._membershipChanged && last31d.hasObservedEnergy ? last31d.energyWh / 1000 : null,
       whPerOutputToken24h:
-        !this._membershipChanged && last24h.fleetEnergyWh > 0 && last24h.coveredOutputTokens > 0
-          ? last24h.fleetEnergyWh / last24h.coveredOutputTokens
+        !this._membershipChanged && tracked24h?.fleetEnergyWh > 0 && tracked24h.coveredOutputTokens > 0
+          ? tracked24h.fleetEnergyWh / tracked24h.coveredOutputTokens
           : null,
       outputTokens24h: last24h.outputTokens,
       coverage24hMs: last24h.fleetCoverageMs,
+      /** Window these coverage figures are measured over — clients must not
+       *  assume the window length. Fleet coverage is wall-clock time during
+       *  which every node was fresh, so it is capped by this window, not by
+       *  window × nodeCount (per-node totals live in nodeCoverage*Ms). */
+      coverage24hWindowMs: DAY_MS,
       coverage31dMs: last31d.fleetCoverageMs,
+      coverage31dWindowMs: RETENTION_MS,
       nodeCoverage24hMs: last24h.nodeCoverageMs,
       nodeCoverage31dMs: last31d.nodeCoverageMs,
       hourlyWatts24h: this._membershipChanged
@@ -600,19 +625,100 @@ export class FleetEnergyTracker {
     };
   }
 
+  /**
+   * Hourly rows for the detailed energy page, oldest first (UTC hour starts, all retained
+   * minute buckets). The client regroups them into days / its local day boundaries.
+   * Per row: per-node Wh and coverage, fleet average watts over the covered time,
+   * fleet Wh, and the output tokens seen (for efficiency). Hours with no coverage are omitted.
+   */
+  history(atMs = undefined) {
+    const timestamp = this._time(atMs);
+    const now = Number.isFinite(timestamp) ? timestamp : (this._latestRecordAt ?? 0);
+    this._prune(now);
+    const byHour = new Map();
+    for (const bucket of this._buckets.values()) {
+      const hourStart = Math.floor(bucket.minuteStartMs / HOUR_MS) * HOUR_MS;
+      let row = byHour.get(hourStart);
+      if (!row) {
+        row = {
+          nodeWh: nodeValues(this.nodeIds),
+          nodeCoverageMs: nodeValues(this.nodeIds),
+          fleetWattMs: 0,
+          fleetCoverageMs: 0,
+          outputTokens: 0,
+          coveredOutputTokens: 0,
+        };
+        byHour.set(hourStart, row);
+      }
+      for (const id of this.nodeIds) {
+        row.nodeWh[id] += bucket.nodeWh[id];
+        row.nodeCoverageMs[id] += bucket.nodeCoverageMs[id];
+      }
+      row.fleetWattMs += bucket.fleetWattMs;
+      row.fleetCoverageMs += bucket.fleetCoverageMs;
+      row.outputTokens += bucket.outputTokens;
+      row.coveredOutputTokens += bucket.coveredOutputTokens;
+    }
+    const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
+    const hourly = this._membershipChanged
+      ? []
+      : [...byHour.entries()]
+          .sort(([a], [b]) => a - b)
+          .filter(([, row]) => Object.values(row.nodeCoverageMs).some((ms) => ms > 0))
+          .map(([t, row]) => ({
+            t,
+            nodeWh: Object.fromEntries(Object.entries(row.nodeWh).map(([id, wh]) => [id, round(wh)])),
+            nodeCoverageMs: row.nodeCoverageMs,
+            avgWatts: row.fleetCoverageMs > 0 ? round(row.fleetWattMs / row.fleetCoverageMs, 1) : null,
+            fleetEnergyWh: round(row.fleetWattMs / 3_600_000),
+            fleetCoverageMs: row.fleetCoverageMs,
+            outputTokens: row.outputTokens,
+            coveredOutputTokens: row.coveredOutputTokens,
+          }));
+    return {
+      estimated: true,
+      membershipChanged: this._membershipChanged,
+      generatedAt: now,
+      retentionMs: RETENTION_MS,
+      nodeIds: [...this.nodeIds],
+      hourly,
+    };
+  }
+
+  /**
+   * A state file from another fleet scope is not loaded (its aggregates would not be truthful for this fleet),
+   * but it is kept: renamed beside the live file so the next flush cannot overwrite that history.
+   */
+  _archiveOutOfScopeState(raw) {
+    const stamp = validNonnegativeSafeInteger(raw?.savedAt) ? raw.savedAt : Math.floor(this._now());
+    const parsed = path.parse(this.filePath);
+    const archivePath = path.join(parsed.dir, `${parsed.name}.scope-${stamp}${parsed.ext}`);
+    try {
+      if (this._fs.existsSync(archivePath)) return;
+      this._fs.renameSync(this.filePath, archivePath);
+      console.warn(
+        `[FleetEnergyTracker] fleet membership changed; previous energy history kept at ${archivePath}`
+      );
+    } catch (error) {
+      console.warn(`[FleetEnergyTracker] unable to archive ${this.filePath}: ${error.message}`);
+    }
+  }
+
   _load() {
     if (!this.filePath) return;
     try {
       const raw = JSON.parse(this._fs.readFileSync(this.filePath, "utf8"));
       const legacyNodeIds = !Object.prototype.hasOwnProperty.call(raw || {}, "nodeIds");
+      if (raw?.version !== FILE_VERSION || !Array.isArray(raw.buckets)) {
+        return;
+      }
       if (
-        raw?.version !== FILE_VERSION ||
-        !Array.isArray(raw.buckets) ||
-        (!legacyNodeIds &&
-          (!Array.isArray(raw.nodeIds) ||
-            raw.nodeIds.length !== this.nodeIds.length ||
-            raw.nodeIds.some((id) => !this._nodeIdSet.has(id))))
+        !legacyNodeIds &&
+        (!Array.isArray(raw.nodeIds) ||
+          raw.nodeIds.length !== this.nodeIds.length ||
+          raw.nodeIds.some((id) => !this._nodeIdSet.has(id)))
       ) {
+        this._archiveOutOfScopeState(raw);
         return;
       }
 
@@ -743,28 +849,54 @@ export class FleetEnergyTracker {
         repairedHighWater = hasPersistedHighWater && persistedHighWater !== null;
       }
 
-      const tokenCounter = raw.tokenCounter;
+      const trackedSince = raw.tokensTrackedSinceMs;
+      const now = this._now();
       if (
-        this._nodeIdSet.has(tokenCounter?.headId) &&
-        validNonnegativeSafeInteger(tokenCounter?.port) &&
-        validNonnegativeSafeInteger(tokenCounter?.totalOutputTokens) &&
-        Number.isFinite(tokenCounter?.observedAtMs)
+        validNonnegativeSafeInteger(trackedSince) &&
+        trackedSince % MINUTE_MS === 0 &&
+        !(trackedSince > now)
       ) {
-        this._tokenCounter = {
-          headId: tokenCounter.headId,
-          port: tokenCounter.port,
-          totalOutputTokens: tokenCounter.totalOutputTokens,
-          observedAtMs: tokenCounter.observedAtMs,
-        };
-        this._tokenNeedsRebase = true;
+        this._tokensTrackedSinceMs = trackedSince;
       }
       this._dirty = legacyNodeIds || rejectedBucket || repairedHighWater;
-      const now = this._now();
       if (Number.isFinite(now)) this._prune(now);
     } catch (error) {
       if (error?.code === "ENOENT") return;
       console.warn(`[FleetEnergyTracker] unable to load ${this.filePath}: ${error.message}`);
     }
+  }
+
+  /**
+   * Delete recorded history: everything, or only minutes older than `olderThanMs`.
+   * Power baselines are kept, so integration carries on from the next sample.
+   * @returns {number} how many minute buckets were removed
+   */
+  clear({ olderThanMs } = {}) {
+    const all = !(Number.isFinite(olderThanMs) && olderThanMs > 0);
+    const cutoff = all ? Infinity : this._now() - olderThanMs;
+    let removed = 0;
+    for (const minuteStartMs of [...this._buckets.keys()]) {
+      if (minuteStartMs < cutoff) {
+        this._buckets.delete(minuteStartMs);
+        removed++;
+      }
+    }
+    this._latestBucketStart = this._buckets.size
+      ? Math.max(...this._buckets.keys())
+      : null;
+    if (all) this._tokensTrackedSinceMs = null;
+    else if (this._tokensTrackedSinceMs !== null && this._tokensTrackedSinceMs < cutoff) {
+      this._tokensTrackedSinceMs = this._buckets.size ? Math.min(...this._buckets.keys()) : null;
+    }
+    if (removed > 0) {
+      this._dirty = true;
+      try {
+        this.flush();
+      } catch (error) {
+        console.error(`[FleetEnergyTracker] persist error: ${error.message}`);
+      }
+    }
+    return removed;
   }
 
   flush() {
@@ -782,7 +914,7 @@ export class FleetEnergyTracker {
         this._integrationHighWaterMs === null
           ? null
           : Math.ceil(this._integrationHighWaterMs),
-      tokenCounter: this._tokenCounter,
+      tokensTrackedSinceMs: this._tokensTrackedSinceMs,
       buckets,
     };
     this._writeState(this.filePath, `${JSON.stringify(state)}\n`, this._fs);
