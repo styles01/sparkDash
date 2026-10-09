@@ -2166,6 +2166,34 @@ export class LlmProbe {
         ? Math.round((mtpAccepted / mtpDrafted) * 10000) / 10000
         : null;
 
+    // Verify-step ledger (DFlash2/EXL3): drafts_total counts verify calls.
+    const numDrafts = this._getVllmMetric(txt, "spec_decode_num_drafts_total");
+    if (numDrafts != null) this.specDrafts = Math.round(numDrafts);
+    if (mtpAccepted != null) this.specHits = Math.round(mtpAccepted);
+    if (numDrafts != null && this.lastSpecDrafts != null && this.lastSpecOut != null && genTokens != null && numDrafts > this.lastSpecDrafts && genTokens > this.lastSpecOut) {
+      const perStep = (genTokens - this.lastSpecOut) / (numDrafts - this.lastSpecDrafts);
+      if (Number.isFinite(perStep) && perStep > 0) {
+        this.tokPerStep = Math.round(perStep * 100) / 100;
+      }
+    }
+    if (numDrafts != null) this.lastSpecDrafts = Math.round(numDrafts);
+    if (genTokens != null) this.lastSpecOut = genTokens;
+    // Peak + per-stream tracking for the vLLM flow (was only wired in the
+    // FreeToken /v1/stats path, so peakAggregateTps stayed null forever).
+    if (this.generationTps > (this.peakAggregateTps ?? 0)) {
+      this.peakAggregateTps = this.generationTps;
+    }
+    if (this.generationTps > 0) {
+      if (this.perStreamHigh == null || this.generationTps > this.perStreamHigh) {
+        this.perStreamHigh = this.generationTps;
+      }
+      if (this.perStreamLow == null || this.generationTps < this.perStreamLow) {
+        this.perStreamLow = this.generationTps;
+      }
+    }
+    // Decoded-tokens lifetime alias so the panel's totalTokensDecoded tile lives.
+    if (genTokens != null) this.totalTokensDecoded = Math.round(genTokens);
+
     // Reasoning effort — vLLM has no per-request effort gauge; read the served
     // model's chat-template default reasoning_effort (e.g. "medium" for Qwen3.8).
     // Fall back to null (hide the card) rather than guessing from the
