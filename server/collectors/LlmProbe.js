@@ -4744,6 +4744,16 @@ async _collectSglangRecipeInfo() {
       kvUsedTokens: this.kvUsedTokens,
       kvPoolTokens: this.kvPoolTokens,
       remainingCtx: this.remainingCtx,
+      // llama.cpp-slots convention tiles fed with vLLM lifetime equivalents
+      // (labelled as totals in sublines; better than em-dashes)
+      promptTokens: this.totalPromptTokens,
+      promptTokensProcessed: this.totalPromptTokens != null && this.totalCachedTokens != null
+        ? Math.max(0, Math.round(this.totalPromptTokens - this.totalCachedTokens))
+        : this.totalPromptTokens,
+      promptTokensCache: this.totalCachedTokens,
+      nDecoded: this.totalOutputTokens,
+      cacheHitRatio: this.prefixCacheHitRate,
+      promptProcessedTokens: this.totalPromptTokens,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
       ttftP95Seconds: this.ttftP95Seconds,
