@@ -2098,6 +2098,13 @@ export class LlmProbe {
     }
 
     this.requestsWaiting = this._getVllmMetric(txt, "num_requests_waiting");
+
+    // Scheduler slot capacity: some builds export it; otherwise leave 0
+    // (honest absence) rather than showing pool size as slots.
+    const maxSeqs =
+      this._getVllmMetric(txt, "max_num_seqs") ??
+      this._getVllmMetric(txt, "scheduler_max_num_seqs");
+    if (maxSeqs != null && maxSeqs > 0) this.slotsTotal = Math.round(maxSeqs);
     // Older vLLM (V0 engine) names the same gauge gpu_cache_usage_perc.
     this.kvCacheUsage =
       this._getVllmMetric(txt, "kv_cache_usage_perc") ??
