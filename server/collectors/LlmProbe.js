@@ -3577,9 +3577,9 @@ export class LlmProbe {
    * lives in prom counters, readable even at idle.
    */
   _applyVllmSpec(txt) {
-    const drafts = this._getPromMetric(txt, "spec_decode_num_drafts_total");
-    const draftTokens = this._getPromMetric(txt, "spec_decode_num_draft_tokens_total");
-    const accepted = this._getPromMetric(txt, "spec_decode_num_accepted_tokens_total");
+    const drafts = this._getPromMetric(txt, "vllm:spec_decode_num_drafts_total");
+    const draftTokens = this._getPromMetric(txt, "vllm:spec_decode_num_draft_tokens_total");
+    const accepted = this._getPromMetric(txt, "vllm:spec_decode_num_accepted_tokens_total");
     if (drafts != null) this.specDrafts = Math.round(drafts);
     if (accepted != null) this.specHits = Math.round(accepted);
     if (draftTokens != null) this.specGeneratedTokens = Math.round(draftTokens);
@@ -3594,7 +3594,7 @@ export class LlmProbe {
     }
     const perPos = [];
     for (let p = 0; p < 8; p++) {
-      const v = this._getPromMetricLabeled(txt, "spec_decode_num_accepted_tokens_per_pos_total", "position", String(p));
+      const v = this._getPromMetricLabeled(txt, "vllm:spec_decode_num_accepted_tokens_per_pos_total", "position", String(p));
       if (v != null) perPos.push(v);
       else break;
     }
