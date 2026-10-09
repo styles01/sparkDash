@@ -3600,6 +3600,8 @@ export class LlmProbe {
     }
     if (perPos.length) this.perPositionAcceptance = perPos;
     this.speculativeTypes = ["mtp"];
+    // vLLM has no slots API; activeContext = tokens resident in KV
+    if (this.kvUsedTokens != null) this.activeContext = this.kvUsedTokens;
   }
   _applyVllmKvPool(txt) {
     const tokens = this._sumPromLabel(txt, "vllm:cache_config_info", "kv_cache_size_tokens");
