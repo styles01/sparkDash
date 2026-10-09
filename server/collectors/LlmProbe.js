@@ -4713,7 +4713,6 @@ async _collectSglangRecipeInfo() {
   }
 
   _getSnapshot() {
-    if (this.totalPromptTokens != null && this.promptTokens == null) console.error("[snap] promptTokens null while totalPrompt=", this.totalPromptTokens);
     const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
     return {
       available: metricsLive,
@@ -4745,16 +4744,6 @@ async _collectSglangRecipeInfo() {
       kvUsedTokens: this.kvUsedTokens,
       kvPoolTokens: this.kvPoolTokens,
       remainingCtx: this.remainingCtx,
-      // llama.cpp-slots convention tiles fed with vLLM lifetime equivalents
-      // (labelled as totals in sublines; better than em-dashes)
-      promptTokens: this.totalPromptTokens,
-      promptTokensProcessed: this.totalPromptTokens != null && this.totalCachedTokens != null
-        ? Math.max(0, Math.round(this.totalPromptTokens - this.totalCachedTokens))
-        : this.totalPromptTokens,
-      promptTokensCache: this.totalCachedTokens,
-      nDecoded: this.totalOutputTokens,
-      cacheHitRatio: this.prefixCacheHitRate,
-      promptProcessedTokens: this.totalPromptTokens,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
       ttftP95Seconds: this.ttftP95Seconds,
@@ -4821,7 +4810,7 @@ async _collectSglangRecipeInfo() {
           : null
       ),
       promptTokensCache: this.promptTokensCache ?? this.totalCachedTokens,
-      cacheHitRatio: this.cacheHitRatio,
+      cacheHitRatio: this.cacheHitRatio ?? this.prefixCacheHitRate,
       nCtx: this.nCtx,
       isProcessing: this.isProcessing,
       nRemain: this.nRemain,
