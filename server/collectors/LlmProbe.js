@@ -2110,6 +2110,23 @@ export class LlmProbe {
       this._getVllmMetric(txt, "kv_cache_usage_perc") ??
       this._getVllmMetric(txt, "gpu_cache_usage_perc");
     this._applyVllmKvPool(txt);
+    // -- Real context usage: KV-cache pool occupancy in tokens --
+    // usage gauge x pool capacity = tokens resident in the KV cache right
+    // now. prompt/generation totals are LIFETIME counters (1.5M+ since
+    // engine start > whole pool) and must never feed a context card.
+    const realUsage = this.kvCacheUsage != null && Number.isFinite(this.kvCacheUsage) && this.kvCacheUsage > 0
+      ? this.kvCacheUsage
+      : (kvPoolUsed = this._getPromMetric(txt, "vllm:kv_cache_used_perc")) != null
+        ? kvPoolUsed
+        : this._getVllmMetric(txt, "cpu_cache_usage_perc");
+    if (realUsage != null) {
+      const used = realUsage * (this.kvCacheTokens ?? 0);
+      this.kvUsedTokens = used > 0 ? Math.round(used) : 0;
+      if (this.kvCacheTokens != null) this.kvPoolTokens = Math.round(this.kvCacheTokens);
+    } else {
+      this.kvUsedTokens = 0;
+      if (this.kvCacheTokens != null) this.kvPoolTokens = Math.round(this.kvCacheTokens);
+    }
     // Engine uptime: vLLM exports process_start_time_seconds (epoch).
     const procStart = this._getVllmMetric(txt, "process_start_time_seconds");
     if (procStart != null && procStart > 0) {

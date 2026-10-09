@@ -1079,7 +1079,17 @@ export function LlmPanel({
   const specAcceptedTokens = llm?.specAcceptedTokens ?? null;
   const specGeneratedTokens = llm?.specGeneratedTokens ?? null;
   const specMeanLen = llm?.specMeanLen ?? null;
-  const contextUsedTokens = (promptTokens != null ? promptTokens : 0) + (nDecoded != null ? nDecoded : 0);
+  const tokPerStepVal = llm?.tokPerStep ?? null;
+  // REAL context usage (vLLM): kvUsedTokens = kv usage gauge x KV pool size
+  // = tokens actually resident in the KV cache right now, plus a mid-flight
+  // decode allowance (avg tok/step x active lanes). The prompt+decode sum is
+  // the llama.cpp /slots convention only (per-slot state) — vLLM's
+  // prompt/generation counters are LIFETIME totals and must not be summed.
+  const llmKvUsed = llm?.kvUsedTokens ?? null;
+  const decodeAllowance = Math.round((tokPerStepVal ?? 0) * Math.max(llm?.banksLive ?? 0, llm?.slotsActive ?? 0, 0));
+  const contextUsedTokens = llmKvUsed != null
+    ? llmKvUsed + decodeAllowance
+    : (promptTokens != null ? promptTokens : 0) + (nDecoded != null ? nDecoded : 0);
   const contextUsedPct = nCtx != null && nCtx > 0 ? contextUsedTokens / nCtx : null;
   const kvUsage = llm?.kvCacheUsage ?? null;
   const specDecodeMethod = llm?.recipeInfo?.specDecodeMethod ?? null;
@@ -1387,7 +1397,7 @@ export function LlmPanel({
             )}
             {nCtx != null && (
               <GaugeCard label="Context Used">
-                <ArcGauge value={contextUsedTokens} max={nCtx} label="" displayValue={fmtInt(contextUsedTokens)} sub={contextUsedPct != null ? pct(contextUsedPct, 1) : undefined} color={contextUsedPct != null && contextUsedPct >= 0.8 ? "var(--color-danger)" : contextUsedPct != null && contextUsedPct >= 0.5 ? "var(--color-accent)" : "var(--color-success)"} size={100} />
+                <ArcGauge value={contextUsedTokens} max={llm?.kvPoolTokens ?? nCtx} label="" displayValue={fmtInt(contextUsedTokens)} sub={contextUsedPct != null ? pct(contextUsedPct, 1) : undefined} color={contextUsedPct != null && contextUsedPct >= 0.8 ? "var(--color-danger)" : contextUsedPct != null && contextUsedPct >= 0.5 ? "var(--color-accent)" : "var(--color-success)"} size={100} />
               </GaugeCard>
             )}
             {cacheHitRatio != null && (

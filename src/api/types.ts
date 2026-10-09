@@ -410,6 +410,10 @@ export interface LlmMetrics {
   kvCacheUsage?: number | null;
   /** Allocated KV-cache pool in tokens (vLLM `cache_config_info`). null when unknown. */
   kvCacheTokens?: number | null;
+  /** Real KV-cache pool occupancy in tokens (vLLM: usage gauge x pool). */
+  kvUsedTokens?: number | null;
+  /** KV-cache pool capacity in tokens (cache_config_info). */
+  kvPoolTokens?: number | null;
   /** Free tokens in that pool (pool × (1 − usage)). null when pool or usage is unknown. */
   kvCacheTokensAvailable?: number | null;
   /** Allocated KV-cache pool in bytes. null when unknown. */
