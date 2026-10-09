@@ -1520,6 +1520,170 @@ export function LlmPanel({
             <button type="button" onClick={() => { const params = new URLSearchParams(); if (llmPort) params.set("port", String(llmPort)); if (llm?.modelId) params.set("model", llm.modelId); const q = params.toString() ? `?${params.toString()}` : ""; window.open(`/showcase/${encodeURIComponent(sparkId)}${q}`, "_blank", "noopener,noreferrer"); }} className="llm-action-btn">Showcase</button>
           </div>
         </div>
+
+        {/* ═══ UPSTREAM 2.0 MONITORING (engine tiles + charts) — at top of dashboard after row cards ═══ */}
+
+          <div className="sp-decode">
+            <div className="sp-metric">
+              <span className="eyebrow">Decode</span>
+              <div className="big-num sp-big-lg">
+                {fmtTps(generationTps)}
+                <small>tok/s</small>
+              </div>
+              <TrendLine data={genHistory} height={44} color="var(--color-accent)" />
+              {genAvg != null && <span className="sp-avg mono">avg {fmtAvg(genAvg)}</span>}
+              {idleNote && (
+                <span className="sp-avg" data-llm-idle>
+                  {idleNote}
+                </span>
+              )}
+            </div>
+            <div
+              className="sp-metric"
+              title="Prompt tokens/sec taken in during the last poll window — cache-served + computed. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Cached prefill does little GPU work; uncached prefill is what builds KV cache."
+            >
+              <span className="eyebrow">Prefill</span>
+              <div className="big-num sp-big-lg">
+                {llm?.prefillActive && prefillTps <= 0 ? (
+                  <>
+                    <span className="ov-tps__dots" aria-hidden />
+                    <small title="A prompt is being processed. The engine reports its speed only when the request finishes.">prefilling</small>
+                  </>
+                ) : (
+                  <>
+                    {fmtTps(prefillTps)}
+                    <small>tok/s</small>
+                  </>
+                )}
+              </div>
+              <TrendLine data={prefillHistory} height={44} color="var(--color-info)" />
+              {prefillAvg != null && <span className="sp-avg mono">avg {fmtAvg(prefillAvg)}</span>}
+            </div>
+          </div>
+          {showPrefillSplit && (
+            <div className="sp-decode sp-decode--split">
+              <div
+                className="sp-metric"
+                title="Prefill tokens served from prefix cache (little GPU work). High values mean prompt reuse, not a faster cold prefill."
+              >
+                <span className="eyebrow">Cached prefill</span>
+                <div className="big-num sp-big-md">
+                  {fmtTps(cachedPrefillTps)}
+                  <small>tok/s</small>
+                </div>
+                <TrendLine data={cachedPrefillHistory} height={30} color="var(--color-muted)" />
+                {cachedPrefillAvg != null && <span className="sp-avg mono">avg {fmtAvg(cachedPrefillAvg)}</span>}
+              </div>
+              <div
+                className="sp-metric"
+                title="Uncached (computed) prefill — tokens that actually build KV cache on the GPU."
+              >
+                <span className="eyebrow">Uncached prefill</span>
+                <div className="big-num sp-big-md">
+                  {fmtTps(uncachedPrefillTps)}
+                  <small>tok/s</small>
+                </div>
+                <TrendLine data={uncachedPrefillHistory} height={30} color="var(--color-violet)" />
+                {uncachedPrefillAvg != null && <span className="sp-avg mono">avg {fmtAvg(uncachedPrefillAvg)}</span>}
+              </div>
+            </div>
+          )}
+
+          <div className="sp-tiles">
+            {showEngineTiles && kvValue != null && tile("kvCache", "KV cache", kvValue, { tone: kvTone, sub: kvSub || undefined })}
+            {showEngineTiles &&
+              llm?.requestsRunning != null &&
+              tile(
+                "requests",
+                "Running / waiting",
+                `${Math.round(llm.requestsRunning)} / ${llm.requestsWaiting != null ? Math.round(llm.requestsWaiting) : "—"}`,
+                { align: "right" }
+              )}
+            {isFreeToken && llm?.ttftSeconds != null && tile("ttftMean", "TTFT mean", `${Math.round(llm.ttftSeconds * 1000)} ms`)}
+            {showEngineTiles && llm?.ttftP95Seconds != null && tile("ttftP95", "TTFT p95", `${Math.round(llm.ttftP95Seconds * 1000)} ms`)}
+            {showEngineTiles &&
+              llm?.preemptionsTotal != null &&
+              tile("preempts", "Preempts", Math.round(llm.preemptionsTotal).toLocaleString(), { align: "right" })}
+            {showEngineTiles &&
+              llm?.prefixCacheHitRate != null &&
+              tile("prefixCache", "Prefix hit", `${(llm.prefixCacheHitRate * 100).toFixed(0)}%`)}
+            {showEngineTiles && llm?.e2eP95Seconds != null && tile("e2eP95", "E2E p95", `${llm.e2eP95Seconds.toFixed(2)}s`, { align: "right" })}
+            {showEngineTiles && llm?.itlP95Seconds != null && tile("itlP95", "Inter-token p95", `${Math.round(llm.itlP95Seconds * 1000)} ms`)}
+            {showEngineTiles &&
+              llm?.mtpAcceptanceRate != null &&
+              tile("mtpAccept", "MTP accept", llm.mtpAcceptanceRate.toFixed(2), { align: "right" })}
+            <div className="sp-tile">
+              <b>
+                {(llm?.slotsTotal ?? 0) > 0
+                  ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
+                  : (llm?.slotsActive ?? 0) > 0
+                    ? `${llm?.slotsActive} running`
+                    : "—"}
+              </b>
+              <span>Slots</span>
+            </div>
+            <div className="sp-tile">
+              <b>{llm?.contextLength ? llm.contextLength.toLocaleString() : "—"}</b>
+              <span>Context</span>
+            </div>
+            <div className="sp-tile">
+              {(() => {
+                const engine = engineStateLabel(llm);
+                return (
+                  <b className={engine.muted ? "text-muted" : undefined} title={engine.title}>
+                    {engine.text}
+                  </b>
+                );
+              })()}
+              <div className="sp-tile__label">
+                <span>Engine</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEngineInfoOpen((v) => {
+                      if (!v) startEngineInfoTimer();
+                      return !v;
+                    });
+                  }}
+                  onMouseEnter={clearEngineInfoTimer}
+                  onMouseLeave={startEngineInfoTimer}
+                  className="relative cursor-pointer opacity-60 hover:opacity-100"
+                  aria-label="Engine state info"
+                >
+                  <InfoIcon className="h-2.5 w-2.5" />
+                  {engineInfoOpen && (
+                    <div
+                      onMouseEnter={clearEngineInfoTimer}
+                      onMouseLeave={startEngineInfoTimer}
+                      className="absolute left-0 top-full z-10 mt-1 w-56 rounded-xl border border-border-strong bg-surface-elevated px-3 py-2 text-left text-[11px] font-normal normal-case text-text shadow-lg"
+                    >
+                      Active = processing or ready for requests. Sleeping = idle, GPU memory freed until next request.
+                    </div>
+                  )}
+                </button>
+              </div>
+            </div>
+            <div className="sp-tile" title={ENGINE_GENERATED_TITLE}>
+              <b>{llm && llm.totalOutputTokens > 0 ? llm.totalOutputTokens.toLocaleString() : "—"}</b>
+              <span>{ENGINE_GENERATED_LABEL}</span>
+            </div>
+          </div>
+
+          <LlmLaunchers
+            sparkId={sparkId}
+            llmPort={llmPort}
+            modelId={llm?.modelId}
+            onLaunch={launchLocal}
+            onRemoteLaunch={launchRemote}
+          />
+          {llm?.posture && (
+            <div className="sp-chips">
+              <PostureBadge posture={llm.posture} />
+            </div>
+          )}
+          <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+          <LlmTrendChart sparkId={sparkId} llmPort={llmPort} />
+          <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
         </div>
       )}
 
