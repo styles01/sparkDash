@@ -2117,15 +2117,14 @@ export class LlmProbe {
       this.nCtx = Math.round(this.contextLength);
     }
     try {
-      const fs = require("fs");
-      const procDirs = fs.readdirSync("/host/proc").filter((p2) => /^[0-9]+$/.test(p2));
+      const procDirs = readdirSync("/host/proc").filter((p2) => /^[0-9]+$/.test(p2));
       for (const pid of procDirs) {
         try {
-          const cl = fs.readFileSync(`/host/proc/${pid}/cmdline`, "utf8").replace(/ /g, " ");
+          const cl = readFileSync(`/host/proc/${pid}/cmdline`, "utf8").replace(/ /g, " ");
           if (cl.includes("/usr/local/bin/vllm serve") && cl.includes("--port 8000")) {
-            const st = fs.readFileSync(`/host/proc/${pid}/stat`, "utf8");
+            const st = readFileSync(`/host/proc/${pid}/stat`, "utf8");
             const f = st.substring(st.lastIndexOf(")") + 2).split(" ");
-            const up = Number(fs.readFileSync("/host/proc/uptime", "utf8").split(" ")[0]);
+            const up = Number(readFileSync("/host/proc/uptime", "utf8").split(" ")[0]);
             const hz = 100;
             const age = up - Number(f[21]) / hz;
             if (Number.isFinite(age) && age > 0) {
@@ -2135,16 +2134,15 @@ export class LlmProbe {
           }
         } catch {}
       }
-    } catch {}
+    } catch (e) { console.error("[fills] uptime err:", e && e.message); }
     if (this.temperature == null || this.topP == null) {
       try {
-        const fs2 = require("fs");
-        const hub = "/host/root/home/jaita/MODELS/hf/hub";
-        const mdirs = fs2.readdirSync(hub).filter((d) => d.startsWith("models--"));
+          const hub = "/host/root/home/jaita/MODELS/hf/hub";
+        const mdirs = readdirSync(hub).filter((d) => d.startsWith("models--"));
         for (const d of mdirs) {
           const snaps = `${hub}/${d}/snapshots`;
-          const snap = fs2.readdirSync(snaps)[0];
-          const gen = JSON.parse(fs2.readFileSync(`${snaps}/${snap}/generation_config.json`, "utf8"));
+          const snap = readdirSync(snaps)[0];
+          const gen = JSON.parse(readFileSync(`${snaps}/${snap}/generation_config.json`, "utf8"));
           const t = Number(gen.temperature);
           const tp = Number(gen.top_p);
           const k = Number(gen.top_k);
@@ -2158,7 +2156,7 @@ export class LlmProbe {
           ].filter(Boolean);
           break;
         }
-      } catch {}
+      } catch (e2) { console.error("[fills] gen err:", e2 && e2.message); }
     }
     if (this.totalCachedTokens != null) this.promptCachedTokens = Math.round(this.totalCachedTokens);
     if (this.kvUsedTokens != null && this.kvPoolTokens != null) {
