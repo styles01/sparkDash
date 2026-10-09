@@ -179,10 +179,11 @@
   align-items: start;
 }
 @media (min-width: 1280px) {
+  /* styles01: stack services+LLM BELOW hardware full-width (was 1fr/420px rail) */
   .sp-cols {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 420px);
-    align-items: start;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-gap);
   }
   .sp-col {
     display: flex;
