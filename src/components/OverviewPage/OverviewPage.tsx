@@ -6,6 +6,7 @@ import { ShutdownAll } from "../ShutdownAll";
 import { FleetEnergyCard } from "./FleetEnergyCard";
 import { FleetAlertStrip } from "./FleetAlertStrip";
 import { FleetTokenTotals } from "./FleetTokenTotals";
+import { FleetLlmKpis } from "./FleetLlmKpis";
 import { FleetKpis } from "./FleetKpis";
 import { ACTIVITY_ID, ENERGY_ID, TOKENS_ID } from "../../constants";
 import { SparkCard } from "./SparkCard";
@@ -323,6 +324,7 @@ export function OverviewPage({
           })}
         </div>
         <FleetKpis sparks={visibleSparks} snapshotKey={sparks} />
+        <FleetLlmKpis sparks={sparks} />
         <div className="ov-side">
           {showFleetEnergy ? <FleetEnergyCard nodeCount={sparks.length} nodeNames={Object.fromEntries(sparks.map((s) => [s.id, s.name]))} onOpenDetails={onNavigate ? () => onNavigate(ENERGY_ID) : undefined} /> : null}
           {showLlmTokenTotals ? <FleetTokenTotals onOpenDetails={onNavigate ? () => onNavigate(TOKENS_ID) : undefined} /> : null}

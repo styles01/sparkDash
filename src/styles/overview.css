@@ -849,3 +849,47 @@
 .ov .ov-help:focus-visible {
   opacity: 1;
 }
+
+/* LLM stats strip on the Overview (homepage / workspace overview) */
+.ov .ov-llmstats {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ov .ov-llmstats__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ov .ov-llmstats__model {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+.ov .ov-kpis--llm {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  padding: 0;
+  background: none;
+  border: 0;
+}
+.ov .ov-kpis--llm .ov-kpi {
+  padding: 12px 14px;
+}
+.ov .ov-kpis--llm .big-num {
+  font-size: 24px;
+}
+.ov .ov-kpis--llm .ov-kpi__foot {
+  min-height: 0;
+}
+@media (max-width: 1400px) {
+  .ov .ov-kpis--llm {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 900px) {
+  .ov .ov-kpis--llm {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
