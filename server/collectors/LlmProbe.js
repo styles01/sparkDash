@@ -2120,7 +2120,7 @@ export class LlmProbe {
       const procDirs = readdirSync("/host/proc").filter((p2) => /^[0-9]+$/.test(p2));
       for (const pid of procDirs) {
         try {
-          const cl = readFileSync(`/host/proc/${pid}/cmdline`, "utf8").replace(/ /g, " ");
+          const cl = readFileSync(`/host/proc/${pid}/cmdline`, "utf8").replace(/\u0000/g, " ");
           if (cl.includes("/usr/local/bin/vllm serve") && cl.includes("--port 8000")) {
             const st = readFileSync(`/host/proc/${pid}/stat`, "utf8");
             const f = st.substring(st.lastIndexOf(")") + 2).split(" ");
@@ -2139,16 +2139,29 @@ export class LlmProbe {
       try {
           const hub = "/host/root/home/jaita/MODELS/hf/hub";
         const mdirs = readdirSync(hub).filter((d) => d.startsWith("models--"));
-        for (const d of mdirs) {
+        const hubModel = mdirs.find((d) => this.modelId && this.modelId.length > 0 && d.toLowerCase().includes(this.modelId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12)))
+          ?? mdirs.find((d) => d.includes("GLM-5.3-Flash"));
+        for (const d of hubModel ? [hubModel] : mdirs) {
           const snaps = `${hub}/${d}/snapshots`;
           const snap = readdirSync(snaps)[0];
-          const gen = JSON.parse(readFileSync(`${snaps}/${snap}/generation_config.json`, "utf8"));
+          let raw;
+          try {
+            raw = readFileSync(`${snaps}/${snap}/generation_config.json`, "utf8");
+          } catch {
+            continue;
+          }
+          const gen = JSON.parse(raw);
           const t = Number(gen.temperature);
           const tp = Number(gen.top_p);
           const k = Number(gen.top_k);
           if (Number.isFinite(t)) this.temperature = t;
           if (Number.isFinite(tp)) this.topP = tp;
           if (Number.isFinite(k) && k > 0) this.topK = k;
+          this.samplingParams = {
+            temperature: Number.isFinite(t) ? t : null,
+            top_p: Number.isFinite(tp) ? tp : null,
+            top_k: Number.isFinite(k) && k > 0 ? k : null,
+          };
           this.samplers = [
             Number.isFinite(t) ? `temp ${t}` : null,
             Number.isFinite(tp) ? `top_p ${tp}` : null,
@@ -2164,6 +2177,7 @@ export class LlmProbe {
     }
     if (this.kvPoolTokens != null && this.kvUsedTokens != null) {
       this.remainingCtx = Math.max(0, this.kvPoolTokens - this.kvUsedTokens);
+      this.nRemain = this.remainingCtx;
     }
 
     this._applyVllmKvPool(txt);
